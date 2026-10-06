@@ -20,7 +20,7 @@ public class IdempotencyRepository {
      * @param requestId          幂等键
      * @param operation          操作类型
      * @param requestFingerprint 请求参数指纹（不含 requestId）
-     * @param responseJson       原成功响应 JSON
+     * @param responseJson       原成功响应 JSON；占位行（事务进行中）为 null，提交前必回填
      */
     public record IdempotencyRecord(String requestId, String operation,
                                     String requestFingerprint, String responseJson) {
@@ -65,5 +65,14 @@ public class IdempotencyRepository {
                 record.requestFingerprint(),
                 record.responseJson(),
                 createdAtUtc);
+    }
+
+    /** 业务成功后回填响应 JSON；与占位插入同一事务提交。 */
+    public void updateResponse(String requestId, String responseJson) {
+        int rows = jdbc.update("UPDATE idempotency_record SET response_json = ? WHERE request_id = ?",
+                responseJson, requestId);
+        if (rows != 1) {
+            throw new IllegalStateException("idempotency row missing for " + requestId);
+        }
     }
 }

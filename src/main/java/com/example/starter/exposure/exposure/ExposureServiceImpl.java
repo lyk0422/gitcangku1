@@ -1,21 +1,28 @@
 package com.example.starter.exposure.exposure;
 
 import com.example.starter.exposure.domain.Campaign;
+import com.example.starter.exposure.domain.IdentityGroup;
 import com.example.starter.exposure.domain.Reservation;
 import com.example.starter.exposure.domain.ReservationStatus;
 import com.example.starter.exposure.repo.CampaignRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository.IdempotencyRecord;
+import com.example.starter.exposure.repo.IdentityGroupRepository;
 import com.example.starter.exposure.repo.LedgerRepository;
 import com.example.starter.exposure.repo.ReservationRepository;
 import com.example.starter.exposure.web.ApiException;
 import com.example.starter.exposure.web.ApplyExposureRequest;
 import com.example.starter.exposure.web.CampaignResponse;
 import com.example.starter.exposure.web.CreateCampaignRequest;
+import com.example.starter.exposure.web.GroupQuotaResponse;
+import com.example.starter.exposure.web.IdentityGroupResponse;
+import com.example.starter.exposure.web.MergeIdentityRequest;
 import com.example.starter.exposure.web.QuotaResponse;
 import com.example.starter.exposure.web.ReservationActionRequest;
 import com.example.starter.exposure.web.ReservationResponse;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -23,7 +30,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 import java.time.LocalDate;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -39,6 +48,9 @@ public class ExposureServiceImpl implements ExposureService {
 
     static final int RESERVATION_TTL_MILLIS = 60_000;
 
+    /** 归并组内编号上限。 */
+    static final int MAX_GROUP_MEMBERS = 10;
+
     /** 并发同键竞争时等待胜出事务提交的最大时长。 */
     private static final long IDEMPOTENT_WAIT_MILLIS = 10_000L;
 
@@ -47,6 +59,7 @@ public class ExposureServiceImpl implements ExposureService {
     private final ReservationRepository reservationRepository;
     private final LedgerRepository ledgerRepository;
     private final IdempotencyRepository idempotencyRepository;
+    private final IdentityGroupRepository identityGroupRepository;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate txTemplate;
 
@@ -55,6 +68,7 @@ public class ExposureServiceImpl implements ExposureService {
                                ReservationRepository reservationRepository,
                                LedgerRepository ledgerRepository,
                                IdempotencyRepository idempotencyRepository,
+                               IdentityGroupRepository identityGroupRepository,
                                ObjectMapper objectMapper,
                                TransactionTemplate txTemplate) {
         this.clock = clock;
@@ -62,15 +76,18 @@ public class ExposureServiceImpl implements ExposureService {
         this.reservationRepository = reservationRepository;
         this.ledgerRepository = ledgerRepository;
         this.idempotencyRepository = idempotencyRepository;
+        this.identityGroupRepository = identityGroupRepository;
         this.objectMapper = objectMapper;
         this.txTemplate = txTemplate;
     }
 
     @Override
     public CampaignResponse createCampaign(CreateCampaignRequest request) {
-        String fingerprint = request.campaignId() + "|" + request.dailyTotalCap() + "|"
-                + request.perVisitorDailyCap();
-        return runIdempotent(request.requestId(), Operation.CREATE_CAMPAIGN, fingerprint,
+        ObjectNode params = objectMapper.createObjectNode()
+                .put("dailyTotalCap", request.dailyTotalCap())
+                .put("perVisitorDailyCap", request.perVisitorDailyCap());
+        JsonNode identity = identity("campaign:" + request.campaignId(), params);
+        return runIdempotent(request.requestId(), Operation.CREATE_CAMPAIGN, identity,
                 CampaignResponse.class, () -> {
                     if (campaignRepository.findById(request.campaignId()).isPresent()) {
                         throw new ApiException(HttpStatus.CONFLICT,
@@ -94,8 +111,11 @@ public class ExposureServiceImpl implements ExposureService {
 
     @Override
     public ReservationResponse apply(ApplyExposureRequest request) {
-        String fingerprint = request.campaignId() + "|" + request.visitorId();
-        return runIdempotent(request.requestId(), Operation.APPLY, fingerprint,
+        ObjectNode params = objectMapper.createObjectNode()
+                .put("campaignId", request.campaignId())
+                .put("visitorId", request.visitorId());
+        JsonNode identity = identity("reservation-apply", params);
+        return runIdempotent(request.requestId(), Operation.APPLY, identity,
                 ReservationResponse.class, () -> {
                     long now = clock.millis();
                     LocalDate utcDate = LocalDate.now(clock);
@@ -104,20 +124,30 @@ public class ExposureServiceImpl implements ExposureService {
                     // 先结算该公告相关过期预占并释放额度
                     settleExpired(campaign.campaignId(), now);
 
-                    // 固定加锁顺序：公告当日总账 -> 访客当日账，避免死锁
+                    // 固定加锁顺序：公告当日总账 -> 身份串行锁 -> 组内成员当日账（字典序），避免死锁
                     ledgerRepository.ensureTotalRow(campaign.campaignId(), utcDate);
-                    ledgerRepository.ensureVisitorRow(campaign.campaignId(), request.visitorId(), utcDate);
                     int usedTotal = ledgerRepository.lockUsedTotal(campaign.campaignId(), utcDate);
-                    int usedVisitor = ledgerRepository.lockUsedVisitor(
-                            campaign.campaignId(), request.visitorId(), utcDate);
+
+                    // 组账串行：与归并共用单行锁，组成员当日账合计执行每访客上限
+                    identityGroupRepository.lockGlobal();
+                    List<String> members = groupMembersOf(request.visitorId());
+                    for (String member : members) {
+                        ledgerRepository.ensureVisitorRow(campaign.campaignId(), member, utcDate);
+                    }
+                    int usedGroup = 0;
+                    for (String member : members) {
+                        usedGroup += ledgerRepository.lockUsedVisitor(
+                                campaign.campaignId(), member, utcDate);
+                    }
 
                     // 任一额度已满则 429，两个额度均不增加（尚未写入）
                     if (usedTotal + 1 > campaign.dailyTotalCap()
-                            || usedVisitor + 1 > campaign.perVisitorDailyCap()) {
+                            || usedGroup + 1 > campaign.perVisitorDailyCap()) {
                         throw new ApiException(HttpStatus.TOO_MANY_REQUESTS,
                                 "exposure quota exhausted for campaign " + campaign.campaignId());
                     }
                     ledgerRepository.addTotal(campaign.campaignId(), utcDate, 1);
+                    // 预占与账目都保留最初申请编号，仅计入申请人自己的分账
                     ledgerRepository.addVisitor(campaign.campaignId(), request.visitorId(), utcDate, 1);
 
                     String reservationId = UUID.randomUUID().toString().replace("-", "");
@@ -137,15 +167,17 @@ public class ExposureServiceImpl implements ExposureService {
 
     @Override
     public ReservationResponse confirm(String reservationId, ReservationActionRequest request) {
-        String fingerprint = reservationId;
-        return runIdempotent(request.requestId(), Operation.CONFIRM, fingerprint,
+        JsonNode identity = identity("reservation:" + reservationId,
+                objectMapper.createObjectNode());
+        return runIdempotent(request.requestId(), Operation.CONFIRM, identity,
                 ReservationResponse.class, () -> transition(reservationId, true));
     }
 
     @Override
     public ReservationResponse cancel(String reservationId, ReservationActionRequest request) {
-        String fingerprint = reservationId;
-        return runIdempotent(request.requestId(), Operation.CANCEL, fingerprint,
+        JsonNode identity = identity("reservation:" + reservationId,
+                objectMapper.createObjectNode());
+        return runIdempotent(request.requestId(), Operation.CANCEL, identity,
                 ReservationResponse.class, () -> transition(reservationId, false));
     }
 
@@ -189,6 +221,61 @@ public class ExposureServiceImpl implements ExposureService {
         });
     }
 
+    // ---- 身份归并 ----
+
+    @Override
+    public IdentityGroupResponse mergeIdentities(MergeIdentityRequest request) {
+        ObjectNode params = objectMapper.createObjectNode()
+                .put("visitorIdA", request.visitorIdA())
+                .put("visitorIdB", request.visitorIdB());
+        ObjectNode identity = identity("identity-union", params);
+        identity.put("operator", request.operator());
+        identity.put("expectedVersion", request.expectedVersion());
+        return runIdempotent(request.requestId(), Operation.MERGE_IDENTITY, identity,
+                IdentityGroupResponse.class, () -> doMerge(request));
+    }
+
+    @Override
+    public IdentityGroupResponse getIdentityGroup(String visitorId) {
+        return txTemplate.execute(status -> {
+            String groupId = identityGroupRepository.findGroupIdByVisitor(visitorId)
+                    .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                            "visitor not in any identity group: " + visitorId));
+            IdentityGroup group = identityGroupRepository.lockGroupById(groupId).orElseThrow();
+            return new IdentityGroupResponse(group.groupId(), group.version(),
+                    identityGroupRepository.findMembers(groupId), false, group.createdAtUtc());
+        });
+    }
+
+    @Override
+    public GroupQuotaResponse queryGroupQuota(String campaignId, String visitorId,
+                                              LocalDate requestedDate) {
+        return txTemplate.execute(status -> {
+            Campaign campaign = requireCampaign(campaignId);
+            long now = clock.millis();
+            LocalDate utcDate = requestedDate != null ? requestedDate : LocalDate.now(clock);
+
+            settleExpired(campaignId, now);
+
+            Optional<String> groupId = identityGroupRepository.findGroupIdByVisitor(visitorId);
+            List<String> members = groupId
+                    .map(identityGroupRepository::findMembers)
+                    .orElse(List.of(visitorId));
+            List<GroupQuotaResponse.MemberUsage> usages = new ArrayList<>();
+            int usedGroup = 0;
+            for (String member : members) {
+                int used = ledgerRepository.getUsedVisitor(campaignId, member, utcDate);
+                usages.add(new GroupQuotaResponse.MemberUsage(member, used));
+                usedGroup += used;
+            }
+            return new GroupQuotaResponse(
+                    campaignId, visitorId, groupId.orElse(null), utcDate,
+                    campaign.perVisitorDailyCap(), usedGroup,
+                    Math.max(0, campaign.perVisitorDailyCap() - usedGroup),
+                    usages, now);
+        });
+    }
+
     // ---- 内部辅助（作用域末尾） ----
 
     /** 幂等操作类型，同时标识存储响应的反序列化类型。 */
@@ -196,40 +283,45 @@ public class ExposureServiceImpl implements ExposureService {
         CREATE_CAMPAIGN,
         APPLY,
         CONFIRM,
-        CANCEL
+        CANCEL,
+        MERGE_IDENTITY
     }
 
     /**
-     * 在事务内执行业务并维护幂等记录；业务变更与去重结果原子提交。
-     * 并发同键插入冲突时等待胜出事务提交后重放其结果。
+     * 构造结构化幂等身份（资源 + 参数），避免分隔符拼接碰撞；
+     * 归并等操作可继续追加 operator、expectedVersion 等字段。
      */
-    private <T> T runIdempotent(String requestId, Operation operation, String fingerprint,
+    private ObjectNode identity(String resource, ObjectNode params) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("resource", resource);
+        node.set("params", params);
+        return node;
+    }
+
+    /**
+     * 在事务内执行业务并维护幂等记录：先插占位行（response_json 为 null），业务成功后
+     * 回填响应并随同事务原子提交；业务失败整体回滚，不占键。并发同键在唯一索引上冲突，
+     * 等待胜出事务提交后重放其完整响应；身份按 JSON 结构化比较，异参 409。
+     */
+    private <T> T runIdempotent(String requestId, Operation operation, JsonNode identity,
                                 Class<T> responseType, Supplier<T> action) {
         long deadline = System.currentTimeMillis() + IDEMPOTENT_WAIT_MILLIS;
         while (true) {
+            var committed = idempotencyRepository.findById(requestId);
+            if (committed.isPresent() && committed.get().responseJson() != null) {
+                return replay(committed.get(), operation, identity, responseType, requestId);
+            }
             try {
                 return txTemplate.execute(status -> {
-                    var existing = idempotencyRepository.lockById(requestId);
-                    if (existing.isPresent()) {
-                        IdempotencyRecord record = existing.get();
-                        if (!record.operation().equals(operation.name())
-                                || !record.requestFingerprint().equals(fingerprint)) {
-                            throw new ApiException(HttpStatus.CONFLICT,
-                                    "idempotency key reused with different parameters: " + requestId);
-                        }
-                        try {
-                            return objectMapper.readValue(record.responseJson(), responseType);
-                        } catch (Exception e) {
-                            throw new IllegalStateException("failed to replay idempotent response", e);
-                        }
-                    }
-                    T result = action.get();
                     idempotencyRepository.insert(new IdempotencyRecord(
-                            requestId, operation.name(), fingerprint, writeJson(result)), clock.millis());
+                            requestId, operation.name(), writeJson(identity), null),
+                            clock.millis());
+                    T result = action.get();
+                    idempotencyRepository.updateResponse(requestId, writeJson(result));
                     return result;
                 });
             } catch (DuplicateKeyException duplicate) {
-                // 同键并发事务抢先插入（可能尚未提交），等待后重放
+                // 同键并发事务抢先占位，等待其提交后回到循环头部重放
                 if (System.currentTimeMillis() >= deadline) {
                     throw new ApiException(HttpStatus.CONFLICT,
                             "concurrent idempotency key conflict: " + requestId);
@@ -241,6 +333,26 @@ public class ExposureServiceImpl implements ExposureService {
                     throw new ApiException(HttpStatus.INTERNAL_SERVER_ERROR, "interrupted");
                 }
             }
+        }
+    }
+
+    /** 重放已提交记录：操作与结构化身份一致返回原响应，否则 409。 */
+    private <T> T replay(IdempotencyRecord record, Operation operation, JsonNode identity,
+                         Class<T> responseType, String requestId) {
+        JsonNode storedIdentity;
+        try {
+            storedIdentity = objectMapper.readTree(record.requestFingerprint());
+        } catch (Exception e) {
+            throw new IllegalStateException("failed to parse stored identity", e);
+        }
+        if (!record.operation().equals(operation.name()) || !storedIdentity.equals(identity)) {
+            throw new ApiException(HttpStatus.CONFLICT,
+                    "idempotency key reused with different parameters: " + requestId);
+        }
+        try {
+            return objectMapper.readValue(record.responseJson(), responseType);
+        } catch (Exception e) {
+            throw new IllegalStateException("failed to replay idempotent response", e);
         }
     }
 
@@ -346,6 +458,85 @@ public class ExposureServiceImpl implements ExposureService {
             return objectMapper.writeValueAsString(value);
         } catch (Exception e) {
             throw new IllegalStateException("failed to serialize response", e);
+        }
+    }
+
+    /** 访客所在组的成员列表（字典序）；未入组时返回仅含自身的单元素列表。 */
+    private List<String> groupMembersOf(String visitorId) {
+        return identityGroupRepository.findGroupIdByVisitor(visitorId)
+                .map(identityGroupRepository::findMembers)
+                .orElse(List.of(visitorId));
+    }
+
+    /**
+     * 显式身份归并（调用方已持幂等键，本方法在事务内执行）。
+     *
+     * <p>规则：两边均未入组则新建组（期望版本须为 0）；仅一边入组则另一边加入该组；
+     * 两边已在同一组则不新增成员、版本不变；两边在不同组则将 B 侧组整体并入 A 侧组。
+     * 存续组版本须等于期望版本，否则 409；成员变更后版本 +1。组合计超过 10 个编号拒绝；
+     * 合计占用超过当日上限不影响归并生效，仅由申请时的组合计检查禁止新增。</p>
+     */
+    private IdentityGroupResponse doMerge(MergeIdentityRequest request) {
+        if (request.visitorIdA().equals(request.visitorIdB())) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "visitorIdA and visitorIdB must differ");
+        }
+        long now = clock.millis();
+        identityGroupRepository.lockGlobal();
+        Optional<String> groupA = identityGroupRepository.lockGroupIdByVisitor(request.visitorIdA());
+        Optional<String> groupB = identityGroupRepository.lockGroupIdByVisitor(request.visitorIdB());
+
+        if (groupA.isPresent() && groupA.equals(groupB)) {
+            IdentityGroup group = identityGroupRepository.lockGroupById(groupA.get()).orElseThrow();
+            requireVersion(group, request.expectedVersion());
+            return new IdentityGroupResponse(group.groupId(), group.version(),
+                    identityGroupRepository.findMembers(group.groupId()), false, now);
+        }
+        if (groupA.isEmpty() && groupB.isEmpty()) {
+            if (request.expectedVersion() != 0) {
+                throw new ApiException(HttpStatus.CONFLICT,
+                        "identity group version conflict: expected " + request.expectedVersion()
+                                + " but no group exists");
+            }
+            IdentityGroup group = new IdentityGroup(
+                    UUID.randomUUID().toString().replace("-", ""), 1, now);
+            identityGroupRepository.insertGroup(group);
+            identityGroupRepository.insertMember(group.groupId(), request.visitorIdA(), now);
+            identityGroupRepository.insertMember(group.groupId(), request.visitorIdB(), now);
+            return new IdentityGroupResponse(group.groupId(), group.version(),
+                    identityGroupRepository.findMembers(group.groupId()), true, now);
+        }
+
+        // 存续组：A 侧优先；A 未入组时为 B 侧组
+        String survivorId = groupA.orElseGet(groupB::get);
+        IdentityGroup survivor = identityGroupRepository.lockGroupById(survivorId).orElseThrow();
+        requireVersion(survivor, request.expectedVersion());
+        List<String> incoming = groupA.isPresent()
+                ? (groupB.isPresent() ? identityGroupRepository.findMembers(groupB.get())
+                        : List.of(request.visitorIdB()))
+                : List.of(request.visitorIdA());
+        if (identityGroupRepository.countMembers(survivorId) + incoming.size()
+                > MAX_GROUP_MEMBERS) {
+            throw new ApiException(HttpStatus.CONFLICT,
+                    "identity group member limit exceeded: max " + MAX_GROUP_MEMBERS);
+        }
+        if (groupA.isPresent() && groupB.isPresent()) {
+            identityGroupRepository.moveMembers(groupB.get(), survivorId);
+            identityGroupRepository.deleteGroup(groupB.get());
+        } else {
+            for (String visitor : incoming) {
+                identityGroupRepository.insertMember(survivorId, visitor, now);
+            }
+        }
+        identityGroupRepository.incrementVersion(survivorId);
+        return new IdentityGroupResponse(survivorId, survivor.version() + 1,
+                identityGroupRepository.findMembers(survivorId), true, now);
+    }
+
+    private void requireVersion(IdentityGroup group, int expectedVersion) {
+        if (group.version() != expectedVersion) {
+            throw new ApiException(HttpStatus.CONFLICT,
+                    "identity group version conflict: expected " + expectedVersion
+                            + " but was " + group.version());
         }
     }
 }

@@ -71,4 +71,26 @@ public class ExposureController {
                                     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate utcDate) {
         return exposureService.queryQuota(campaignId, visitorId, utcDate);
     }
+
+    /** 显式身份归并：将两个编号（及其所在组）并为一组，共享每访客每日上限。 */
+    @PostMapping("/identity/merges")
+    public IdentityGroupResponse mergeIdentities(@Valid @RequestBody MergeIdentityRequest request) {
+        return exposureService.mergeIdentities(request);
+    }
+
+    /** 访客所属归并组；未入组返回 404。 */
+    @GetMapping("/identity/groups/{visitorId}")
+    public IdentityGroupResponse getIdentityGroup(@PathVariable String visitorId) {
+        return exposureService.getIdentityGroup(visitorId);
+    }
+
+    /** 组维度额度：组成员、合计及原编号分账；utcDate 缺省使用服务端当前 UTC 日。 */
+    @GetMapping("/campaigns/{campaignId}/group-quota")
+    public GroupQuotaResponse queryGroupQuota(@PathVariable String campaignId,
+                                              @RequestParam String visitorId,
+                                              @RequestParam(required = false)
+                                              @DateTimeFormat(iso = DateTimeFormat.ISO.DATE)
+                                              LocalDate utcDate) {
+        return exposureService.queryGroupQuota(campaignId, visitorId, utcDate);
+    }
 }
