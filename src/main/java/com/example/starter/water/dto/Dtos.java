@@ -74,6 +74,51 @@ public final class Dtos {
                                   List<CurtailmentResponse> curtailments) {
     }
 
+    /** 创建渠段命令；操作人由 X-Actor-Id 请求头提供，阻力版本从 1 起。 */
+    public record CreateSegmentRequest(String requestId, String segmentKey, Long resistance) {
+    }
+
+    /** 修改渠段阻力命令；expectedVersion 须等于当前版本。 */
+    public record UpdateResistanceRequest(String requestId, Long resistance, Long expectedVersion) {
+    }
+
+    /** 渠段视图；resistance 为正整数阻力系数，version 为当前阻力版本。 */
+    public record SegmentResponse(String segmentKey, long resistance, int version,
+                                  String createdUtc, String updatedUtc) {
+    }
+
+    /**
+     * 新类型配水申请命令；操作人由 X-Actor-Id 请求头提供。
+     * segments 为 1..5 段有序无重复渠段；flow 为恒定正整数流量（立方米/分钟）；
+     * 时段为 UTC 整分钟左闭右开；流量 × 分钟数 = 原申请水量；availableHead 为正整数可用水头。
+     */
+    public record SubmitPathAllocationRequest(String requestId, String allocationKey, Long windowId,
+                                              String userId, Long flow, String startUtc, String endUtc,
+                                              Long availableHead, List<String> segments) {
+    }
+
+    /** 新类型申请视图；amount 为派生原申请水量（流量 × 分钟数）的十进制字符串。 */
+    public record PathAllocationResponse(String allocationKey, long windowId, String userId,
+                                         String amount, String status, long flow, String startUtc,
+                                         String endUtc, long availableHead, List<String> segments,
+                                         String createdUtc) {
+    }
+
+    /** 审批冻结的段参数快照视图。 */
+    public record FrozenSegmentView(String segmentKey, int seq, long resistance, int version) {
+    }
+
+    /** 审批冻结的时片总流量视图，时片为 UTC 左闭右开。 */
+    public record FrozenSliceView(String segmentKey, String startUtc, String endUtc, long totalFlow) {
+    }
+
+    /** 申请路径视图；frozen 为 false 时冻结快照为空列表。 */
+    public record AllocationPathResponse(String allocationKey, long flow, String startUtc,
+                                         String endUtc, long availableHead, List<String> segments,
+                                         boolean frozen, List<FrozenSegmentView> frozenSegments,
+                                         List<FrozenSliceView> frozenSlices) {
+    }
+
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }

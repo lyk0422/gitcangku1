@@ -49,9 +49,61 @@ CREATE TABLE IF NOT EXISTS transfer (
     CONSTRAINT fk_transfer_window FOREIGN KEY (window_id) REFERENCES supply_window (id)
 ) COMMENT='配水额度转让流水，与源扣减、目标批准同事务提交，创建后不可变，不提供撤销';
 
+CREATE TABLE IF NOT EXISTS channel_segment (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '渠段主键',
+    segment_key VARCHAR(128) NOT NULL COMMENT '渠段业务键，全局唯一',
+    resistance BIGINT NOT NULL COMMENT '阻力系数 k，正整数；段损失 = k × 该段同时总流量平方',
+    version INT NOT NULL COMMENT '阻力版本，从 1 起，每次成功修改 +1；修改须携带 expectedVersion',
+    actor VARCHAR(128) NOT NULL COMMENT '最近操作人（X-Actor-Id），非空',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
+    updated_nanos BIGINT NOT NULL COMMENT '最近修改时间，UTC 纳秒时间戳',
+    CONSTRAINT uk_channel_segment_key UNIQUE (segment_key),
+    CONSTRAINT chk_channel_segment_resistance CHECK (resistance > 0),
+    CONSTRAINT chk_channel_segment_version CHECK (version >= 1)
+) COMMENT='渠段阻力参数，简化水力模型，仅合成参数，不模拟真实泵站';
+
+CREATE TABLE IF NOT EXISTS allocation_path (
+    allocation_id BIGINT PRIMARY KEY COMMENT '配水申请主键，一申请至多一条路径',
+    flow BIGINT NOT NULL COMMENT '恒定流量，正整数，单位立方米/分钟',
+    start_nanos BIGINT NOT NULL COMMENT '供水开始，UTC 整分钟纳秒时间戳（含）',
+    end_nanos BIGINT NOT NULL COMMENT '供水结束，UTC 整分钟纳秒时间戳（不含），左闭右开',
+    available_head BIGINT NOT NULL COMMENT '可用水头，正整数；任一时片路径损失之和不得超过',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
+    CONSTRAINT fk_path_allocation FOREIGN KEY (allocation_id) REFERENCES allocation (id),
+    CONSTRAINT chk_path_flow CHECK (flow > 0),
+    CONSTRAINT chk_path_head CHECK (available_head > 0)
+) COMMENT='新类型申请的供水路径参数；流量 × 分钟数 = 原申请水量';
+
+CREATE TABLE IF NOT EXISTS allocation_path_segment (
+    allocation_id BIGINT NOT NULL COMMENT '配水申请主键',
+    seq INT NOT NULL COMMENT '段序号，从 0 起，按申请指定顺序',
+    segment_key VARCHAR(128) NOT NULL COMMENT '渠段业务键，须已存在',
+    PRIMARY KEY (allocation_id, seq),
+    CONSTRAINT uk_path_segment UNIQUE (allocation_id, segment_key),
+    CONSTRAINT fk_path_seg_allocation FOREIGN KEY (allocation_id) REFERENCES allocation (id)
+) COMMENT='申请路径的有序无重复渠段，每份申请最多 5 段';
+
+CREATE TABLE IF NOT EXISTS path_freeze_segment (
+    allocation_id BIGINT NOT NULL COMMENT '配水申请主键',
+    seq INT NOT NULL COMMENT '段序号，与申请路径一致',
+    segment_key VARCHAR(128) NOT NULL COMMENT '渠段业务键',
+    resistance BIGINT NOT NULL COMMENT '批准时刻阻力快照',
+    version INT NOT NULL COMMENT '批准时刻阻力版本快照',
+    PRIMARY KEY (allocation_id, seq)
+) COMMENT='审批冻结的路径与参数版本快照，批准时写入，之后不可变';
+
+CREATE TABLE IF NOT EXISTS path_freeze_flow (
+    allocation_id BIGINT NOT NULL COMMENT '配水申请主键',
+    segment_key VARCHAR(128) NOT NULL COMMENT '渠段业务键',
+    slice_start_nanos BIGINT NOT NULL COMMENT '时片开始，UTC 纳秒时间戳（含）',
+    slice_end_nanos BIGINT NOT NULL COMMENT '时片结束，UTC 纳秒时间戳（不含）',
+    total_flow BIGINT NOT NULL COMMENT '该时片该渠段同时总流量，单位立方米/分钟',
+    PRIMARY KEY (allocation_id, segment_key, slice_start_nanos)
+) COMMENT='审批冻结的各时片总流量，按全部已批曲线起止切片计算';
+
 CREATE TABLE IF NOT EXISTS command_log (
     command_key VARCHAR(128) PRIMARY KEY COMMENT '命令幂等键',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：WINDOW_CREATE/ALLOCATION_SUBMIT/ALLOCATION_APPROVE/ALLOCATION_CANCEL/CURTAILMENT_CREATE/CURTAILMENT_CANCEL/TRANSFER/SEGMENT_CREATE/SEGMENT_UPDATE_RESISTANCE/PATH_ALLOCATION_SUBMIT',
     params VARCHAR(2048) NOT NULL COMMENT '规范化请求参数串，用于同键改参检测',
     response MEDIUMTEXT NULL COMMENT '首次成功响应 JSON；命令事务提交前写入',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳'

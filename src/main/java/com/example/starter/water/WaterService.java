@@ -1,7 +1,6 @@
 package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
-import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
@@ -12,7 +11,6 @@ import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -47,13 +45,15 @@ public class WaterService {
 
     private final WaterRepository repository;
     private final TransactionTemplate tx;
-    private final ObjectMapper objectMapper;
+    private final CommandExecutor commands;
+    private final HydraulicService hydraulicService;
 
     public WaterService(WaterRepository repository, PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+                        CommandExecutor commands, HydraulicService hydraulicService) {
         this.repository = repository;
         this.tx = new TransactionTemplate(transactionManager);
-        this.objectMapper = objectMapper;
+        this.commands = commands;
+        this.hydraulicService = hydraulicService;
     }
 
     // ------------------------------------------------------------------
@@ -134,6 +134,8 @@ public class WaterService {
                 throw ApiException.quotaExceeded("批准后将超过当前可用总量 " + fmt(available));
             }
             repository.updateAllocationStatus(allocation.id(), STATUS_APPROVED, nowNanos());
+            // 新类型申请：批准即进入水力模型，按起止切片重算全部已批路径并冻结快照；越限抛 422 整体回滚
+            hydraulicService.verifyAndFreezeIfPath(allocation.id());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
@@ -217,6 +219,24 @@ public class WaterService {
                         + " 不足，无法转让 " + fmt(amount));
             }
             long now = nowNanos();
+            // 路径继承：源带路径时目标必须无自有路径并继承原路径，且重算流量 × 分钟数 = 目标原申请水量；
+            // 一致性不满足则 422，双方各有路径则 409
+            HydraulicService.PathSpec sourcePath = hydraulicService.findPathSpec(lockedSource.id());
+            boolean targetHasPath;
+            if (sourcePath != null) {
+                if (hydraulicService.findPathSpec(lockedTarget.id()) != null) {
+                    throw ApiException.conflict("TRANSFER_PATH_CONFLICT", "转入申请已有自有路径，不能继承源路径");
+                }
+                if (amount.compareTo(sourcePath.volume()) != 0) {
+                    throw ApiException.unprocessable("FLOW_VOLUME_MISMATCH",
+                            "目标原申请水量 " + fmt(amount) + " 与继承路径流量 × 分钟数 "
+                                    + fmt(sourcePath.volume()) + " 不一致");
+                }
+                hydraulicService.inheritPath(lockedTarget.id(), sourcePath, now);
+                targetHasPath = true;
+            } else {
+                targetHasPath = hydraulicService.findPathSpec(lockedTarget.id()) != null;
+            }
             repository.decrementHeldAmount(lockedSource.id(), amount, now);
             repository.updateAllocationStatus(lockedTarget.id(), STATUS_APPROVED, now);
             try {
@@ -225,6 +245,10 @@ public class WaterService {
             } catch (DuplicateKeyException e) {
                 // 并发复用同一 transferKey（换 commandKey）：事务回滚，额度无变化
                 throw ApiException.conflict("TRANSFER_KEY_REUSED", "transferKey 已被使用: " + transferKey);
+            }
+            // 目标带路径（自有或继承）时按批准口径重算水力模型并冻结；越限抛 422 整体回滚
+            if (targetHasPath) {
+                hydraulicService.verifyAndFreezeIfPath(lockedTarget.id());
             }
             return toTransferResponse(repository.findTransferByKey(transferKey));
         });
@@ -316,40 +340,12 @@ public class WaterService {
     }
 
     // ------------------------------------------------------------------
-    // 幂等命令框架
+    // 幂等命令框架（委托 CommandExecutor，与新增写入口共用同一 command_log）
     // ------------------------------------------------------------------
 
-    /**
-     * 在单事务内执行幂等命令：先占位插入命令行，再执行业务并写回响应。
-     * 并发同键时占位插入会因唯一约束失败，随后读取已提交的首次结果重放或报 409。
-     */
     private <T> T runCommand(String operation, String commandKey, String params, Class<T> type,
                              Supplier<T> business) {
-        try {
-            return tx.execute(status -> {
-                CommandRow existing = repository.findCommand(commandKey);
-                if (existing != null) {
-                    return replay(existing, operation, params, type);
-                }
-                repository.insertCommand(commandKey, operation, params, nowNanos());
-                T result = business.get();
-                repository.updateCommandResponse(commandKey, toJson(result));
-                return result;
-            });
-        } catch (DuplicateKeyException e) {
-            CommandRow committed = repository.findCommand(commandKey);
-            if (committed == null || committed.response() == null) {
-                throw ApiException.conflict("COMMAND_CONFLICT", "相同 commandKey 的命令正在处理，请重试");
-            }
-            return replay(committed, operation, params, type);
-        }
-    }
-
-    private <T> T replay(CommandRow existing, String operation, String params, Class<T> type) {
-        if (!existing.operation().equals(operation) || !existing.params().equals(params)) {
-            throw ApiException.conflict("COMMAND_KEY_REUSED", "相同 commandKey 但参数不同，拒绝重放");
-        }
-        return fromJson(existing.response(), type);
+        return commands.run(operation, commandKey, params, type, business);
     }
 
     // ------------------------------------------------------------------
@@ -453,21 +449,5 @@ public class WaterService {
             return "0";
         }
         return stripped.toPlainString();
-    }
-
-    private String toJson(Object value) {
-        try {
-            return objectMapper.writeValueAsString(value);
-        } catch (Exception e) {
-            throw new IllegalStateException("响应序列化失败", e);
-        }
-    }
-
-    private <T> T fromJson(String json, Class<T> type) {
-        try {
-            return objectMapper.readValue(json, type);
-        } catch (Exception e) {
-            throw new IllegalStateException("响应反序列化失败", e);
-        }
     }
 }
