@@ -40,13 +40,21 @@ public class ObservationController {
     }
 
     /**
-     * 离线提交：携带 baseVersion 与三个字段完整候选值，执行三方合并。
+     * 离线提交：携带 baseVersion 与各字段完整候选值，执行三方合并。
+     * 字段冲突（409）时在冲突事务回滚后复核并置位未解决冲突标记，供密度估计成果校验。
      */
     @PostMapping("/{observationId}/merge")
     public ResponseEntity<ObservationResponse> merge(@PathVariable String observationId,
                                                      @Valid @RequestBody MergeObservationRequest request) {
-        ObservationService.WriteOutcome outcome = observationService.merge(observationId, request);
-        return ResponseEntity.status(outcome.status()).body(outcome.body());
+        try {
+            ObservationService.WriteOutcome outcome = observationService.merge(observationId, request);
+            return ResponseEntity.status(outcome.status()).body(outcome.body());
+        } catch (ApiException ex) {
+            if (ex.conflictFields() != null && !ex.conflictFields().isEmpty()) {
+                observationService.markConflictPendingIfStillConflicting(observationId, request);
+            }
+            throw ex;
+        }
     }
 
     /**

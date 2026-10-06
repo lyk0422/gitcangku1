@@ -32,6 +32,11 @@ import java.util.Set;
  * <p>合并规则（按字段比较基线 base、当前 current、候选 candidate）：
  * 候选未改（等于基线）保留当前；当前未改接受候选；两边改为相同值也接受；
  * 否则整次 409，不写入任何部分结果。读数按数值比较，其余字段按原文比较。
+ * 计数与采样面积作为一组（countArea）整体参与合并：只整组取值，不跨提交拼组。
+ *
+ * <p>合并冲突落库为 observation_current.conflict_pending 标记（冲突事务回滚后由
+ * 独立事务复核并置位），成功的合并/解决/删除会清除该标记；存在未解决冲突的观测
+ * 不得用于生成密度估计成果。
  *
  * <p>显式冲突解决（RESOLVE）在同一套占位与行锁机制内执行：事务内重读基线与最新当前版本重算冲突，
  * 人工选择必须恰好覆盖重算后的冲突字段；成功后原子写入新观测版本（内容无变化则不加版本）、
@@ -40,12 +45,12 @@ import java.util.Set;
 @Service
 public class ObservationService {
 
-    private static final String SEPARATOR = "\u0001";
+    private static final String SEPARATOR = "";
 
     /**
-     * 三个可编辑字段的固定顺序：冲突重算、选择校验与指纹均以此顺序处理，保证结果稳定。
+     * 可编辑字段（含计数面积组）的固定顺序：冲突重算、选择校验与指纹均以此顺序处理，保证结果稳定。
      */
-    private static final List<String> FIELDS = List.of("location", "reading", "note");
+    private static final List<String> FIELDS = List.of("location", "reading", "note", "countArea");
 
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
@@ -70,8 +75,9 @@ public class ObservationService {
      */
     @Transactional
     public WriteOutcome create(CreateObservationRequest request) {
+        validateCountAreaPair(request.count(), request.sampleArea());
         String fingerprint = fingerprint("CREATE", request.observationId(), request.location(),
-                request.reading(), request.note());
+                request.reading(), request.note(), toText(request.count()), toText(request.sampleArea()));
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -85,7 +91,8 @@ public class ObservationService {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
         ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
-                request.location(), request.reading(), request.note(), false);
+                request.location(), request.reading(), request.note(),
+                request.count(), request.sampleArea(), false, false);
         try {
             observationRepository.insertCurrent(snapshot);
         } catch (DuplicateKeyException e) {
@@ -101,8 +108,10 @@ public class ObservationService {
      */
     @Transactional
     public WriteOutcome merge(String observationId, MergeObservationRequest request) {
+        validateCountAreaPair(request.count(), request.sampleArea());
         String fingerprint = fingerprint("MERGE", observationId, String.valueOf(request.baseVersion()),
-                request.location(), request.reading(), request.note());
+                request.location(), request.reading(), request.note(),
+                toText(request.count()), toText(request.sampleArea()));
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -127,18 +136,25 @@ public class ObservationService {
         String mergedReading = mergeReadingField(base.reading(), current.reading(),
                 request.reading(), conflictFields);
         String mergedNote = mergeField("note", base.note(), current.note(), request.note(), conflictFields);
+        CountArea mergedGroup = mergeCountAreaGroup(base, current, request.count(), request.sampleArea(),
+                conflictFields);
         if (!conflictFields.isEmpty()) {
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, mergedReading, mergedNote, mergedGroup.count(), mergedGroup.sampleArea(),
+                false, false);
         if (sameContent(merged, current)) {
-            // 合并结果与当前完全相同：返回当前版本，不加版本
+            // 合并结果与当前完全相同：返回当前版本，不加版本；成功合并清除未解决冲突标记
+            if (current.conflictPending()) {
+                observationRepository.setConflictPending(observationId, false);
+            }
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
         ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, mergedReading, mergedNote, mergedGroup.count(), mergedGroup.sampleArea(),
+                false, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
@@ -168,7 +184,7 @@ public class ObservationService {
             throw ApiException.conflict("expectedVersion mismatch", current.version());
         }
         ObservationSnapshot tombstone = new ObservationSnapshot(observationId, current.version() + 1,
-                null, null, null, true);
+                null, null, null, null, null, true, false);
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
@@ -190,11 +206,13 @@ public class ObservationService {
      */
     @Transactional
     public ResolveOutcome resolveConflict(String observationId, ResolveConflictRequest request) {
+        validateCountAreaPair(request.count(), request.sampleArea());
         Map<String, FieldSelection> selections = parseSelections(request.selections());
         String normalizedSelections = writeSelectionsJson(selections);
         String fingerprint = fingerprint("RESOLVE", observationId, request.resolutionId(),
                 String.valueOf(request.baseVersion()), String.valueOf(request.expectedCurrentVersion()),
-                request.location(), request.reading(), request.note(), normalizedSelections, request.operator());
+                request.location(), request.reading(), request.note(),
+                toText(request.count()), toText(request.sampleArea()), normalizedSelections, request.operator());
         ResolveOutcome replayed = checkResolveReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -243,6 +261,10 @@ public class ObservationService {
         if (noteConflict) {
             conflictFields.add("note");
         }
+        boolean countAreaConflict = countAreaConflicts(base, current, request.count(), request.sampleArea());
+        if (countAreaConflict) {
+            conflictFields.add("countArea");
+        }
         validateSelectionCoverage(selections.keySet(), conflictFields);
 
         String resolvedLocation = resolveFieldValue(locationConflict, selections.get("location"),
@@ -251,22 +273,30 @@ public class ObservationService {
                 base.reading(), current.reading(), request.reading(), true);
         String resolvedNote = resolveFieldValue(noteConflict, selections.get("note"),
                 base.note(), current.note(), request.note(), false);
+        CountArea resolvedGroup = resolveCountAreaGroup(countAreaConflict, selections.get("countArea"),
+                base, current, request.count(), request.sampleArea());
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                resolvedLocation, resolvedReading, resolvedNote, false);
+                resolvedLocation, resolvedReading, resolvedNote, resolvedGroup.count(),
+                resolvedGroup.sampleArea(), false, false);
         boolean contentChanged = !sameContent(merged, current);
         int newVersion = contentChanged ? current.version() + 1 : current.version();
         if (contentChanged) {
             ObservationSnapshot next = new ObservationSnapshot(observationId, newVersion,
-                    resolvedLocation, resolvedReading, resolvedNote, false);
+                    resolvedLocation, resolvedReading, resolvedNote, resolvedGroup.count(),
+                    resolvedGroup.sampleArea(), false, false);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
+        } else if (current.conflictPending()) {
+            // 无变化解决同样视为冲突已处理：清除未解决冲突标记
+            observationRepository.setConflictPending(observationId, false);
         }
 
         ResolutionRecord record = new ResolutionRecord(
                 request.resolutionId(), observationId, request.requestId(),
                 request.baseVersion(), current.version(), newVersion,
                 request.location(), request.reading(), request.note(),
+                request.count(), request.sampleArea(),
                 List.copyOf(conflictFields), normalizedSelections, request.operator(),
                 Instant.now(clock), contentChanged);
         try {
@@ -285,10 +315,33 @@ public class ObservationService {
         }
 
         ObservationSnapshot pointed = contentChanged
-                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
+                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading,
+                        resolvedNote, resolvedGroup.count(), resolvedGroup.sampleArea(), false, false)
                 : current;
         return completeResolve(request.requestId(), HttpStatus.OK,
                 ResolutionResponse.of(record, pointed, objectMapper));
+    }
+
+    /**
+     * 合并冲突后置位未解决冲突标记：在冲突事务回滚后的独立事务内重读当前状态并复核，
+     * 仅当相同候选与最新当前状态仍然冲突时才置位，避免覆盖并发已完成的新合并/解决。
+     */
+    @Transactional
+    public void markConflictPendingIfStillConflicting(String observationId, MergeObservationRequest request) {
+        ObservationSnapshot current = observationRepository.findCurrentForUpdate(observationId).orElse(null);
+        if (current == null || current.deleted()) {
+            return;
+        }
+        ObservationSnapshot base = observationRepository.findVersion(observationId, request.baseVersion())
+                .orElse(null);
+        if (base == null) {
+            return;
+        }
+        List<String> conflicts = computeConflictFields(base, current, request.location(), request.reading(),
+                request.note(), request.count(), request.sampleArea());
+        if (!conflicts.isEmpty()) {
+            observationRepository.setConflictPending(observationId, true);
+        }
     }
 
     /**
@@ -362,12 +415,95 @@ public class ObservationService {
     }
 
     /**
-     * 判断合并结果与当前版本内容是否完全相同（读数按数值，其余按原文）。
+     * 计数面积组三方合并：整组比较、整组取值，不跨提交拼组；组冲突记录为 countArea。
+     */
+    private CountArea mergeCountAreaGroup(ObservationSnapshot base, ObservationSnapshot current,
+                                          Integer candidateCount, Integer candidateArea,
+                                          List<String> conflictFields) {
+        if (groupEquals(candidateCount, candidateArea, base.individualCount(), base.sampleArea())) {
+            return new CountArea(current.individualCount(), current.sampleArea());
+        }
+        if (groupEquals(current.individualCount(), current.sampleArea(),
+                base.individualCount(), base.sampleArea())
+                || groupEquals(candidateCount, candidateArea,
+                        current.individualCount(), current.sampleArea())) {
+            return new CountArea(candidateCount, candidateArea);
+        }
+        conflictFields.add("countArea");
+        return new CountArea(current.individualCount(), current.sampleArea());
+    }
+
+    /**
+     * 判断计数面积组是否冲突：候选组未改、任一侧未改或两边改为相同组均不冲突，否则冲突。
+     */
+    private boolean countAreaConflicts(ObservationSnapshot base, ObservationSnapshot current,
+                                       Integer candidateCount, Integer candidateArea) {
+        if (groupEquals(candidateCount, candidateArea, base.individualCount(), base.sampleArea())) {
+            return false;
+        }
+        if (groupEquals(current.individualCount(), current.sampleArea(),
+                base.individualCount(), base.sampleArea())) {
+            return false;
+        }
+        return !groupEquals(candidateCount, candidateArea,
+                current.individualCount(), current.sampleArea());
+    }
+
+    /**
+     * 按原三方规则重算全部冲突字段（含计数面积组），供冲突标记复核使用。
+     */
+    private List<String> computeConflictFields(ObservationSnapshot base, ObservationSnapshot current,
+                                               String location, String reading, String note,
+                                               Integer count, Integer sampleArea) {
+        List<String> conflicts = new ArrayList<>();
+        if (fieldConflicts(base.location(), current.location(), location, false)) {
+            conflicts.add("location");
+        }
+        if (fieldConflicts(base.reading(), current.reading(), reading, true)) {
+            conflicts.add("reading");
+        }
+        if (fieldConflicts(base.note(), current.note(), note, false)) {
+            conflicts.add("note");
+        }
+        if (countAreaConflicts(base, current, count, sampleArea)) {
+            conflicts.add("countArea");
+        }
+        return conflicts;
+    }
+
+    /**
+     * 计数面积组相等判定：计数与采样面积同时相等（含同为 null）才视为同组。
+     */
+    private boolean groupEquals(Integer countLeft, Integer areaLeft, Integer countRight, Integer areaRight) {
+        return Objects.equals(countLeft, countRight) && Objects.equals(areaLeft, areaRight);
+    }
+
+    /**
+     * 计数面积组解决取值：组冲突时按人工选择整组取当前或候选；非冲突时按原三方规则整组合并。
+     */
+    private CountArea resolveCountAreaGroup(boolean conflict, FieldSelection selection,
+                                            ObservationSnapshot base, ObservationSnapshot current,
+                                            Integer candidateCount, Integer candidateArea) {
+        if (conflict) {
+            return selection == FieldSelection.CANDIDATE
+                    ? new CountArea(candidateCount, candidateArea)
+                    : new CountArea(current.individualCount(), current.sampleArea());
+        }
+        if (groupEquals(candidateCount, candidateArea, base.individualCount(), base.sampleArea())) {
+            return new CountArea(current.individualCount(), current.sampleArea());
+        }
+        return new CountArea(candidateCount, candidateArea);
+    }
+
+    /**
+     * 判断合并结果与当前版本内容是否完全相同（读数按数值，计数面积组整组，其余按原文）。
      */
     private boolean sameContent(ObservationSnapshot merged, ObservationSnapshot current) {
         return Objects.equals(merged.location(), current.location())
                 && Objects.equals(merged.note(), current.note())
-                && readingEquals(merged.reading(), current.reading());
+                && readingEquals(merged.reading(), current.reading())
+                && groupEquals(merged.individualCount(), merged.sampleArea(),
+                        current.individualCount(), current.sampleArea());
     }
 
     private boolean readingEquals(String left, String right) {
@@ -375,6 +511,19 @@ public class ObservationService {
             return Objects.equals(left, right);
         }
         return new BigDecimal(left).compareTo(new BigDecimal(right)) == 0;
+    }
+
+    /**
+     * 计数面积组完整性校验：计数与采样面积必须同时提供或同时缺省，否则 400。
+     */
+    private void validateCountAreaPair(Integer count, Integer sampleArea) {
+        if ((count == null) != (sampleArea == null)) {
+            throw ApiException.badRequest("count and sampleArea must be provided together as a group");
+        }
+    }
+
+    private static String toText(Integer value) {
+        return value == null ? null : value.toString();
     }
 
     /**
@@ -450,15 +599,16 @@ public class ObservationService {
     // ---------- 冲突解决辅助逻辑 ----------
 
     /**
-     * 解析并规范化选择映射：键必须是三个可编辑字段之一，值仅允许 CURRENT/CANDIDATE（大小写不敏感）；
-     * 重复字段（JSON 反序列化不会出现）或非法键值一律 400。
+     * 解析并规范化选择映射：键必须是可编辑字段（含计数面积组 countArea）之一，
+     * 值仅允许 CURRENT/CANDIDATE（大小写不敏感）；重复字段或非法键值一律 400。
      */
     private Map<String, FieldSelection> parseSelections(Map<String, String> raw) {
         Map<String, FieldSelection> selections = new LinkedHashMap<>();
         for (Map.Entry<String, String> entry : raw.entrySet()) {
             String field = entry.getKey() == null ? null : entry.getKey().trim();
             if (field == null || !FIELDS.contains(field)) {
-                throw ApiException.badRequest("selection key must be one of location/reading/note: " + field);
+                throw ApiException.badRequest(
+                        "selection key must be one of location/reading/note/countArea: " + field);
             }
             FieldSelection selection = FieldSelection.fromValue(entry.getValue());
             if (selection == null) {
@@ -609,6 +759,8 @@ public class ObservationService {
                 && Objects.equals(record.candidateLocation(), request.location())
                 && Objects.equals(record.candidateReading(), request.reading())
                 && Objects.equals(record.candidateNote(), request.note())
+                && Objects.equals(record.candidateCount(), request.count())
+                && Objects.equals(record.candidateSampleArea(), request.sampleArea())
                 && Objects.equals(record.fieldSelections(), normalizedSelections)
                 && Objects.equals(record.operator(), request.operator());
     }
@@ -622,6 +774,12 @@ public class ObservationService {
                 .orElseThrow(() -> new IllegalStateException(
                         "pointed version missing for resolution: " + record.resolutionId()));
         return ResolutionResponse.of(record, pointed, objectMapper);
+    }
+
+    /**
+     * 计数面积组：观测计数（非负整数）与采样面积（正整数，平方米）作为整体参与合并与解决。
+     */
+    private record CountArea(Integer count, Integer sampleArea) {
     }
 
     /**

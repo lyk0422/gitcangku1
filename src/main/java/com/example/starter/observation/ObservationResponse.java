@@ -11,6 +11,8 @@ import com.fasterxml.jackson.annotation.JsonInclude;
  * @param location      观测地点（墓碑版本不返回）
  * @param reading       观测读数（墓碑版本不返回）
  * @param note          观测备注（墓碑版本不返回）
+ * @param count         观测计数，非负整数（墓碑版本或未记录计数面积组时不返回）
+ * @param sampleArea    采样面积，正整数，单位平方米（墓碑版本或未记录计数面积组时不返回）
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ObservationResponse(
@@ -19,16 +21,20 @@ public record ObservationResponse(
         boolean deleted,
         String location,
         String reading,
-        String note) {
+        String note,
+        Integer count,
+        Integer sampleArea) {
 
     /**
      * 由快照构造响应；墓碑版本自动省略业务字段。
      */
     public static ObservationResponse of(ObservationSnapshot snapshot) {
         if (snapshot.deleted()) {
-            return new ObservationResponse(snapshot.observationId(), snapshot.version(), true, null, null, null);
+            return new ObservationResponse(snapshot.observationId(), snapshot.version(), true,
+                    null, null, null, null, null);
         }
         return new ObservationResponse(snapshot.observationId(), snapshot.version(), false,
-                snapshot.location(), snapshot.reading(), snapshot.note());
+                snapshot.location(), snapshot.reading(), snapshot.note(),
+                snapshot.individualCount(), snapshot.sampleArea());
     }
 }

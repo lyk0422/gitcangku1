@@ -8,7 +8,6 @@ import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
 import java.sql.Timestamp;
-import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 
@@ -23,6 +22,10 @@ public class ResolutionRepository {
     };
     private static final TypeReference<java.util.Map<String, String>> SELECTIONS_TYPE = new TypeReference<>() {
     };
+
+    private static final String COLUMNS = "resolution_id, observation_id, request_id, base_version, previous_version, "
+            + "new_version, candidate_location, candidate_reading, candidate_note, candidate_count, "
+            + "candidate_sample_area, conflict_fields, field_selections, operator, content_changed, resolved_at_utc";
 
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
@@ -39,9 +42,9 @@ public class ResolutionRepository {
         jdbcTemplate.update(
                 "INSERT INTO conflict_resolution (resolution_id, observation_id, request_id, "
                         + "base_version, previous_version, new_version, candidate_location, candidate_reading, "
-                        + "candidate_note, conflict_fields, field_selections, operator, content_changed, "
-                        + "resolved_at_utc, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                        + "candidate_note, candidate_count, candidate_sample_area, conflict_fields, "
+                        + "field_selections, operator, content_changed, resolved_at_utc, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 record.resolutionId(),
                 record.observationId(),
                 record.requestId(),
@@ -51,6 +54,8 @@ public class ResolutionRepository {
                 record.candidateLocation(),
                 record.candidateReading(),
                 record.candidateNote(),
+                record.candidateCount(),
+                record.candidateSampleArea(),
                 writeJson(record.conflictFields()),
                 record.fieldSelections(),
                 record.operator(),
@@ -63,10 +68,7 @@ public class ResolutionRepository {
      */
     public Optional<ResolutionRecord> findByResolutionId(String resolutionId) {
         return jdbcTemplate.query(
-                        "SELECT resolution_id, observation_id, request_id, base_version, previous_version, "
-                                + "new_version, candidate_location, candidate_reading, candidate_note, "
-                                + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc "
-                                + "FROM conflict_resolution WHERE resolution_id = ?",
+                        "SELECT " + COLUMNS + " FROM conflict_resolution WHERE resolution_id = ?",
                         RESOLUTION_MAPPER, resolutionId)
                 .stream().findFirst();
     }
@@ -76,10 +78,7 @@ public class ResolutionRepository {
      */
     public List<ResolutionRecord> findByObservationId(String observationId) {
         return jdbcTemplate.query(
-                "SELECT resolution_id, observation_id, request_id, base_version, previous_version, "
-                        + "new_version, candidate_location, candidate_reading, candidate_note, "
-                        + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc "
-                        + "FROM conflict_resolution WHERE observation_id = ? "
+                "SELECT " + COLUMNS + " FROM conflict_resolution WHERE observation_id = ? "
                         + "ORDER BY resolved_at_utc ASC, resolution_id ASC",
                 RESOLUTION_MAPPER, observationId);
     }
@@ -121,6 +120,8 @@ public class ResolutionRepository {
             rs.getString("candidate_location"),
             rs.getString("candidate_reading"),
             rs.getString("candidate_note"),
+            (Integer) rs.getObject("candidate_count"),
+            (Integer) rs.getObject("candidate_sample_area"),
             readFieldList(rs.getString("conflict_fields")),
             rs.getString("field_selections"),
             rs.getString("operator"),
