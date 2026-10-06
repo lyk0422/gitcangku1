@@ -135,9 +135,14 @@ public class ExperimentService {
 
     /**
      * 退组：状态置为 WITHDRAWN 并记录时间；席位不释放、已有分配不重排。
+     * 实验行级锁使退组与关闭、结果提交、分析串行，决定分析所见的最终集合。
      */
     @Transactional
     public AllocationView withdraw(String experimentId, String participantId) {
+        ExperimentRow experiment = experimentRepository.lockById(experimentId);
+        if (experiment == null) {
+            throw ApiException.notFound("实验不存在: " + experimentId);
+        }
         AllocationRow allocation = mustFindAllocation(experimentId, participantId);
         if ("WITHDRAWN".equals(allocation.status())) {
             throw ApiException.conflict("参与者已退组");

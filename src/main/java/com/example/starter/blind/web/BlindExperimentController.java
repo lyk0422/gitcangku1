@@ -5,13 +5,18 @@ import com.example.starter.blind.ActorContext;
 import com.example.starter.blind.ApiException;
 import com.example.starter.blind.RequestTokens;
 import com.example.starter.blind.dto.AllocationView;
+import com.example.starter.blind.dto.AnalysisRequest;
 import com.example.starter.blind.dto.CreateExperimentRequest;
 import com.example.starter.blind.dto.ExperimentView;
+import com.example.starter.blind.dto.ResultView;
+import com.example.starter.blind.dto.SubmitResultRequest;
 import com.example.starter.blind.dto.UnblindApplyRequest;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
+import com.example.starter.blind.service.AnalysisService;
 import com.example.starter.blind.service.ExperimentService;
 import com.example.starter.blind.service.IdempotencyService;
+import com.example.starter.blind.service.ResultService;
 import com.example.starter.blind.service.UnblindService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -24,7 +29,10 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * 实验盲法分配与受控揭盲接口。
@@ -40,18 +48,26 @@ public class BlindExperimentController {
     static final String OP_ALLOCATION_WITHDRAW = "allocation.withdraw";
     static final String OP_UNBLIND_APPLY = "unblind.apply";
     static final String OP_UNBLIND_APPROVE = "unblind.approve";
+    static final String OP_RESULT_SUBMIT = "result.submit";
+    static final String OP_ANALYSIS_CREATE = "analysis.create";
 
     private final ExperimentService experimentService;
     private final UnblindService unblindService;
+    private final ResultService resultService;
+    private final AnalysisService analysisService;
     private final IdempotencyService idempotencyService;
     private final ActorContext actorContext;
 
     public BlindExperimentController(ExperimentService experimentService,
                                      UnblindService unblindService,
+                                     ResultService resultService,
+                                     AnalysisService analysisService,
                                      IdempotencyService idempotencyService,
                                      ActorContext actorContext) {
         this.experimentService = experimentService;
         this.unblindService = unblindService;
+        this.resultService = resultService;
+        this.analysisService = analysisService;
         this.idempotencyService = idempotencyService;
         this.actorContext = actorContext;
     }
@@ -193,6 +209,56 @@ public class BlindExperimentController {
         Actor actor = requireActor();
         return unblindService.getResult(
                 RequestTokens.requireId("unblindRequestId", unblindRequestId), actor.actorId());
+    }
+
+    // ---------------- 结果与受限统计 ----------------
+
+    /** 提交/修订参与者结果（仅 COORDINATOR）：首次提交版本1，仅 OPEN 且未退组可修订并加一。 */
+    @PostMapping("/experiments/{experimentId}/participants/{participantId}/result")
+    public ResponseEntity<String> submitResult(
+            @PathVariable String experimentId,
+            @PathVariable String participantId,
+            @Valid @RequestBody SubmitResultRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireCoordinator();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String pid = RequestTokens.requireId("participantId", participantId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        String fingerprint = idempotencyService.fingerprint(OP_RESULT_SUBMIT,
+                Map.of("experimentId", expId, "participantId", pid, "value", request.value()));
+        return idempotencyService.runWrite(reqId, OP_RESULT_SUBMIT, fingerprint, actor, () -> {
+            ResultView view = resultService.submit(expId, pid, request.value(), actor.actorId());
+            int status = view.version() == 1 ? HttpStatus.CREATED.value() : HttpStatus.OK.value();
+            return IdempotencyService.WriteOutcome.of(status, view);
+        });
+    }
+
+    /**
+     * 受限置换分析（仅 REVIEWER）：实验关闭后引用 4~8 个不同未退组参与者与固定结果版本；
+     * 响应仅含精确 k/n 与匿名人数，不含个体值或处理映射。引用换序视为同参。
+     */
+    @PostMapping("/experiments/{experimentId}/analysis")
+    public ResponseEntity<String> createAnalysis(
+            @PathVariable String experimentId,
+            @RequestBody AnalysisRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        Actor actor = requireReviewer();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        // 指纹使用排序后的引用列表，换序同参；空元素原样保留，由服务层以 422 报告。
+        List<String> sortedIds = request.participantIds() == null ? null
+                : request.participantIds().stream()
+                        .sorted(Comparator.nullsFirst(Comparator.naturalOrder()))
+                        .toList();
+        Map<String, Object> params = new TreeMap<>();
+        params.put("experimentId", expId);
+        params.put("version", request.version());
+        params.put("participantIds", sortedIds);
+        String fingerprint = idempotencyService.fingerprint(OP_ANALYSIS_CREATE, params);
+        return idempotencyService.runWrite(reqId, OP_ANALYSIS_CREATE, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
+                        analysisService.analyze(expId, request.participantIds(),
+                                request.version(), actor.actorId())));
     }
 
     // ---------------- 权限辅助（先于幂等回放执行） ----------------

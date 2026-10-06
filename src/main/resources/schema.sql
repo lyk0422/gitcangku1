@@ -92,6 +92,54 @@ COMMENT ON COLUMN unblind_request.created_at IS '申请时间，Unix 毫秒，UT
 COMMENT ON COLUMN unblind_request.reviewed_at IS '批准时间，Unix 毫秒，UTC；NULL 表示未批准';
 COMMENT ON COLUMN unblind_request.pending_allocation_id IS '待审去重列：待审时等于 allocation_id，终态置 NULL；唯一索引保证同一分配至多一个待审申请';
 
+CREATE TABLE IF NOT EXISTS participant_result (
+    experiment_id  VARCHAR(64) NOT NULL,
+    participant_id VARCHAR(64) NOT NULL,
+    version        INT         NOT NULL,
+    result_value   INT         NOT NULL,
+    updated_actor  VARCHAR(64) NOT NULL,
+    updated_at     BIGINT      NOT NULL,
+    CONSTRAINT pk_participant_result PRIMARY KEY (experiment_id, participant_id, version),
+    CONSTRAINT ck_result_value CHECK (result_value BETWEEN 0 AND 100),
+    CONSTRAINT ck_result_version CHECK (version >= 1)
+);
+COMMENT ON TABLE  participant_result IS '参与者结果表；每次提交/修订追加一行新版本，历史版本保留供分析冻结引用';
+COMMENT ON COLUMN participant_result.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN participant_result.participant_id IS '合成参与者编号，非真实医疗数据';
+COMMENT ON COLUMN participant_result.version IS '结果版本，首次提交为1，每次修订加一；版本行一旦写入不可改';
+COMMENT ON COLUMN participant_result.result_value IS '整数结果值，范围0~100，无单位';
+COMMENT ON COLUMN participant_result.updated_actor IS '提交/修订的操作者编号（X-Actor-Id）';
+COMMENT ON COLUMN participant_result.updated_at IS '该版本写入时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS analysis (
+    id              VARCHAR(64)  NOT NULL,
+    experiment_id   VARCHAR(64)  NOT NULL,
+    result_version  INT          NOT NULL,
+    participant_ids VARCHAR(600) NOT NULL,
+    group_a_count   INT          NOT NULL,
+    group_b_count   INT          NOT NULL,
+    k               BIGINT       NOT NULL,
+    n               BIGINT       NOT NULL,
+    observed_num    BIGINT       NOT NULL,
+    basis_json      CLOB         NOT NULL,
+    actor_id        VARCHAR(64)  NOT NULL,
+    created_at      BIGINT       NOT NULL,
+    CONSTRAINT pk_analysis PRIMARY KEY (id)
+);
+COMMENT ON TABLE  analysis IS '置换分析冻结记录；成功分析落库后不可改，外部响应仅含统计量，个体值与处理映射仅保存在 basis_json 内部依据中';
+COMMENT ON COLUMN analysis.id IS '分析记录编号，全局唯一';
+COMMENT ON COLUMN analysis.experiment_id IS '所属实验编号，分析时实验必须已关闭';
+COMMENT ON COLUMN analysis.result_version IS '冻结引用的结果版本，全部引用参与者在该版本必须有值';
+COMMENT ON COLUMN analysis.participant_ids IS '引用的参与者编号，按字典序排序后逗号连接；换序同参';
+COMMENT ON COLUMN analysis.group_a_count IS '匿名人数：引用集合中处理A人数（取自库内映射，不由调用方指定）';
+COMMENT ON COLUMN analysis.group_b_count IS '匿名人数：引用集合中处理B人数';
+COMMENT ON COLUMN analysis.k IS '全部同A人数分组中统计量大于等于观察值的组合数';
+COMMENT ON COLUMN analysis.n IS '全部同A人数分组的总组合数';
+COMMENT ON COLUMN analysis.observed_num IS '观察统计量分子 |sumA*countB - sumB*countA|，公分母 countA*countB 省略，避免浮点';
+COMMENT ON COLUMN analysis.basis_json IS '完整内部依据快照（参与者、处理映射、取值），禁止透出到任何接口';
+COMMENT ON COLUMN analysis.actor_id IS '执行分析的 REVIEWER 操作者编号';
+COMMENT ON COLUMN analysis.created_at IS '分析时间，Unix 毫秒，UTC';
+
 CREATE TABLE IF NOT EXISTS idempotent_request (
     request_id      VARCHAR(64)  NOT NULL,
     actor_id        VARCHAR(64)  NOT NULL,

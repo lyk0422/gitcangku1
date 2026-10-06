@@ -19,8 +19,10 @@ public abstract class AbstractBlindIntegrationTest {
 
     @BeforeEach
     void cleanTables() {
-        // 无外键约束，顺序无依赖；全部清空保证场景独立。
+        // 无外键约束，顺序无依赖；全部清空保证场景独立（含合成演示数据）。
         jdbc.update("DELETE FROM idempotent_request");
+        jdbc.update("DELETE FROM analysis");
+        jdbc.update("DELETE FROM participant_result");
         jdbc.update("DELETE FROM unblind_request");
         jdbc.update("DELETE FROM allocation");
         jdbc.update("DELETE FROM seat");
