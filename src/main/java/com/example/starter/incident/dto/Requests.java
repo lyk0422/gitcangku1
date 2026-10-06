@@ -53,6 +53,30 @@ public final class Requests {
     }
 
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
-    public record TaskActionRequest(String commandKey) {
+    public record TaskActionRequest(String commandKey, Integer expectedTaskVersion) {
+
+        /** 兼容构造：不携带期望版本（不校验任务版本）。 */
+        public TaskActionRequest(String commandKey) {
+            this(commandKey, null);
+        }
+    }
+
+    /**
+     * 择一前置组配置请求：requestId 为调用方幂等键；expectedTaskVersion 为目标任务期望版本；
+     * groups 为 1~3 组前置，每组 2~5 个成员，组内成员顺序无关（换序视为同参）。
+     */
+    public record ConfigureGroupsRequest(String requestId, Integer expectedTaskVersion,
+                                         List<GroupSpec> groups) {
+    }
+
+    /** 前置组：2~5 个成员任务，完成判定要求组内至少一个 DONE。 */
+    public record GroupSpec(List<MemberSpec> members) {
+    }
+
+    /**
+     * 前置组成员：以事件号与任务号标识，可跨事件；
+     * expectedTaskVersion 为配置时声明的成员任务期望版本，不一致则配置 409。
+     */
+    public record MemberSpec(String incidentKey, String taskKey, Integer expectedTaskVersion) {
     }
 }

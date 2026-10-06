@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     done_at TIMESTAMP(6) NULL,
     cancelled_by VARCHAR(128) NULL,
     cancelled_at TIMESTAMP(6) NULL,
+    version INT NOT NULL DEFAULT 1,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
@@ -94,6 +95,25 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
     blocker_incident_id BIGINT NOT NULL,
     created_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_task_blocker UNIQUE (task_id, blocker_incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS task_prerequisite_groups (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    group_no INT NOT NULL,
+    selected_member_id BIGINT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_prereq_group UNIQUE (task_id, group_no)
+);
+
+CREATE TABLE IF NOT EXISTS task_prerequisite_members (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    group_id BIGINT NOT NULL,
+    member_incident_id BIGINT NOT NULL,
+    member_task_id BIGINT NOT NULL,
+    expected_task_version INT NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_prereq_member UNIQUE (group_id, member_task_id)
 );
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (

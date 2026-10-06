@@ -1,6 +1,7 @@
 package com.example.starter.incident;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.ConfigureGroupsRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
@@ -187,5 +188,15 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 配置择一前置组（仅当前指挥人；仅 OPEN 任务；整体替换，候选边成环 422）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/prerequisites")
+    public TaskView configureGroups(@PathVariable String incidentKey, @PathVariable String taskKey,
+                                    @RequestHeader("X-Actor-Id") String actor,
+                                    @RequestBody ConfigureGroupsRequest req) {
+        return service.configureGroups(incidentKey, taskKey, actor, req);
     }
 }

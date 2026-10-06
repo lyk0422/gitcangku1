@@ -56,4 +56,9 @@ public class ApiException extends RuntimeException {
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
     }
+
+    /** 422：择一前置组候选边在任务依赖图中成环，整体拒绝且不留边。 */
+    public static ApiException dependencyCycle(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "DEPENDENCY_CYCLE", message, null);
+    }
 }

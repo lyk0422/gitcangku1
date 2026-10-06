@@ -7,16 +7,21 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Supplier;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.ConfigureGroupsRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.GroupSpec;
+import com.example.starter.incident.dto.Requests.MemberSpec;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
@@ -30,6 +35,8 @@ import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.PrerequisiteGroupView;
+import com.example.starter.incident.dto.Responses.PrerequisiteMemberView;
 import com.example.starter.incident.dto.Responses.StatusChangeView;
 import com.example.starter.incident.dto.Responses.TaskBlockerView;
 import com.example.starter.incident.dto.Responses.TaskView;
@@ -64,6 +71,15 @@ public class IncidentService {
     /** 每任务阻塞事件上限。 */
     private static final int MAX_BLOCKERS_PER_TASK = 5;
 
+    /** 每任务择一前置组上限。 */
+    private static final int MAX_GROUPS_PER_TASK = 3;
+
+    /** 每前置组成员数量下限（择一至少两个候选）。 */
+    private static final int MIN_MEMBERS_PER_GROUP = 2;
+
+    /** 每前置组成员数量上限。 */
+    private static final int MAX_MEMBERS_PER_GROUP = 5;
+
     /** 视为阻塞已解除的目标事件状态。 */
     private static final Set<IncidentStatus> UNBLOCKING_STATUSES = EnumSet.of(
             IncidentStatus.CONTAINED, IncidentStatus.RESOLVED, IncidentStatus.CLOSED);
@@ -71,16 +87,19 @@ public class IncidentService {
     private final IncidentRepository incidents;
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
+    private final TaskPrerequisiteRepository prerequisites;
     private final CommandKeyRepository commandKeys;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
-                           IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           IncidentTaskRepository tasks, TaskPrerequisiteRepository prerequisites,
+                           CommandKeyRepository commandKeys,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
+        this.prerequisites = prerequisites;
         this.commandKeys = commandKeys;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -453,7 +472,7 @@ public class IncidentService {
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
                             groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
-                            now, now));
+                            1, now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
                     }
@@ -463,7 +482,11 @@ public class IncidentService {
 
     /**
      * 完成任务：仅当前指挥人；仅 OPEN 可完成；全部阻塞事件进入
-     * CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表。
+     * CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表；
+     * 已配置择一前置组时每组至少一个 DONE 成员（CANCELLED 不满足，全部取消仍阻塞），
+     * 否则 409 并返回未满足的组。完成时冻结每组选中的 DONE 依据（完整任务标识字典序
+     * 最小者），快照保留组全集与选中依据，后续其他候选完成不改历史；成功后版本加一。
+     * 携带 expectedTaskVersion 时与当前版本不一致返回 409。
      * DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
@@ -471,7 +494,8 @@ public class IncidentService {
                                  TaskActionRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "task_complete", hash(incidentKey, taskKey, actor),
+        return runIdempotent(commandKey, "task_complete",
+                hash(incidentKey, taskKey, actor, String.valueOf(req.expectedTaskVersion())),
                 TaskView.class, () -> {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
@@ -480,26 +504,41 @@ public class IncidentService {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能完成");
                     }
+                    requireTaskVersion(task, req.expectedTaskVersion());
+                    // 图锁：与配置、成员完成/取消串行，共同锁定依赖图判定
+                    tasks.lockGraph();
                     List<String> unresolved = unresolvedBlockers(task.id());
                     if (!unresolved.isEmpty()) {
                         throw ApiException.conflict("存在未解除阻塞的事件: "
                                 + String.join(",", unresolved), List.copyOf(unresolved));
                     }
+                    List<PrerequisiteGroupView> groups = prerequisiteGroups(task.id());
+                    List<PrerequisiteGroupView> unsatisfied = groups.stream()
+                            .filter(g -> g.members().stream()
+                                    .noneMatch(PrerequisiteMemberView::satisfied))
+                            .toList();
+                    if (!unsatisfied.isEmpty()) {
+                        throw ApiException.conflict("存在未满足的择一前置组",
+                                List.copyOf(unsatisfied));
+                    }
+                    freezeSelections(task.id());
                     tasks.markDone(task.id(), actor, now());
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
 
     /**
-     * 取消任务：仅当前指挥人；仅 OPEN 可取消；DONE/CANCELLED 为终态，
-     * 重复操作按 commandKey 幂等规则返回首次结果。
+     * 取消任务：仅当前指挥人；仅 OPEN 可取消；成功后版本加一，
+     * 携带 expectedTaskVersion 时与当前版本不一致返回 409。
+     * DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
     public TaskView cancelTask(String incidentKey, String taskKey, String actor,
                                TaskActionRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "task_cancel", hash(incidentKey, taskKey, actor),
+        return runIdempotent(commandKey, "task_cancel",
+                hash(incidentKey, taskKey, actor, String.valueOf(req.expectedTaskVersion())),
                 TaskView.class, () -> {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
@@ -508,6 +547,9 @@ public class IncidentService {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能取消");
                     }
+                    requireTaskVersion(task, req.expectedTaskVersion());
+                    // 图锁：与配置、成员完成/取消串行，共同锁定依赖图判定
+                    tasks.lockGraph();
                     tasks.markCancelled(task.id(), actor, now());
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
@@ -632,7 +674,8 @@ public class IncidentService {
     }
 
     /**
-     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务。
+     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务；
+     * 择一前置组与完成冻结的选中依据按当前库内快照组装。
      */
     private TaskView toTaskView(IncidentTask task) {
         List<TaskBlockerView> blockers = incidents.listBlockingIncidents(task.id()).stream()
@@ -641,7 +684,8 @@ public class IncidentService {
                 .toList();
         return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
                 blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
-                task.cancelledBy(), task.cancelledAt());
+                task.cancelledBy(), task.cancelledAt(), task.version(),
+                prerequisiteGroups(task.id()));
     }
 
     private static TransferView toTransferView(IncidentTransfer transfer) {
@@ -662,5 +706,214 @@ public class IncidentService {
         List<EscalationView> views = list.stream().map(this::toEscalationView).toList();
         EscalationView current = views.isEmpty() ? null : views.get(views.size() - 1);
         return new EscalationHistoryView(incident.deadlineAt(), current, views);
+    }
+
+    /**
+     * 配置择一前置组：仅当前指挥人可写（权限检查先于幂等重放，交接后旧指挥人
+     * 即使持有曾成功的 requestId 也无权写入）；仅 OPEN 任务可配置，已完成/已取消
+     * 任务不能修改组。1~3 组、每组 2~5 个成员，成员以事件号与任务号标识、可跨事件，
+     * 组内换序视为同参、组内重复 400。请求与每个成员均附 expectedTaskVersion，
+     * 与当前版本不一致 409（配置、成员完成/取消、当前任务完成共同推进版本，
+     * 锁定依赖图判定）。配置整体替换旧组：在依赖图全局锁内先删旧边，再对全部候选边
+     * 做任务级环检测，任一环 422 且不留边；成功后任务版本加一。
+     * requestId 幂等：身份含操作、操作者、资源及全部参数和期望版本（结构化 JSON 摘要，
+     * 避免分隔符碰撞），同键同参重放首次完整响应，异参 409，失败不占键。
+     */
+    @Transactional
+    public TaskView configureGroups(String incidentKey, String taskKey, String actor,
+                                    ConfigureGroupsRequest req) {
+        String requestId = requireText(req.requestId(), "requestId");
+        String taskKeyText = requireText(taskKey, "taskKey");
+        int expectedVersion = requireVersion(req.expectedTaskVersion());
+        List<GroupSpec> specs = req.groups() == null ? List.of() : req.groups();
+        if (specs.isEmpty() || specs.size() > MAX_GROUPS_PER_TASK) {
+            throw ApiException.badRequest("择一前置组数量为 1~" + MAX_GROUPS_PER_TASK);
+        }
+        // 参数规范化：组内成员按完整任务标识字典序排序（换序同参），组内重复 400
+        List<List<MemberSpec>> normalizedGroups = new ArrayList<>();
+        for (GroupSpec spec : specs) {
+            List<MemberSpec> members = spec == null || spec.members() == null
+                    ? List.of() : spec.members();
+            if (members.size() < MIN_MEMBERS_PER_GROUP || members.size() > MAX_MEMBERS_PER_GROUP) {
+                throw ApiException.badRequest("每组前置成员数量为 " + MIN_MEMBERS_PER_GROUP
+                        + "~" + MAX_MEMBERS_PER_GROUP);
+            }
+            List<MemberSpec> normalized = members.stream()
+                    .map(m -> {
+                        if (m == null) {
+                            throw ApiException.badRequest("前置组成员不能为空");
+                        }
+                        return new MemberSpec(requireText(m.incidentKey(), "memberIncidentKey"),
+                                requireText(m.taskKey(), "memberTaskKey"),
+                                requireVersion(m.expectedTaskVersion()));
+                    })
+                    .sorted(Comparator.comparing(MemberSpec::incidentKey)
+                            .thenComparing(MemberSpec::taskKey))
+                    .toList();
+            for (int i = 1; i < normalized.size(); i++) {
+                MemberSpec prev = normalized.get(i - 1);
+                MemberSpec curr = normalized.get(i);
+                if (prev.incidentKey().equals(curr.incidentKey())
+                        && prev.taskKey().equals(curr.taskKey())) {
+                    throw ApiException.badRequest("组内成员重复: "
+                            + curr.incidentKey() + "/" + curr.taskKey());
+                }
+            }
+            normalizedGroups.add(normalized);
+        }
+        Incident incident = lockIncident(incidentKey);
+        requireCommander(incident, actor);
+        return runIdempotent(requestId, "task_groups_configure",
+                structuredHash(incidentKey, actor, taskKeyText, expectedVersion, normalizedGroups),
+                TaskView.class, () -> configureGroups(incident, taskKeyText,
+                        expectedVersion, normalizedGroups));
+    }
+
+    /**
+     * 配置事务体：状态与版本校验、成员解析、图锁内环检测与整组替换。
+     */
+    private TaskView configureGroups(Incident incident, String taskKey, int expectedVersion,
+                                     List<List<MemberSpec>> normalizedGroups) {
+        IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+        if (task.status() != TaskStatus.OPEN) {
+            throw ApiException.conflict("任务已处于终态 " + task.status() + "，不能修改前置组");
+        }
+        if (task.version() != expectedVersion) {
+            throw ApiException.conflict("任务版本已变更，期望版本 " + expectedVersion
+                    + "，当前版本 " + task.version());
+        }
+        // 解析成员任务并校验成员期望版本（成员完成/取消/被配置会推进版本）
+        record ResolvedMember(long incidentId, long taskId, int expectedTaskVersion) {
+        }
+        List<List<ResolvedMember>> resolvedGroups = new ArrayList<>();
+        for (List<MemberSpec> group : normalizedGroups) {
+            List<ResolvedMember> resolved = new ArrayList<>();
+            for (MemberSpec member : group) {
+                Incident memberIncident = incidents.findByKey(member.incidentKey())
+                        .orElseThrow(() -> ApiException.notFound(
+                                "成员事件不存在: " + member.incidentKey()));
+                IncidentTask memberTask = tasks.findByKey(memberIncident.id(), member.taskKey())
+                        .orElseThrow(() -> ApiException.notFound("成员任务不存在: "
+                                + member.incidentKey() + "/" + member.taskKey()));
+                if (memberTask.version() != member.expectedTaskVersion()) {
+                    throw ApiException.conflict("成员任务 " + member.incidentKey() + "/"
+                            + member.taskKey() + " 版本已变更，期望版本 "
+                            + member.expectedTaskVersion() + "，当前版本 " + memberTask.version());
+                }
+                resolved.add(new ResolvedMember(memberIncident.id(), memberTask.id(),
+                        member.expectedTaskVersion()));
+            }
+            resolvedGroups.add(resolved);
+        }
+        // 全局图锁：串行化配置、成员完成/取消与当前任务完成的依赖图判定
+        tasks.lockGraph();
+        // 替换语义：同事务先删旧边，再对全部候选边做任务级环检测，任一环 422 且不留边
+        prerequisites.deleteByTask(task.id());
+        for (List<ResolvedMember> resolved : resolvedGroups) {
+            for (ResolvedMember member : resolved) {
+                if (tasks.isTaskReachable(member.taskId(), task.id())) {
+                    throw ApiException.dependencyCycle("前置组候选边会形成环: 成员任务 "
+                            + member.taskId() + " 已直接或间接依赖任务 " + taskKey);
+                }
+            }
+        }
+        Instant now = now();
+        for (int g = 0; g < resolvedGroups.size(); g++) {
+            long groupId = prerequisites.insertGroup(task.id(), g + 1, now);
+            for (ResolvedMember member : resolvedGroups.get(g)) {
+                prerequisites.insertMember(groupId, member.incidentId(), member.taskId(),
+                        member.expectedTaskVersion(), now);
+            }
+        }
+        tasks.bumpVersion(task.id(), now);
+        return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+    }
+
+    /**
+     * 任务版本校验：携带期望版本时与当前版本不一致返回 409（旧版本拒绝）。
+     */
+    private static void requireTaskVersion(IncidentTask task, Integer expectedTaskVersion) {
+        if (expectedTaskVersion != null && task.version() != expectedTaskVersion) {
+            throw ApiException.conflict("任务版本已变更，期望版本 " + expectedTaskVersion
+                    + "，当前版本 " + task.version());
+        }
+    }
+
+    private static int requireVersion(Integer value) {
+        if (value == null) {
+            throw ApiException.badRequest("expectedTaskVersion 不能为空");
+        }
+        return value;
+    }
+
+    /**
+     * 组装择一前置组视图：成员按事件号、任务号字典序；selectedMember 为完成时
+     * 冻结的选中依据，未完成为 null。
+     */
+    private List<PrerequisiteGroupView> prerequisiteGroups(long taskId) {
+        Map<Integer, List<TaskPrerequisiteRepository.MemberDetail>> byGroup = new LinkedHashMap<>();
+        for (TaskPrerequisiteRepository.MemberDetail detail
+                : prerequisites.listMemberDetails(taskId)) {
+            byGroup.computeIfAbsent(detail.groupNo(), k -> new ArrayList<>()).add(detail);
+        }
+        List<PrerequisiteGroupView> groups = new ArrayList<>();
+        for (var entry : byGroup.entrySet()) {
+            List<TaskPrerequisiteRepository.MemberDetail> details = entry.getValue();
+            List<PrerequisiteMemberView> members = details.stream()
+                    .map(IncidentService::toMemberView).toList();
+            PrerequisiteMemberView selected = null;
+            Long selectedId = details.get(0).selectedMemberId();
+            if (selectedId != null) {
+                for (int i = 0; i < details.size(); i++) {
+                    if (details.get(i).memberId() == selectedId) {
+                        selected = members.get(i);
+                        break;
+                    }
+                }
+            }
+            groups.add(new PrerequisiteGroupView(entry.getKey(), members, selected));
+        }
+        return groups;
+    }
+
+    /**
+     * 完成冻结：每组在 DONE 成员中取完整任务标识字典序最小者写为选中依据，
+     * 此后其他候选完成或状态变化不再改历史（明细查询已按字典序排序）。
+     */
+    private void freezeSelections(long taskId) {
+        Map<Long, List<TaskPrerequisiteRepository.MemberDetail>> byGroup = new LinkedHashMap<>();
+        for (TaskPrerequisiteRepository.MemberDetail detail
+                : prerequisites.listMemberDetails(taskId)) {
+            byGroup.computeIfAbsent(detail.groupId(), k -> new ArrayList<>()).add(detail);
+        }
+        for (var entry : byGroup.entrySet()) {
+            TaskPrerequisiteRepository.MemberDetail selected = entry.getValue().stream()
+                    .filter(d -> TaskStatus.DONE.name().equals(d.taskStatus()))
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalStateException("完成门禁已通过但组内无 DONE 成员"));
+            prerequisites.markSelected(entry.getKey(), selected.memberId());
+        }
+    }
+
+    private static PrerequisiteMemberView toMemberView(TaskPrerequisiteRepository.MemberDetail d) {
+        return new PrerequisiteMemberView(d.incidentKey(), d.taskKey(), d.taskStatus(),
+                d.expectedTaskVersion(), TaskStatus.DONE.name().equals(d.taskStatus()));
+    }
+
+    /**
+     * 结构化参数摘要：将操作身份（操作者、资源、全部参数与期望版本）序列化为 JSON 后
+     * 取 SHA-256，避免分隔符拼接造成的碰撞；调用方需先完成参数规范化（如组内排序）。
+     */
+    private String structuredHash(Object... parts) {
+        try {
+            byte[] json = objectMapper.writeValueAsBytes(List.of(parts));
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(digest.digest(json));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("幂等参数序列化失败", e);
+        }
     }
 }

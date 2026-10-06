@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel/task_groups_configure',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     done_at TIMESTAMP(6) NULL COMMENT '完成 UTC 时间；仅 DONE 有值，否则为空',
     cancelled_by VARCHAR(128) NULL COMMENT '取消人（操作时的当前指挥人）；仅 CANCELLED 有值，否则为空',
     cancelled_at TIMESTAMP(6) NULL COMMENT '取消 UTC 时间；仅 CANCELLED 有值，否则为空',
+    version INT NOT NULL DEFAULT 1 COMMENT '任务版本，初始 1；配置择一前置组、完成、取消成功各加一，用于依赖图判定的乐观锁',
     created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
     updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
@@ -96,6 +97,25 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
     created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
     CONSTRAINT uk_task_blocker UNIQUE (task_id, blocker_incident_id)
 ) COMMENT='处置任务跨事件阻塞关系表（有向图边：所属任务事件 → 阻塞事件）';
+
+CREATE TABLE IF NOT EXISTS task_prerequisite_groups (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id；配置替换时整组重建，仅 OPEN 任务可配置',
+    group_no INT NOT NULL COMMENT '组序号，从 1 开始；每任务 1~3 组，完成判定要求每组至少一个 DONE 成员',
+    selected_member_id BIGINT NULL COMMENT '任务完成时冻结的选中依据成员 id（task_prerequisite_members.id），取该组 DONE 成员中完整任务标识（事件号+任务号）字典序最小者；未完成为空，冻结后不再变更',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '配置写入 UTC 时间',
+    CONSTRAINT uk_prereq_group UNIQUE (task_id, group_no)
+) COMMENT='任务择一前置组表';
+
+CREATE TABLE IF NOT EXISTS task_prerequisite_members (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    group_id BIGINT NOT NULL COMMENT '所属前置组 id，关联 task_prerequisite_groups.id；每组 2~5 个成员',
+    member_incident_id BIGINT NOT NULL COMMENT '成员任务所属事件 id，关联 incidents.id；可跨事件',
+    member_task_id BIGINT NOT NULL COMMENT '成员任务 id，关联 incident_tasks.id；仅 DONE 满足前置，CANCELLED 不满足，全部取消仍阻塞',
+    expected_task_version INT NOT NULL COMMENT '配置时声明的成员任务期望版本；与成员当前版本不一致时配置失败（409）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '配置写入 UTC 时间',
+    CONSTRAINT uk_prereq_member UNIQUE (group_id, member_task_id)
+) COMMENT='任务择一前置组成员表';
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'

@@ -64,11 +64,30 @@ public final class Responses {
 
     /**
      * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * cancelledBy/cancelledAt 仅 CANCELLED 有值。version 初始 1，配置前置组、完成、
+     * 取消成功各加一；prerequisiteGroups 为择一前置组（未配置为空列表）。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
                            List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt,
+                           int version, List<PrerequisiteGroupView> prerequisiteGroups) {
+    }
+
+    /**
+     * 择一前置组视图：members 按事件号、任务号字典序；selectedMember 为任务完成时
+     * 冻结的选中依据（该组 DONE 成员中完整任务标识字典序最小者），未完成为 null。
+     */
+    public record PrerequisiteGroupView(int groupNo, List<PrerequisiteMemberView> members,
+                                        PrerequisiteMemberView selectedMember) {
+    }
+
+    /**
+     * 前置组成员视图：taskStatus 为查询时成员任务的当前状态；
+     * satisfied 表示该成员为 DONE（CANCELLED 不满足）；expectedTaskVersion 为配置时
+     * 声明的成员期望版本（历史快照，不随成员后续版本变化）。
+     */
+    public record PrerequisiteMemberView(String incidentKey, String taskKey, String taskStatus,
+                                         int expectedTaskVersion, boolean satisfied) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */

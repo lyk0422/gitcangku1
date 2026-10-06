@@ -52,6 +52,7 @@ public class IncidentTaskRepository {
                 doneAt == null ? null : doneAt.toInstant(),
                 rs.getString("cancelled_by"),
                 cancelledAt == null ? null : cancelledAt.toInstant(),
+                rs.getInt("version"),
                 rs.getTimestamp("created_at").toInstant(),
                 rs.getTimestamp("updated_at").toInstant());
     }
@@ -70,8 +71,8 @@ public class IncidentTaskRepository {
         jdbc.update(con -> {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
-                            + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            + " created_by, done_by, done_at, cancelled_by, cancelled_at, version,"
+                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
@@ -83,8 +84,9 @@ public class IncidentTaskRepository {
             ps.setTimestamp(8, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
             ps.setString(9, task.cancelledBy());
             ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
-            ps.setTimestamp(11, Timestamp.from(task.createdAt()));
-            ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setInt(11, task.version());
+            ps.setTimestamp(12, Timestamp.from(task.createdAt()));
+            ps.setTimestamp(13, Timestamp.from(task.updatedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -126,21 +128,29 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻。
+     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻，版本加一。
      */
     public void markDone(long id, String actor, Instant at) {
         jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
-                        + " updated_at = ? WHERE id = ?",
+                        + " version = version + 1, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 
     /**
-     * 将 OPEN 任务置为 CANCELLED，记录取消人与 UTC 时刻。
+     * 将 OPEN 任务置为 CANCELLED，记录取消人与 UTC 时刻，版本加一。
      */
     public void markCancelled(long id, String actor, Instant at) {
         jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
-                        + " cancelled_at = ?, updated_at = ? WHERE id = ?",
+                        + " cancelled_at = ?, version = version + 1, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
+    }
+
+    /**
+     * 配置择一前置组成功后将任务版本加一（状态不变）。
+     */
+    public void bumpVersion(long id, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET version = version + 1, updated_at = ? WHERE id = ?",
+                Timestamp.from(at), id);
     }
 
     /**
@@ -191,6 +201,48 @@ public class IncidentTaskRepository {
             long current = queue.poll();
             for (Long next : adjacency.getOrDefault(current, List.of())) {
                 if (next == toIncidentId) {
+                    return true;
+                }
+                if (visited.add(next)) {
+                    queue.add(next);
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 任务级依赖图有向边：fromTaskId（被前置组约束的任务）→ toTaskId（前置组成员任务）。
+     */
+    public record TaskEdge(long fromTaskId, long toTaskId) {
+    }
+
+    /**
+     * 任务级环检测：在择一前置组构成的任务依赖图中，判断从 fromTaskId 出发
+     * 沿前置边是否可达 toTaskId。调用前必须已持有 lockGraph() 全局锁，
+     * 且调用方已同事务删除被替换任务的旧出边，保证检测与后续边写入串行一致。
+     */
+    public boolean isTaskReachable(long fromTaskId, long toTaskId) {
+        if (fromTaskId == toTaskId) {
+            return true;
+        }
+        List<TaskEdge> edges = jdbc.query(
+                "SELECT g.task_id, m.member_task_id FROM task_prerequisite_members m"
+                        + " JOIN task_prerequisite_groups g ON g.id = m.group_id",
+                (rs, n) -> new TaskEdge(rs.getLong(1), rs.getLong(2)));
+        Map<Long, List<Long>> adjacency = new HashMap<>();
+        for (TaskEdge edge : edges) {
+            adjacency.computeIfAbsent(edge.fromTaskId(), k -> new ArrayList<>())
+                    .add(edge.toTaskId());
+        }
+        Set<Long> visited = new HashSet<>();
+        Deque<Long> queue = new ArrayDeque<>();
+        queue.add(fromTaskId);
+        visited.add(fromTaskId);
+        while (!queue.isEmpty()) {
+            long current = queue.poll();
+            for (Long next : adjacency.getOrDefault(current, List.of())) {
+                if (next == toTaskId) {
                     return true;
                 }
                 if (visited.add(next)) {
