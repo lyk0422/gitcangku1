@@ -63,6 +63,37 @@ CREATE TABLE IF NOT EXISTS release_resume_record (
   PRIMARY KEY (id)
 ) COMMENT='发布单人工恢复记录，历史不可改';
 
+CREATE TABLE IF NOT EXISTS group_release (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '组发布ID',
+  model VARCHAR(64) NOT NULL COMMENT '目标设备型号，全体成员同型号',
+  to_version VARCHAR(64) NOT NULL COMMENT '目标固件版本，激活成功时全组统一切换',
+  generation INT NOT NULL DEFAULT 1 COMMENT '当前组代次，从1开始；准备回执与激活必须匹配该代次',
+  status VARCHAR(16) NOT NULL COMMENT '状态：PREPARING准备中，ACTIVATED已激活（终态），ABORTED准备失败中止（终态），CANCELLED已取消（终态）',
+  activation_generation INT NULL COMMENT '激活代次，激活成功时生成且全组成员一致；未激活为NULL',
+  success_count INT NOT NULL DEFAULT 0 COMMENT '成功统计：激活成功时按成员数统一记成功，每设备一次',
+  failed_count INT NOT NULL DEFAULT 0 COMMENT '失败统计：每台设备首次FAILED回执记一次，取消不计',
+  failed_device VARCHAR(64) NULL COMMENT '触发整组中止的失败成员设备ID，未中止为NULL',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
+  PRIMARY KEY (id)
+) COMMENT='固定设备组预备屏障发布，区别于单设备普通升级';
+
+CREATE TABLE IF NOT EXISTS group_member (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '成员任务ID',
+  group_id BIGINT NOT NULL COMMENT '所属组发布ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  generation INT NOT NULL COMMENT '组代次，创建时取自组当前代次，回执必须匹配',
+  status VARCHAR(16) NOT NULL COMMENT 'PENDING待准备；PREPARED已暂存（不改当前版本）；FAILED准备失败',
+  active_device VARCHAR(64) NULL COMMENT '组未终结时等于device_id，组终结后置NULL；用于同设备至多属于一个活动组的唯一约束',
+  prepared_at_utc VARCHAR(40) NULL COMMENT '暂存时刻，UTC，ISO-8601格式；未暂存为NULL',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_member_group_device UNIQUE (group_id, device_id)
+) COMMENT='组发布成员任务，同设备同组最多一条';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_member_active_device ON group_member (active_device);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
   request_id VARCHAR(64) NOT NULL COMMENT '全局唯一请求ID',
   api VARCHAR(64) NOT NULL COMMENT '接口标识',
