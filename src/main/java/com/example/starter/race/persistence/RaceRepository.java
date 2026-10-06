@@ -3,6 +3,7 @@ package com.example.starter.race.persistence;
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.RankingMode;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -40,7 +41,8 @@ public class RaceRepository {
     /** 按ID查询赛事。 */
     public Optional<RaceRow> findRace(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ?",
+                .query("SELECT race_id, version, status, ranking_mode, created_at "
+                                + "FROM race WHERE race_id = ?",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -53,7 +55,8 @@ public class RaceRepository {
      */
     public Optional<RaceRow> findRaceForUpdate(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ? FOR UPDATE",
+                .query("SELECT race_id, version, status, ranking_mode, created_at "
+                                + "FROM race WHERE race_id = ? FOR UPDATE",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -188,7 +191,8 @@ public class RaceRepository {
         SnapshotRow header = headers.getFirst();
         List<SnapshotEntryRow> entryRows = jdbcTemplate.query(
                 "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count "
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "segment_millis_desc "
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
         List<SnapshotCheckpointRow> checkpoints = jdbcTemplate.query(
@@ -210,17 +214,26 @@ public class RaceRepository {
                         entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
                         entry.displayOrder(), entry.checkpointCount(),
                         entry.coveredCheckpointCount(),
-                        missingByBib.getOrDefault(entry.bib(), List.of())))
+                        missingByBib.getOrDefault(entry.bib(), List.of()),
+                        entry.segmentMillisDesc()))
                 .toList();
         return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.sealedAt(),
                 entries, checkpoints));
     }
 
-    /** 新建赛事，初始版本1、状态OPEN。 */
+    /** 新建赛事，初始版本1、状态OPEN、NORMAL排名模式。 */
     public void insertRace(String raceId, long now) {
         jdbcTemplate.update(
-                "INSERT INTO race (race_id, version, status, created_at) VALUES (?, 1, 'OPEN', ?)",
+                "INSERT INTO race (race_id, version, status, ranking_mode, created_at) "
+                        + "VALUES (?, 1, 'OPEN', 'NORMAL', ?)",
                 raceId, now);
+    }
+
+    /** 变更排名模式；调用方已持有 race 行锁并完成版本推进。 */
+    public void updateRankingMode(String raceId, RankingMode mode) {
+        jdbcTemplate.update(
+                "UPDATE race SET ranking_mode = ? WHERE race_id = ?",
+                mode.name(), raceId);
     }
 
     /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
@@ -292,8 +305,9 @@ public class RaceRepository {
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_entry "
                         + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "segment_millis_desc) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.entries(),
                 snapshot.entries().size(),
                 (ps, entry) -> {
@@ -307,6 +321,7 @@ public class RaceRepository {
                     ps.setInt(8, entry.displayOrder());
                     ps.setInt(9, entry.checkpointCount());
                     ps.setInt(10, entry.coveredCheckpointCount());
+                    ps.setString(11, serializeSegments(entry.segmentMillisDesc()));
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
@@ -381,6 +396,36 @@ public class RaceRepository {
         jdbcTemplate.update("DELETE FROM race");
     }
 
+    /** 序列化倒序段耗时向量为逗号分隔字符串；null 向量存 NULL。 */
+    private static String serializeSegments(List<Long> segmentMillisDesc) {
+        if (segmentMillisDesc == null) {
+            return null;
+        }
+        StringBuilder builder = new StringBuilder();
+        for (Long segment : segmentMillisDesc) {
+            if (builder.length() > 0) {
+                builder.append(',');
+            }
+            builder.append(segment);
+        }
+        return builder.toString();
+    }
+
+    /** 解析逗号分隔的倒序段耗时向量；NULL 返回 null，空串对应空向量（无检查点的 COUNTBACK）。 */
+    private static List<Long> parseSegments(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        if (raw.isEmpty()) {
+            return List.of();
+        }
+        List<Long> segments = new java.util.ArrayList<>();
+        for (String part : raw.split(",")) {
+            segments.add(Long.parseLong(part));
+        }
+        return List.copyOf(segments);
+    }
+
     private static final class RaceRowMapper implements RowMapper<RaceRow> {
         @Override
         public RaceRow mapRow(ResultSet rs, int rowNum) throws SQLException {
@@ -388,6 +433,7 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getInt("version"),
                     RaceStatus.valueOf(rs.getString("status")),
+                    RankingMode.valueOf(rs.getString("ranking_mode")),
                     rs.getLong("created_at"));
         }
     }
@@ -435,7 +481,8 @@ public class RaceRepository {
                     rs.getInt("display_order"),
                     rs.getInt("checkpoint_count"),
                     rs.getInt("covered_checkpoint_count"),
-                    List.of());
+                    List.of(),
+                    parseSegments(rs.getString("segment_millis_desc")));
         }
     }
 

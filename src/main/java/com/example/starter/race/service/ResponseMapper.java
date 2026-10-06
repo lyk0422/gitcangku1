@@ -53,7 +53,7 @@ final class ResponseMapper {
             List<CheckpointRow> checkpoints,
             List<CheckpointTimingRow> timings) {
         List<ResultEntry> entries = ResultCalculator.compute(
-                runners, penalties, checkpoints, timings);
+                race.rankingMode(), runners, penalties, checkpoints, timings);
         return new StandingResponse(
                 race.raceId(),
                 race.version(),
@@ -81,7 +81,8 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                entry.segmentMillisDesc());
     }
 
     static ResultEntryResponse toEntryResponse(SnapshotEntryRow entry) {
@@ -94,7 +95,8 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                entry.segmentMillisDesc());
     }
 
     /**

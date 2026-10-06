@@ -79,6 +79,14 @@ public class RaceController {
         return toResponse(raceService.submitTiming(raceId, bib, request));
     }
 
+    /** 变更排名模式（仅尚无分段记录的 OPEN 赛事）。 */
+    @PostMapping("/{raceId}/ranking-mode")
+    public ResponseEntity<Object> setRankingMode(
+            @PathVariable String raceId,
+            @Valid @RequestBody SetRankingModeRequest request) {
+        return toResponse(raceService.setRankingMode(raceId, request));
+    }
+
     /** 封榜。 */
     @PostMapping("/{raceId}/seal")
     public ResponseEntity<Object> sealRace(

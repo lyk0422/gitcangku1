@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS race (
     race_id VARCHAR(64) NOT NULL COMMENT '赛事ID，全局唯一',
     version INT NOT NULL COMMENT '版本号，从1开始，每次写操作加一',
     status VARCHAR(16) NOT NULL COMMENT '赛事状态：OPEN-开放可写，SEALED-已封榜只读',
+    ranking_mode VARCHAR(16) NOT NULL DEFAULT 'NORMAL' COMMENT '排名模式：NORMAL-总耗时升序同分并列，COUNTBACK-总耗时相同按倒序段耗时破同分；仅尚无分段记录的OPEN赛事可变更',
     created_at BIGINT NOT NULL COMMENT '创建时间，Unix毫秒时间戳',
     CONSTRAINT pk_race PRIMARY KEY (race_id)
 );
@@ -54,6 +55,7 @@ CREATE TABLE IF NOT EXISTS result_snapshot_entry (
     total_time_ms BIGINT COMMENT '总耗时=原始完赛耗时+生效加时（毫秒）；未排名时为NULL',
     checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '赛事检查点总数；未配置检查点为0',
     covered_checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '封榜时该选手已覆盖检查点数量；缺失检查点由result_snapshot_checkpoint中elapsed_millis为NULL的行固化',
+    segment_millis_desc VARCHAR(1024) COMMENT '倒序段耗时向量（毫秒，逗号分隔，从最后一段到第一段），段耗时为相邻检查点累计时刻之差、不含处罚；仅COUNTBACK模式的RANKED条目非空，其余为NULL',
     display_order INT NOT NULL COMMENT '展示顺序，从0开始：先名次顺序，并列者按参赛号字典序，其余按参赛号字典序',
     CONSTRAINT pk_snapshot_entry PRIMARY KEY (race_id, bib),
     CONSTRAINT fk_snapshot_entry_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
@@ -97,7 +99,7 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/SET_RANKING_MODE',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',

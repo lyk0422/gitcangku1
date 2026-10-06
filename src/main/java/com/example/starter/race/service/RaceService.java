@@ -9,6 +9,7 @@ import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
+import com.example.starter.race.api.SetRankingModeRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
 
@@ -44,6 +45,12 @@ public interface RaceService {
      * 且 elapsedMillis 必须小于该选手原始完赛耗时；违反返回422且不写入。
      */
     ServiceResult submitTiming(String raceId, String bib, SubmitTimingRequest request);
+
+    /**
+     * 变更排名模式（NORMAL/COUNTBACK）；仅 OPEN 且尚无任何分段记录时可变更，
+     * 需携带非空操作者与匹配版本，成功后版本加一；已有分段记录或已封榜返回409。
+     */
+    ServiceResult setRankingMode(String raceId, SetRankingModeRequest request);
 
     /** 封榜：校验版本并原子保存只读成绩快照（含每名选手分段明细与缺失检查点）。 */
     ServiceResult sealRace(String raceId, SealRaceRequest request);
