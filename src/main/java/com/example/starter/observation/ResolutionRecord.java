@@ -15,6 +15,8 @@ import java.util.List;
  * @param candidateLocation   候选地点完整值
  * @param candidateReading    候选读数完整值（十进制原文）
  * @param candidateNote       候选备注完整值
+ * @param candidateIndividualCount 候选个体计数完整值（非负整数；未提供计数面积组时为 null）
+ * @param candidateSampledArea     候选采样面积完整值（正整数，单位平方米；未提供计数面积组时为 null）
  * @param conflictFields      服务端重算出的冲突字段名列表
  * @param fieldSelections     各冲突字段的人工选择（CURRENT/CANDIDATE 的 JSON 原文）
  * @param operator            操作者标识
@@ -31,6 +33,8 @@ public record ResolutionRecord(
         String candidateLocation,
         String candidateReading,
         String candidateNote,
+        Integer candidateIndividualCount,
+        Integer candidateSampledArea,
         List<String> conflictFields,
         String fieldSelections,
         String operator,

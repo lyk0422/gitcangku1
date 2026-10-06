@@ -43,9 +43,10 @@ public class ObservationService {
     private static final String SEPARATOR = "\u0001";
 
     /**
-     * 三个可编辑字段的固定顺序：冲突重算、选择校验与指纹均以此顺序处理，保证结果稳定。
+     * 可编辑字段（组合并单元）的固定顺序：冲突重算、选择校验与指纹均以此顺序处理，保证结果稳定。
+     * countArea 表示个体计数与采样面积组成的合并单元：两值作为一组整体参与三方合并，不可跨提交拼组。
      */
-    private static final List<String> FIELDS = List.of("location", "reading", "note");
+    private static final List<String> FIELDS = List.of("location", "reading", "note", "countArea");
 
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
@@ -70,8 +71,10 @@ public class ObservationService {
      */
     @Transactional
     public WriteOutcome create(CreateObservationRequest request) {
+        validateCountAreaPair(request.individualCount(), request.sampledArea());
         String fingerprint = fingerprint("CREATE", request.observationId(), request.location(),
-                request.reading(), request.note());
+                request.reading(), request.note(), Objects.toString(request.individualCount(), null),
+                Objects.toString(request.sampledArea(), null));
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -85,7 +88,8 @@ public class ObservationService {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
         ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
-                request.location(), request.reading(), request.note(), false);
+                request.location(), request.reading(), request.note(),
+                request.individualCount(), request.sampledArea(), false);
         try {
             observationRepository.insertCurrent(snapshot);
         } catch (DuplicateKeyException e) {
@@ -101,8 +105,11 @@ public class ObservationService {
      */
     @Transactional
     public WriteOutcome merge(String observationId, MergeObservationRequest request) {
+        validateCountAreaPair(request.individualCount(), request.sampledArea());
         String fingerprint = fingerprint("MERGE", observationId, String.valueOf(request.baseVersion()),
-                request.location(), request.reading(), request.note());
+                request.location(), request.reading(), request.note(),
+                Objects.toString(request.individualCount(), null),
+                Objects.toString(request.sampledArea(), null));
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -127,18 +134,20 @@ public class ObservationService {
         String mergedReading = mergeReadingField(base.reading(), current.reading(),
                 request.reading(), conflictFields);
         String mergedNote = mergeField("note", base.note(), current.note(), request.note(), conflictFields);
+        Integer[] mergedCountArea = mergeCountAreaField(base, current,
+                request.individualCount(), request.sampledArea(), conflictFields);
         if (!conflictFields.isEmpty()) {
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, mergedReading, mergedNote, mergedCountArea[0], mergedCountArea[1], false);
         if (sameContent(merged, current)) {
             // 合并结果与当前完全相同：返回当前版本，不加版本
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
         ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, mergedReading, mergedNote, mergedCountArea[0], mergedCountArea[1], false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
@@ -168,7 +177,7 @@ public class ObservationService {
             throw ApiException.conflict("expectedVersion mismatch", current.version());
         }
         ObservationSnapshot tombstone = new ObservationSnapshot(observationId, current.version() + 1,
-                null, null, null, true);
+                null, null, null, null, null, true);
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
@@ -190,11 +199,15 @@ public class ObservationService {
      */
     @Transactional
     public ResolveOutcome resolveConflict(String observationId, ResolveConflictRequest request) {
+        validateCountAreaPair(request.individualCount(), request.sampledArea());
         Map<String, FieldSelection> selections = parseSelections(request.selections());
         String normalizedSelections = writeSelectionsJson(selections);
         String fingerprint = fingerprint("RESOLVE", observationId, request.resolutionId(),
                 String.valueOf(request.baseVersion()), String.valueOf(request.expectedCurrentVersion()),
-                request.location(), request.reading(), request.note(), normalizedSelections, request.operator());
+                request.location(), request.reading(), request.note(),
+                Objects.toString(request.individualCount(), null),
+                Objects.toString(request.sampledArea(), null),
+                normalizedSelections, request.operator());
         ResolveOutcome replayed = checkResolveReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -243,6 +256,11 @@ public class ObservationService {
         if (noteConflict) {
             conflictFields.add("note");
         }
+        boolean countAreaConflict = countAreaConflicts(base, current,
+                request.individualCount(), request.sampledArea());
+        if (countAreaConflict) {
+            conflictFields.add("countArea");
+        }
         validateSelectionCoverage(selections.keySet(), conflictFields);
 
         String resolvedLocation = resolveFieldValue(locationConflict, selections.get("location"),
@@ -251,14 +269,17 @@ public class ObservationService {
                 base.reading(), current.reading(), request.reading(), true);
         String resolvedNote = resolveFieldValue(noteConflict, selections.get("note"),
                 base.note(), current.note(), request.note(), false);
+        Integer[] resolvedCountArea = resolveCountAreaValue(countAreaConflict, selections.get("countArea"),
+                base, current, request.individualCount(), request.sampledArea());
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                resolvedLocation, resolvedReading, resolvedNote, false);
+                resolvedLocation, resolvedReading, resolvedNote, resolvedCountArea[0], resolvedCountArea[1], false);
         boolean contentChanged = !sameContent(merged, current);
         int newVersion = contentChanged ? current.version() + 1 : current.version();
         if (contentChanged) {
             ObservationSnapshot next = new ObservationSnapshot(observationId, newVersion,
-                    resolvedLocation, resolvedReading, resolvedNote, false);
+                    resolvedLocation, resolvedReading, resolvedNote,
+                    resolvedCountArea[0], resolvedCountArea[1], false);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
         }
@@ -267,6 +288,7 @@ public class ObservationService {
                 request.resolutionId(), observationId, request.requestId(),
                 request.baseVersion(), current.version(), newVersion,
                 request.location(), request.reading(), request.note(),
+                request.individualCount(), request.sampledArea(),
                 List.copyOf(conflictFields), normalizedSelections, request.operator(),
                 Instant.now(clock), contentChanged);
         try {
@@ -285,7 +307,8 @@ public class ObservationService {
         }
 
         ObservationSnapshot pointed = contentChanged
-                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
+                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading,
+                        resolvedNote, resolvedCountArea[0], resolvedCountArea[1], false)
                 : current;
         return completeResolve(request.requestId(), HttpStatus.OK,
                 ResolutionResponse.of(record, pointed, objectMapper));
@@ -362,12 +385,51 @@ public class ObservationService {
     }
 
     /**
-     * 判断合并结果与当前版本内容是否完全相同（读数按数值，其余按原文）。
+     * 判断合并结果与当前版本内容是否完全相同（读数按数值，计数面积组按组，其余按原文）。
      */
     private boolean sameContent(ObservationSnapshot merged, ObservationSnapshot current) {
         return Objects.equals(merged.location(), current.location())
                 && Objects.equals(merged.note(), current.note())
-                && readingEquals(merged.reading(), current.reading());
+                && readingEquals(merged.reading(), current.reading())
+                && countAreaEquals(merged.individualCount(), merged.sampledArea(),
+                        current.individualCount(), current.sampledArea());
+    }
+
+    /**
+     * 计数面积组校验：两值必须同时提供或同时缺省；缺省表示该观测尚未录入计数面积组。
+     */
+    private void validateCountAreaPair(Integer individualCount, Integer sampledArea) {
+        if ((individualCount == null) != (sampledArea == null)) {
+            throw ApiException.badRequest(
+                    "individualCount and sampledArea must be provided together as a group");
+        }
+    }
+
+    /**
+     * 计数面积组等值判断：计数与采样面积都相等才视为同组值；两组均为空也相等。
+     */
+    private boolean countAreaEquals(Integer leftCount, Integer leftArea, Integer rightCount, Integer rightArea) {
+        return Objects.equals(leftCount, rightCount) && Objects.equals(leftArea, rightArea);
+    }
+
+    /**
+     * 计数面积组三方合并：作为单一合并单元整体判定，候选未改保留当前组、当前未改接受候选组、
+     * 两边改为相同组值也接受；否则整组冲突（countArea），不允许从两侧各取一值拼组。
+     */
+    private Integer[] mergeCountAreaField(ObservationSnapshot base, ObservationSnapshot current,
+                                          Integer candidateCount, Integer candidateArea,
+                                          List<String> conflictFields) {
+        if (countAreaEquals(candidateCount, candidateArea, base.individualCount(), base.sampledArea())) {
+            return new Integer[]{current.individualCount(), current.sampledArea()};
+        }
+        if (countAreaEquals(current.individualCount(), current.sampledArea(),
+                base.individualCount(), base.sampledArea())
+                || countAreaEquals(candidateCount, candidateArea,
+                        current.individualCount(), current.sampledArea())) {
+            return new Integer[]{candidateCount, candidateArea};
+        }
+        conflictFields.add("countArea");
+        return new Integer[]{current.individualCount(), current.sampledArea()};
     }
 
     private boolean readingEquals(String left, String right) {
@@ -450,7 +512,7 @@ public class ObservationService {
     // ---------- 冲突解决辅助逻辑 ----------
 
     /**
-     * 解析并规范化选择映射：键必须是三个可编辑字段之一，值仅允许 CURRENT/CANDIDATE（大小写不敏感）；
+     * 解析并规范化选择映射：键必须是可编辑字段（合并单元）之一，值仅允许 CURRENT/CANDIDATE（大小写不敏感）；
      * 重复字段（JSON 反序列化不会出现）或非法键值一律 400。
      */
     private Map<String, FieldSelection> parseSelections(Map<String, String> raw) {
@@ -458,7 +520,8 @@ public class ObservationService {
         for (Map.Entry<String, String> entry : raw.entrySet()) {
             String field = entry.getKey() == null ? null : entry.getKey().trim();
             if (field == null || !FIELDS.contains(field)) {
-                throw ApiException.badRequest("selection key must be one of location/reading/note: " + field);
+                throw ApiException.badRequest(
+                        "selection key must be one of location/reading/note/countArea: " + field);
             }
             FieldSelection selection = FieldSelection.fromValue(entry.getValue());
             if (selection == null) {
@@ -546,6 +609,40 @@ public class ObservationService {
     }
 
     /**
+     * 按原三方规则判断计数面积组是否冲突：候选组未改、任一侧未改或两边改为相同组值均不冲突，否则整组冲突。
+     */
+    private boolean countAreaConflicts(ObservationSnapshot base, ObservationSnapshot current,
+                                       Integer candidateCount, Integer candidateArea) {
+        if (countAreaEquals(candidateCount, candidateArea, base.individualCount(), base.sampledArea())) {
+            return false;
+        }
+        if (countAreaEquals(current.individualCount(), current.sampledArea(),
+                base.individualCount(), base.sampledArea())
+                || countAreaEquals(candidateCount, candidateArea,
+                        current.individualCount(), current.sampledArea())) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * 计算计数面积组的解决结果：冲突时按人工选择整体取当前组或候选组；非冲突时按原三方规则自动合并。
+     */
+    private Integer[] resolveCountAreaValue(boolean conflict, FieldSelection selection,
+                                            ObservationSnapshot base, ObservationSnapshot current,
+                                            Integer candidateCount, Integer candidateArea) {
+        if (conflict) {
+            return selection == FieldSelection.CANDIDATE
+                    ? new Integer[]{candidateCount, candidateArea}
+                    : new Integer[]{current.individualCount(), current.sampledArea()};
+        }
+        if (countAreaEquals(candidateCount, candidateArea, base.individualCount(), base.sampledArea())) {
+            return new Integer[]{current.individualCount(), current.sampledArea()};
+        }
+        return new Integer[]{candidateCount, candidateArea};
+    }
+
+    /**
      * 解决请求的 requestId 幂等检查：同键同参返回原成功结果；同键异参返回 409；无记录返回 null。
      */
     private ResolveOutcome checkResolveReplay(String requestId, String fingerprint) {
@@ -609,6 +706,8 @@ public class ObservationService {
                 && Objects.equals(record.candidateLocation(), request.location())
                 && Objects.equals(record.candidateReading(), request.reading())
                 && Objects.equals(record.candidateNote(), request.note())
+                && Objects.equals(record.candidateIndividualCount(), request.individualCount())
+                && Objects.equals(record.candidateSampledArea(), request.sampledArea())
                 && Objects.equals(record.fieldSelections(), normalizedSelections)
                 && Objects.equals(record.operator(), request.operator());
     }

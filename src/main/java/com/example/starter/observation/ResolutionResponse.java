@@ -26,6 +26,8 @@ import java.util.Map;
  * @param location        解决后版本的观测地点
  * @param reading         解决后版本的观测读数
  * @param note            解决后版本的观测备注
+ * @param individualCount 解决后版本的个体计数（未提供计数面积组时不返回）
+ * @param sampledArea     解决后版本的采样面积，单位平方米（未提供计数面积组时不返回）
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ResolutionResponse(
@@ -42,7 +44,9 @@ public record ResolutionResponse(
         Instant resolvedAtUtc,
         String location,
         String reading,
-        String note) {
+        String note,
+        Integer individualCount,
+        Integer sampledArea) {
 
     private static final TypeReference<Map<String, String>> SELECTIONS_TYPE = new TypeReference<>() {
     };
@@ -66,7 +70,9 @@ public record ResolutionResponse(
                 record.resolvedAtUtc(),
                 pointed.location(),
                 pointed.reading(),
-                pointed.note());
+                pointed.note(),
+                pointed.individualCount(),
+                pointed.sampledArea());
     }
 
     private static Map<String, String> parseSelections(String json, ObjectMapper objectMapper) {

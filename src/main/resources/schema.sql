@@ -7,6 +7,8 @@ CREATE TABLE IF NOT EXISTS observation_current (
     location VARCHAR(512) NOT NULL COMMENT '观测地点（可编辑字段）',
     reading VARCHAR(64) NOT NULL COMMENT '观测读数，十进制字符串，最多三位小数，比较按数值（可编辑字段）',
     note VARCHAR(1024) NOT NULL COMMENT '观测备注（可编辑字段）',
+    individual_count INT NULL COMMENT '个体计数，非负整数；与 sampled_area 作为一组同时存在或同时为空（可编辑字段组）',
+    sampled_area INT NULL COMMENT '采样面积，正整数，单位平方米；与 individual_count 成组（可编辑字段组）',
     version INT NOT NULL COMMENT '当前版本号，从 1 开始',
     deleted BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已删除：TRUE 表示当前状态为删除墓碑',
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次变更时间（服务器时区）',
@@ -20,6 +22,8 @@ CREATE TABLE IF NOT EXISTS observation_version (
     location VARCHAR(512) NULL COMMENT '该版本观测地点快照；删除墓碑版本为 NULL',
     reading VARCHAR(64) NULL COMMENT '该版本观测读数快照（十进制字符串原文）；删除墓碑版本为 NULL',
     note VARCHAR(1024) NULL COMMENT '该版本观测备注快照；删除墓碑版本为 NULL',
+    individual_count INT NULL COMMENT '该版本个体计数快照（非负整数）；删除墓碑版本为 NULL',
+    sampled_area INT NULL COMMENT '该版本采样面积快照（正整数，单位平方米）；删除墓碑版本为 NULL',
     deleted BOOLEAN NOT NULL COMMENT '该版本是否为删除墓碑：TRUE 时业务字段无意义',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '该版本生成时间（服务器时区）',
     PRIMARY KEY (observation_id, version)
@@ -47,6 +51,8 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     candidate_location VARCHAR(512) NOT NULL COMMENT '客户端提交的候选地点完整值',
     candidate_reading VARCHAR(64) NOT NULL COMMENT '客户端提交的候选读数完整值（十进制原文，最多三位小数）',
     candidate_note VARCHAR(1024) NOT NULL COMMENT '客户端提交的候选备注完整值',
+    candidate_individual_count INT NULL COMMENT '客户端提交的候选个体计数完整值（非负整数）；未提供计数面积组时为 NULL',
+    candidate_sampled_area INT NULL COMMENT '客户端提交的候选采样面积完整值（正整数，单位平方米）；未提供计数面积组时为 NULL',
     conflict_fields VARCHAR(256) NOT NULL COMMENT '服务端重算出的冲突字段名列表（JSON 数组原文，固定顺序 location/reading/note）',
     field_selections VARCHAR(512) NOT NULL COMMENT '各冲突字段的人工选择（JSON 对象原文，值为 CURRENT/CANDIDATE）',
     operator VARCHAR(128) NOT NULL COMMENT '执行冲突解决的操作者标识',
@@ -58,4 +64,43 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 不设置指向 observation_current 的外键：观测记录删除仅置墓碑（当前行保留），
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
+);
+
+-- 分层样方密度估计成果表：成功生成后原子写入，冻结精确有理数结果，永不修改。
+CREATE TABLE IF NOT EXISTS density_estimate (
+    estimate_id VARCHAR(128) NOT NULL COMMENT '密度估计成果唯一标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '生成该成果的请求标识（requestId）',
+    operator VARCHAR(128) NOT NULL COMMENT '操作者标识（非空）',
+    layer_count INT NOT NULL COMMENT '层数（2至5）',
+    observation_count INT NOT NULL COMMENT '参与观测总数（不超过20）',
+    result_numerator VARCHAR(130) NOT NULL COMMENT '总体数量估计精确结果的分子（最简分数，十进制整数字符串）',
+    result_denominator VARCHAR(130) NOT NULL COMMENT '总体数量估计精确结果的分母（最简分数，正整数十进制字符串）',
+    result_display VARCHAR(64) NOT NULL COMMENT '展示值：精确结果按 HALF_UP 保留三位小数的十进制字符串，不参与任何计算',
+    created_at_utc TIMESTAMP NOT NULL COMMENT '成果生成时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (estimate_id),
+    -- 同一 requestId 至多生成一个成果，支撑同参重放与异参 409。
+    UNIQUE (request_id)
+);
+
+-- 估计成果层表：冻结每层的总体面积与精确密度（计数总和/采样面积总和的最简分数）。
+CREATE TABLE IF NOT EXISTS density_estimate_layer (
+    estimate_id VARCHAR(128) NOT NULL COMMENT '密度估计成果唯一标识',
+    layer_index INT NOT NULL COMMENT '层在请求中的顺序，从 0 开始',
+    total_area INT NOT NULL COMMENT '该层总体面积，正整数，单位平方米',
+    density_numerator VARCHAR(130) NOT NULL COMMENT '该层精确密度的分子（最简分数，十进制整数字符串），单位：个体/平方米',
+    density_denominator VARCHAR(130) NOT NULL COMMENT '该层精确密度的分母（最简分数，正整数十进制字符串）',
+    PRIMARY KEY (estimate_id, layer_index)
+);
+
+-- 估计成果成员表：冻结每层引用的观测身份、版本及当时的计数与采样面积，后续观测变更不倒改成果。
+CREATE TABLE IF NOT EXISTS density_estimate_member (
+    estimate_id VARCHAR(128) NOT NULL COMMENT '密度估计成果唯一标识',
+    layer_index INT NOT NULL COMMENT '所属层的顺序号，与 density_estimate_layer.layer_index 对应',
+    member_index INT NOT NULL COMMENT '成员在层内的顺序，从 0 开始',
+    observation_id VARCHAR(64) NOT NULL COMMENT '引用的观测记录标识',
+    observation_version INT NOT NULL COMMENT '生成成果时核对并冻结的观测当前版本号',
+    individual_count INT NOT NULL COMMENT '冻结的该版本个体计数（非负整数）',
+    sampled_area INT NOT NULL COMMENT '冻结的该版本采样面积（正整数，单位平方米）',
+    PRIMARY KEY (estimate_id, layer_index, member_index)
 );

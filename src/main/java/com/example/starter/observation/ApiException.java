@@ -68,4 +68,11 @@ public class ApiException extends RuntimeException {
     public static ApiException gone(String message) {
         return new ApiException(HttpStatus.GONE, message, null, null);
     }
+
+    /**
+     * 422：业务规则不满足（如估计成果引用的观测缺计数面积组、已删除或采样面积超过层总体面积）。
+     */
+    public static ApiException unprocessable(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, null);
+    }
 }

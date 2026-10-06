@@ -32,6 +32,12 @@ public class ResolutionRepository {
         this.objectMapper = objectMapper;
     }
 
+    private static final String RECORD_COLUMNS =
+            "resolution_id, observation_id, request_id, base_version, previous_version, "
+                    + "new_version, candidate_location, candidate_reading, candidate_note, "
+                    + "candidate_individual_count, candidate_sampled_area, "
+                    + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc";
+
     /**
      * 插入一条不可变解决记录；resolutionId 主键或 (observationId, requestId) 唯一键冲突时抛出重复键异常。
      */
@@ -39,9 +45,10 @@ public class ResolutionRepository {
         jdbcTemplate.update(
                 "INSERT INTO conflict_resolution (resolution_id, observation_id, request_id, "
                         + "base_version, previous_version, new_version, candidate_location, candidate_reading, "
-                        + "candidate_note, conflict_fields, field_selections, operator, content_changed, "
+                        + "candidate_note, candidate_individual_count, candidate_sampled_area, "
+                        + "conflict_fields, field_selections, operator, content_changed, "
                         + "resolved_at_utc, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 record.resolutionId(),
                 record.observationId(),
                 record.requestId(),
@@ -51,6 +58,8 @@ public class ResolutionRepository {
                 record.candidateLocation(),
                 record.candidateReading(),
                 record.candidateNote(),
+                record.candidateIndividualCount(),
+                record.candidateSampledArea(),
                 writeJson(record.conflictFields()),
                 record.fieldSelections(),
                 record.operator(),
@@ -63,10 +72,7 @@ public class ResolutionRepository {
      */
     public Optional<ResolutionRecord> findByResolutionId(String resolutionId) {
         return jdbcTemplate.query(
-                        "SELECT resolution_id, observation_id, request_id, base_version, previous_version, "
-                                + "new_version, candidate_location, candidate_reading, candidate_note, "
-                                + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc "
-                                + "FROM conflict_resolution WHERE resolution_id = ?",
+                        "SELECT " + RECORD_COLUMNS + " FROM conflict_resolution WHERE resolution_id = ?",
                         RESOLUTION_MAPPER, resolutionId)
                 .stream().findFirst();
     }
@@ -76,10 +82,7 @@ public class ResolutionRepository {
      */
     public List<ResolutionRecord> findByObservationId(String observationId) {
         return jdbcTemplate.query(
-                "SELECT resolution_id, observation_id, request_id, base_version, previous_version, "
-                        + "new_version, candidate_location, candidate_reading, candidate_note, "
-                        + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc "
-                        + "FROM conflict_resolution WHERE observation_id = ? "
+                "SELECT " + RECORD_COLUMNS + " FROM conflict_resolution WHERE observation_id = ? "
                         + "ORDER BY resolved_at_utc ASC, resolution_id ASC",
                 RESOLUTION_MAPPER, observationId);
     }
@@ -121,6 +124,8 @@ public class ResolutionRepository {
             rs.getString("candidate_location"),
             rs.getString("candidate_reading"),
             rs.getString("candidate_note"),
+            (Integer) rs.getObject("candidate_individual_count"),
+            (Integer) rs.getObject("candidate_sampled_area"),
             readFieldList(rs.getString("conflict_fields")),
             rs.getString("field_selections"),
             rs.getString("operator"),
