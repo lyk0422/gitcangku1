@@ -10,16 +10,19 @@ import java.util.Map;
 
 /**
  * 冲突解决请求：在普通三方合并收到冲突后，提交三个字段的完整候选值及对每个冲突字段的人工选择。
+ * 带量纲记录必须携带与创建时一致的量纲；解决成功后冻结所选来源与精确规范值。
  *
  * @param requestId              全局唯一请求标识（幂等去重键）
  * @param resolutionId           全局唯一解决记录标识
  * @param baseVersion            离线修改所基于的基线版本号（服务端据此重新读取基线重算冲突）
  * @param expectedCurrentVersion 客户端预期的解决前当前版本号，不匹配返回 409
  * @param location               观测地点候选完整值
- * @param reading                观测读数候选完整值，十进制字符串，最多三位小数
+ * @param reading                观测读数候选完整值，十进制字符串，最多三位小数（带量纲时为原始单位下的原值）
  * @param note                   观测备注候选完整值
  * @param selections             冲突字段选择，键为字段名，值为 CURRENT 或 CANDIDATE；必须恰好覆盖本次仍冲突的字段
  * @param operator               操作者标识
+ * @param dimension              读数量纲：LENGTH / TEMPERATURE；必须与记录创建时的量纲一致
+ * @param readingUnit            读数原始单位：m / cm / C / K，必须属于所给量纲
  */
 public record ResolveConflictRequest(
         @NotBlank @Size(max = 128) String requestId,
@@ -31,5 +34,18 @@ public record ResolveConflictRequest(
         String reading,
         @NotNull @Size(max = 1024) String note,
         @NotNull Map<String, String> selections,
-        @NotBlank @Size(max = 128) String operator) {
+        @NotBlank @Size(max = 128) String operator,
+        @Size(max = 16) String dimension,
+        @Size(max = 8) String readingUnit) {
+
+    /**
+     * 旧无单位读数解决请求（不携带量纲与单位）。
+     */
+    public ResolveConflictRequest(String requestId, String resolutionId,
+                                  Integer baseVersion, Integer expectedCurrentVersion,
+                                  String location, String reading, String note,
+                                  Map<String, String> selections, String operator) {
+        this(requestId, resolutionId, baseVersion, expectedCurrentVersion,
+                location, reading, note, selections, operator, null, null);
+    }
 }

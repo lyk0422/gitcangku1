@@ -11,21 +11,25 @@ import java.util.Map;
 
 /**
  * 冲突解决响应：返回不可变解决记录要点及解决后指向版本的内容。
+ * 带量纲记录额外返回量纲、解决后版本的原始单位与冻结的精确规范读数。
  *
- * @param resolutionId    全局唯一解决记录标识
- * @param observationId   观测记录唯一标识
- * @param requestId       生成该记录的请求标识
- * @param baseVersion     基线版本号
- * @param previousVersion 解决前当前版本号
- * @param version         解决后指向的版本号（无变化解决时等于 previousVersion）
- * @param contentChanged  解决后内容是否发生变化：false 表示未生成新观测版本
- * @param conflictFields  服务端重算出的冲突字段名列表
- * @param selections      各冲突字段的人工选择
- * @param operator        操作者标识
- * @param resolvedAtUtc   解决完成时刻（UTC，ISO-8601）
- * @param location        解决后版本的观测地点
- * @param reading         解决后版本的观测读数
- * @param note            解决后版本的观测备注
+ * @param resolutionId       全局唯一解决记录标识
+ * @param observationId      观测记录唯一标识
+ * @param requestId          生成该记录的请求标识
+ * @param baseVersion        基线版本号
+ * @param previousVersion    解决前当前版本号
+ * @param version            解决后指向的版本号（无变化解决时等于 previousVersion）
+ * @param contentChanged     解决后内容是否发生变化：false 表示未生成新观测版本
+ * @param conflictFields     服务端重算出的冲突字段名列表
+ * @param selections         各冲突字段的人工选择
+ * @param operator           操作者标识
+ * @param resolvedAtUtc      解决完成时刻（UTC，ISO-8601）
+ * @param location           解决后版本的观测地点
+ * @param reading            解决后版本的观测读数原文（原始单位下的值）
+ * @param note               解决后版本的观测备注
+ * @param dimension          读数量纲：LENGTH / TEMPERATURE；旧无单位读数不返回
+ * @param readingUnit        解决后版本读数的原始单位；无单位读数不返回
+ * @param normalizedReading  解决后冻结的精确规范读数（长度 m、温度 C）；无量纲记录不返回
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ResolutionResponse(
@@ -42,7 +46,10 @@ public record ResolutionResponse(
         Instant resolvedAtUtc,
         String location,
         String reading,
-        String note) {
+        String note,
+        String dimension,
+        String readingUnit,
+        String normalizedReading) {
 
     private static final TypeReference<Map<String, String>> SELECTIONS_TYPE = new TypeReference<>() {
     };
@@ -66,7 +73,10 @@ public record ResolutionResponse(
                 record.resolvedAtUtc(),
                 pointed.location(),
                 pointed.reading(),
-                pointed.note());
+                pointed.note(),
+                pointed.dimension(),
+                pointed.readingUnit(),
+                pointed.readingNormalized());
     }
 
     private static Map<String, String> parseSelections(String json, ObjectMapper objectMapper) {

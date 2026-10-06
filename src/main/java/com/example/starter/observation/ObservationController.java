@@ -77,6 +77,15 @@ public class ObservationController {
     }
 
     /**
+     * 查询带量纲读数收件历史：每次成功源输入的原值、原始单位与精确规范值，按收件先后排序。
+     * 与当前规范读数查询区分：这里只返回历次输入溯源，不返回当前合并结果。
+     */
+    @GetMapping("/{observationId}/receipts")
+    public List<ReadingReceipt> listReceipts(@PathVariable String observationId) {
+        return observationService.listReceipts(observationId);
+    }
+
+    /**
      * 显式冲突解决：提交候选值与冲突字段选择，原子生成新版本（或无变化）与不可变解决记录。
      */
     @PostMapping("/{observationId}/resolve")

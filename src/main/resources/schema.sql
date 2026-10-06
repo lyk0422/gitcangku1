@@ -7,6 +7,9 @@ CREATE TABLE IF NOT EXISTS observation_current (
     location VARCHAR(512) NOT NULL COMMENT '观测地点（可编辑字段）',
     reading VARCHAR(64) NOT NULL COMMENT '观测读数，十进制字符串，最多三位小数，比较按数值（可编辑字段）',
     note VARCHAR(1024) NOT NULL COMMENT '观测备注（可编辑字段）',
+    dimension VARCHAR(16) NULL COMMENT '读数量纲：LENGTH / TEMPERATURE；NULL 表示旧无单位读数（创建时固定，不自动推断）',
+    reading_unit VARCHAR(8) NULL COMMENT '当前读数的原始单位：m / cm / C / K；NULL 表示无单位',
+    reading_normalized VARCHAR(64) NULL COMMENT '当前精确规范读数（长度 m、温度 C，十进制原文，比较不舍入）；NULL 表示无量纲',
     version INT NOT NULL COMMENT '当前版本号，从 1 开始',
     deleted BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已删除：TRUE 表示当前状态为删除墓碑',
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次变更时间（服务器时区）',
@@ -20,6 +23,9 @@ CREATE TABLE IF NOT EXISTS observation_version (
     location VARCHAR(512) NULL COMMENT '该版本观测地点快照；删除墓碑版本为 NULL',
     reading VARCHAR(64) NULL COMMENT '该版本观测读数快照（十进制字符串原文）；删除墓碑版本为 NULL',
     note VARCHAR(1024) NULL COMMENT '该版本观测备注快照；删除墓碑版本为 NULL',
+    dimension VARCHAR(16) NULL COMMENT '该版本读数量纲：LENGTH / TEMPERATURE；NULL 表示旧无单位读数（落库后不修改）',
+    reading_unit VARCHAR(8) NULL COMMENT '该版本读数的原始单位：m / cm / C / K；NULL 表示无单位（历史版本不改单位）',
+    reading_normalized VARCHAR(64) NULL COMMENT '该版本精确规范读数（长度 m、温度 C，十进制原文）；NULL 表示无量纲',
     deleted BOOLEAN NOT NULL COMMENT '该版本是否为删除墓碑：TRUE 时业务字段无意义',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '该版本生成时间（服务器时区）',
     PRIMARY KEY (observation_id, version)
@@ -47,6 +53,10 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     candidate_location VARCHAR(512) NOT NULL COMMENT '客户端提交的候选地点完整值',
     candidate_reading VARCHAR(64) NOT NULL COMMENT '客户端提交的候选读数完整值（十进制原文，最多三位小数）',
     candidate_note VARCHAR(1024) NOT NULL COMMENT '客户端提交的候选备注完整值',
+    dimension VARCHAR(16) NULL COMMENT '读数量纲：LENGTH / TEMPERATURE；NULL 表示旧无单位读数',
+    candidate_reading_unit VARCHAR(8) NULL COMMENT '候选读数的原始单位：m / cm / C / K；NULL 表示无单位',
+    candidate_reading_normalized VARCHAR(64) NULL COMMENT '候选读数的精确规范值（长度 m、温度 C）；NULL 表示无量纲',
+    resolved_reading_normalized VARCHAR(64) NULL COMMENT '解决后冻结的精确规范读数；NULL 表示无量纲',
     conflict_fields VARCHAR(256) NOT NULL COMMENT '服务端重算出的冲突字段名列表（JSON 数组原文，固定顺序 location/reading/note）',
     field_selections VARCHAR(512) NOT NULL COMMENT '各冲突字段的人工选择（JSON 对象原文，值为 CURRENT/CANDIDATE）',
     operator VARCHAR(128) NOT NULL COMMENT '执行冲突解决的操作者标识',
@@ -58,4 +68,19 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 不设置指向 observation_current 的外键：观测记录删除仅置墓碑（当前行保留），
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
+);
+
+-- 源输入收件表：带量纲读数每次成功收件都另存原值、单位与规范值，只插不改。
+CREATE TABLE IF NOT EXISTS reading_receipt (
+    request_id VARCHAR(128) NOT NULL COMMENT '产生该收件的请求标识（幂等键，全局唯一）',
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    operation VARCHAR(16) NOT NULL COMMENT '收件来源操作：CREATE / MERGE / RESOLVE',
+    dimension VARCHAR(16) NOT NULL COMMENT '读数量纲：LENGTH / TEMPERATURE',
+    original_reading VARCHAR(64) NOT NULL COMMENT '源输入原始读数（十进制原文，最多三位小数）',
+    original_unit VARCHAR(8) NOT NULL COMMENT '源输入原始单位：m / cm / C / K',
+    normalized_reading VARCHAR(64) NOT NULL COMMENT '精确规范读数（长度 m、温度 C，十进制原文，不舍入）',
+    operator VARCHAR(128) NULL COMMENT '操作者标识；未提供时为 NULL',
+    received_at_utc TIMESTAMP NOT NULL COMMENT '收件时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (request_id)
 );

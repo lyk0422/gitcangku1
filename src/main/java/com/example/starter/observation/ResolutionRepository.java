@@ -24,6 +24,13 @@ public class ResolutionRepository {
     private static final TypeReference<java.util.Map<String, String>> SELECTIONS_TYPE = new TypeReference<>() {
     };
 
+    private static final String RECORD_COLUMNS =
+            "resolution_id, observation_id, request_id, base_version, previous_version, "
+                    + "new_version, candidate_location, candidate_reading, candidate_note, "
+                    + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc, "
+                    + "dimension, candidate_reading_unit, candidate_reading_normalized, "
+                    + "resolved_reading_normalized";
+
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
 
@@ -40,8 +47,9 @@ public class ResolutionRepository {
                 "INSERT INTO conflict_resolution (resolution_id, observation_id, request_id, "
                         + "base_version, previous_version, new_version, candidate_location, candidate_reading, "
                         + "candidate_note, conflict_fields, field_selections, operator, content_changed, "
-                        + "resolved_at_utc, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                        + "resolved_at_utc, dimension, candidate_reading_unit, candidate_reading_normalized, "
+                        + "resolved_reading_normalized, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 record.resolutionId(),
                 record.observationId(),
                 record.requestId(),
@@ -55,7 +63,11 @@ public class ResolutionRepository {
                 record.fieldSelections(),
                 record.operator(),
                 record.contentChanged(),
-                Timestamp.from(record.resolvedAtUtc()));
+                Timestamp.from(record.resolvedAtUtc()),
+                record.dimension(),
+                record.candidateReadingUnit(),
+                record.candidateReadingNormalized(),
+                record.resolvedReadingNormalized());
     }
 
     /**
@@ -63,10 +75,7 @@ public class ResolutionRepository {
      */
     public Optional<ResolutionRecord> findByResolutionId(String resolutionId) {
         return jdbcTemplate.query(
-                        "SELECT resolution_id, observation_id, request_id, base_version, previous_version, "
-                                + "new_version, candidate_location, candidate_reading, candidate_note, "
-                                + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc "
-                                + "FROM conflict_resolution WHERE resolution_id = ?",
+                        "SELECT " + RECORD_COLUMNS + " FROM conflict_resolution WHERE resolution_id = ?",
                         RESOLUTION_MAPPER, resolutionId)
                 .stream().findFirst();
     }
@@ -76,10 +85,7 @@ public class ResolutionRepository {
      */
     public List<ResolutionRecord> findByObservationId(String observationId) {
         return jdbcTemplate.query(
-                "SELECT resolution_id, observation_id, request_id, base_version, previous_version, "
-                        + "new_version, candidate_location, candidate_reading, candidate_note, "
-                        + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc "
-                        + "FROM conflict_resolution WHERE observation_id = ? "
+                "SELECT " + RECORD_COLUMNS + " FROM conflict_resolution WHERE observation_id = ? "
                         + "ORDER BY resolved_at_utc ASC, resolution_id ASC",
                 RESOLUTION_MAPPER, observationId);
     }
@@ -125,5 +131,9 @@ public class ResolutionRepository {
             rs.getString("field_selections"),
             rs.getString("operator"),
             rs.getTimestamp("resolved_at_utc").toInstant(),
-            rs.getBoolean("content_changed"));
+            rs.getBoolean("content_changed"),
+            rs.getString("dimension"),
+            rs.getString("candidate_reading_unit"),
+            rs.getString("candidate_reading_normalized"),
+            rs.getString("resolved_reading_normalized"));
 }
