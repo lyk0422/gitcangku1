@@ -8,9 +8,11 @@ import com.example.starter.firmware.api.ReleaseHistoryResponse;
 import com.example.starter.firmware.api.ReleaseView;
 import com.example.starter.firmware.api.ResumeRecordView;
 import com.example.starter.firmware.api.ResumeReleaseRequest;
+import com.example.starter.firmware.domain.ReleaseKind;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.repo.BootTaskRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.ResumeRecordRepository;
@@ -30,17 +32,20 @@ public class ReleaseService {
 
     private final ReleaseRepository releaseRepository;
     private final TaskRepository taskRepository;
+    private final BootTaskRepository bootTaskRepository;
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
+                          BootTaskRepository bootTaskRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
                           IdempotencyService idempotency, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
+        this.bootTaskRepository = bootTaskRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
         this.idempotency = idempotency;
@@ -53,14 +58,16 @@ public class ReleaseService {
         }
         int sampleFloor = request.effectiveSampleFloor();
         int threshold = request.effectiveFailureThresholdPercent();
+        ReleaseKind kind = request.effectiveDualPartition() ? ReleaseKind.DUAL_PARTITION
+                : ReleaseKind.NORMAL;
         String fingerprint = String.join("|", "release.create", request.model(), request.fromVersion(),
                 request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
-                String.valueOf(threshold));
+                String.valueOf(threshold), kind.name());
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
             long id;
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
-                        request.ratio(), sampleFloor, threshold);
+                        request.ratio(), sampleFloor, threshold, kind);
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
             }
@@ -127,6 +134,7 @@ public class ReleaseService {
             if (order.status() == ReleaseStatus.ACTIVE || order.status() == ReleaseStatus.PAUSED) {
                 releaseRepository.cancel(releaseId);
                 taskRepository.cancelPendingByRelease(releaseId);
+                bootTaskRepository.cancelPendingByRelease(releaseId);
             }
             return ReleaseView.of(findOrder(releaseId));
         }, ReleaseView.class);

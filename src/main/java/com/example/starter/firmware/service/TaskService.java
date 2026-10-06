@@ -6,20 +6,18 @@ import com.example.starter.firmware.api.TaskListResponse;
 import com.example.starter.firmware.api.TaskView;
 import com.example.starter.firmware.domain.Device;
 import com.example.starter.firmware.domain.ReceiptResult;
+import com.example.starter.firmware.domain.ReleaseKind;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
 import com.example.starter.firmware.repo.DeviceRepository;
-import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.TaskRepository;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
-import java.time.Clock;
-import java.time.Instant;
 import java.util.List;
 
 /**
@@ -32,24 +30,25 @@ public class TaskService {
     private final TaskRepository taskRepository;
     private final ReleaseRepository releaseRepository;
     private final DeviceRepository deviceRepository;
-    private final PauseRecordRepository pauseRecordRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
+    private final BootTaskService bootTaskService;
+    private final FailureMonitor failureMonitor;
     private final IdempotencyService idempotency;
-    private final Clock clock;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
-                       DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
+                       DeviceRepository deviceRepository,
                        DeviceService deviceService, ReleaseService releaseService,
-                       IdempotencyService idempotency, Clock clock) {
+                       BootTaskService bootTaskService, FailureMonitor failureMonitor,
+                       IdempotencyService idempotency) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
-        this.pauseRecordRepository = pauseRecordRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
+        this.bootTaskService = bootTaskService;
+        this.failureMonitor = failureMonitor;
         this.idempotency = idempotency;
-        this.clock = clock;
     }
 
     /**
@@ -66,6 +65,9 @@ public class TaskService {
             }
             ReleaseOrder order = releaseRepository.findByIdForUpdate(activeOrder.get().id())
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在"));
+            if (order.kind() == ReleaseKind.DUAL_PARTITION) {
+                return bootTaskService.pullDualPartition(device, order);
+            }
             var existing = taskRepository.findByReleaseAndDevice(order.id(), deviceId);
             if (existing.isPresent()) {
                 return new PullResponse(TaskView.of(existing.get(), order));
@@ -111,7 +113,7 @@ public class TaskService {
                         deviceRepository.updateCurrentVersion(task.deviceId(), lockedOrder.toVersion());
                     }
                     ReleaseOrder updated = releaseRepository.findById(snapshot.releaseId()).orElseThrow();
-                    pauseIfThresholdReached(updated, taskId);
+                    failureMonitor.pauseIfThresholdReached(updated, taskId);
                     yield TaskView.of(taskRepository.findById(taskId).orElseThrow(), updated);
                 }
                 case SUCCESS, FAILED -> {
@@ -128,25 +130,8 @@ public class TaskService {
 
     /**
      * 样本数达到下限且 FAILED×100 >= 样本数×阈值 时，将仍为 ACTIVE 的发布单原子转为 PAUSED。
-     * 调用方持有发布单行锁，并发回执串行通过，每轮至多生成一条暂停记录。
+     * 判定逻辑已迁移至 {@link FailureMonitor}，普通回执与双分区回滚共用。
      */
-    private void pauseIfThresholdReached(ReleaseOrder order, long triggerTaskId) {
-        if (order.status() != ReleaseStatus.ACTIVE) {
-            return;
-        }
-        int samples = order.roundSuccess() + order.roundFailed();
-        if (samples < order.sampleFloor()) {
-            return;
-        }
-        if ((long) order.roundFailed() * 100 < (long) samples * order.failureThresholdPercent()) {
-            return;
-        }
-        if (releaseRepository.pauseIfActive(order.id()) == 1) {
-            pauseRecordRepository.insert(order.id(), order.monitorRound(), triggerTaskId,
-                    order.roundSuccess(), order.roundFailed(), Instant.now(clock).toString());
-        }
-    }
-
     public TaskListResponse listByRelease(long releaseId, TaskStatus statusFilter) {
         ReleaseOrder order = releaseService.findOrder(releaseId);
         List<TaskView> tasks = taskRepository.findByRelease(releaseId, statusFilter).stream()

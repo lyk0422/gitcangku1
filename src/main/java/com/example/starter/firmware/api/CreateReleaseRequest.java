@@ -8,6 +8,7 @@ import jakarta.validation.constraints.Size;
 /**
  * 创建发布单请求。sampleFloor 与 failureThresholdPercent 为可选，
  * 缺省分别为 2 与 100（即仅当本轮全部失败且样本达标时才自动暂停），旧客户端不传仍可创建。
+ * dualPartition 可选，缺省 false（普通发布）；为 true 时创建双分区试启动发布。
  */
 public record CreateReleaseRequest(
         @NotBlank @Size(max = 64) String requestId,
@@ -16,7 +17,8 @@ public record CreateReleaseRequest(
         @NotBlank @Size(max = 64) String toVersion,
         @Min(0) @Max(100) int ratio,
         @Min(2) @Max(100) Integer sampleFloor,
-        @Min(1) @Max(100) Integer failureThresholdPercent) {
+        @Min(1) @Max(100) Integer failureThresholdPercent,
+        Boolean dualPartition) {
 
     public static final int DEFAULT_SAMPLE_FLOOR = 2;
     public static final int DEFAULT_FAILURE_THRESHOLD_PERCENT = 100;
@@ -24,8 +26,17 @@ public record CreateReleaseRequest(
     /**
      * 兼容旧调用方：不配置监控参数时使用默认值。
      */
-    public CreateReleaseRequest(String requestId, String model, String fromVersion, String toVersion, int ratio) {
-        this(requestId, model, fromVersion, toVersion, ratio, null, null);
+    public CreateReleaseRequest(String requestId, String model, String fromVersion, String toVersion,
+                                int ratio) {
+        this(requestId, model, fromVersion, toVersion, ratio, null, null, null);
+    }
+
+    /**
+     * 兼容旧调用方：不指定发布类型时为普通发布。
+     */
+    public CreateReleaseRequest(String requestId, String model, String fromVersion, String toVersion,
+                                int ratio, Integer sampleFloor, Integer failureThresholdPercent) {
+        this(requestId, model, fromVersion, toVersion, ratio, sampleFloor, failureThresholdPercent, null);
     }
 
     public int effectiveSampleFloor() {
@@ -33,6 +44,11 @@ public record CreateReleaseRequest(
     }
 
     public int effectiveFailureThresholdPercent() {
-        return failureThresholdPercent == null ? DEFAULT_FAILURE_THRESHOLD_PERCENT : failureThresholdPercent;
+        return failureThresholdPercent == null ? DEFAULT_FAILURE_THRESHOLD_PERCENT
+                : failureThresholdPercent;
+    }
+
+    public boolean effectiveDualPartition() {
+        return dualPartition != null && dualPartition;
     }
 }
