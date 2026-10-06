@@ -3,10 +3,13 @@ package com.example.starter.water;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CommandRequest;
+import com.example.starter.water.dto.Dtos.CreateFieldRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.FieldResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.InfiltrationResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
@@ -29,9 +32,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class WaterController {
 
     private final WaterService service;
+    private final FieldService fieldService;
 
-    public WaterController(WaterService service) {
+    public WaterController(WaterService service, FieldService fieldService) {
         this.service = service;
+        this.fieldService = fieldService;
     }
 
     /** 创建供水窗口。 */
@@ -46,7 +51,7 @@ public class WaterController {
     public AllocationResponse submitAllocation(@RequestBody SubmitAllocationRequest request,
                                                @RequestHeader("X-Actor-Id") String actor) {
         return service.submitAllocation(request.commandKey(), request.allocationKey(), request.windowId(),
-                request.userId(), request.amount(), actor);
+                request.userId(), request.amount(), request.fieldKey(), request.irrigationUtc(), actor);
     }
 
     /** 批准配水申请。 */
@@ -102,5 +107,19 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 创建田块（首次关联合成农户并设启用时刻）；requestId 幂等。 */
+    @PostMapping("/fields")
+    public FieldResponse createField(@RequestBody CreateFieldRequest request,
+                                     @RequestHeader("X-Actor-Id") String actor) {
+        return fieldService.createField(request.requestId(), request.fieldKey(), request.capacity(),
+                request.recoveryPerHour(), request.enabledAtUtc(), request.expectedVersion(), actor);
+    }
+
+    /** 查询田块入渗现况：按当前已批准申请的最新时序重算，不改写历史冻结余额。 */
+    @GetMapping("/fields/{fieldKey}/infiltration")
+    public InfiltrationResponse getInfiltration(@PathVariable String fieldKey) {
+        return fieldService.getInfiltration(fieldKey);
     }
 }

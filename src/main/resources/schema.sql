@@ -10,6 +10,18 @@ CREATE TABLE IF NOT EXISTS supply_window (
     CONSTRAINT uk_supply_window_key UNIQUE (window_key)
 ) COMMENT='供水窗口，创建后不可修改';
 
+CREATE TABLE IF NOT EXISTS field_plot (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '田块主键',
+    field_key VARCHAR(128) NOT NULL COMMENT '田块业务键，全局唯一',
+    farmer VARCHAR(128) NOT NULL COMMENT '首次关联合成的农户 ID；关联田块的申请 userId 须与之相等，否则 403',
+    capacity BIGINT NOT NULL COMMENT '入渗容量 C，单位立方米，正整数，创建后不可变；初始入渗余额等于 C',
+    recovery_per_hour BIGINT NOT NULL COMMENT '每小时入渗恢复 R，单位立方米/小时，正整数，创建后不可变',
+    enabled_nanos BIGINT NOT NULL COMMENT '启用时刻，UTC 纳秒时间戳；早于此时刻的灌溉时刻非法（400）',
+    version BIGINT NOT NULL DEFAULT 0 COMMENT '配置版本；配置不可变，恒为 0',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
+    CONSTRAINT uk_field_plot_key UNIQUE (field_key)
+) COMMENT='田块入渗配置，创建后不可变；余额随时间恢复 min(C, 前余额 + 间隔整小时数 × R)';
+
 CREATE TABLE IF NOT EXISTS curtailment (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '限供记录主键',
     window_id BIGINT NOT NULL COMMENT '所属供水窗口 ID',
@@ -29,10 +41,14 @@ CREATE TABLE IF NOT EXISTS allocation (
     held_amount DECIMAL(19,3) NOT NULL DEFAULT 0 COMMENT '当前持有额度，单位立方米；批准时等于原申请水量，取消时归零，转出时等额扣减',
     requester VARCHAR(128) NOT NULL COMMENT '申请人（X-Actor-Id）',
     status VARCHAR(16) NOT NULL COMMENT '状态：REQUESTED 已申请 / APPROVED 已批准 / CANCELLED 已取消（不可恢复）',
+    field_key VARCHAR(128) NULL COMMENT '关联田块业务键；NULL 表示不参与入渗余额核算',
+    irrigation_nanos BIGINT NULL COMMENT '灌溉时刻，UTC 纳秒时间戳，须为整小时且不早于田块启用时刻；无田块为 NULL',
+    infiltration_balance DECIMAL(19,3) NULL COMMENT '批准时冻结的扣后入渗余额，单位立方米；未批准或无田块为 NULL，冻结后不改写',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳',
     updated_nanos BIGINT NOT NULL COMMENT '最近状态变更时间，UTC 纳秒时间戳',
     CONSTRAINT uk_allocation_key UNIQUE (allocation_key),
     CONSTRAINT fk_allocation_window FOREIGN KEY (window_id) REFERENCES supply_window (id),
+    CONSTRAINT fk_allocation_field FOREIGN KEY (field_key) REFERENCES field_plot (field_key),
     CONSTRAINT chk_allocation_held CHECK (held_amount >= 0 AND held_amount <= amount)
 ) COMMENT='配水申请';
 
@@ -56,3 +72,13 @@ CREATE TABLE IF NOT EXISTS command_log (
     response MEDIUMTEXT NULL COMMENT '首次成功响应 JSON；命令事务提交前写入',
     created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳'
 ) COMMENT='命令幂等日志，同键同参重放返回首次结果，同键改参返回 409';
+
+CREATE TABLE IF NOT EXISTS request_log (
+    request_id VARCHAR(128) PRIMARY KEY COMMENT '新增写入幂等键 requestId',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：FIELD_CREATE',
+    actor VARCHAR(128) NOT NULL COMMENT '操作者（X-Actor-Id），参与幂等身份比较',
+    resource VARCHAR(128) NOT NULL COMMENT '资源标识（如田块业务键），参与幂等身份比较',
+    params_json VARCHAR(2048) NOT NULL COMMENT '全部参数与期望版本的 JSON 结构化表示，按结构比较避免分隔符碰撞',
+    response MEDIUMTEXT NULL COMMENT '首次成功响应 JSON；命令事务提交前写入',
+    created_nanos BIGINT NOT NULL COMMENT '创建时间，UTC 纳秒时间戳'
+) COMMENT='新增写入幂等日志，同键同参重放首次完整响应，异参 409，失败回滚不占键';

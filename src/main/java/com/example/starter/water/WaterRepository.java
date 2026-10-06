@@ -10,6 +10,7 @@ import org.springframework.stereotype.Repository;
 import java.math.BigDecimal;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
+import java.sql.Types;
 import java.util.List;
 import java.util.Objects;
 
@@ -25,10 +26,23 @@ public class WaterRepository {
                             BigDecimal plannedVolume, long createdNanos) {
     }
 
-    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
+    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。
+     *  fieldKey/irrigationNanos 为关联田块与灌溉时刻（可空）；infiltrationBalance 为批准时冻结的
+     *  扣后入渗余额，冻结后不改写。 */
     public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
-                                BigDecimal heldAmount, String requester, String status,
+                                BigDecimal heldAmount, String requester, String status, String fieldKey,
+                                Long irrigationNanos, BigDecimal infiltrationBalance,
                                 long createdNanos, long updatedNanos) {
+    }
+
+    /** 田块入渗配置行，创建后不可变；初始入渗余额等于 capacity。 */
+    public record FieldRow(long id, String fieldKey, String farmer, long capacity, long recoveryPerHour,
+                           long enabledNanos, long version, long createdNanos) {
+    }
+
+    /** 新增写入幂等日志行；response 为 null 表示响应尚未写回（同事务内）。 */
+    public record RequestLogRow(String requestId, String operation, String actor, String resource,
+                                String paramsJson, String response, long createdNanos) {
     }
 
     /** 转让流水行，创建后不可变。 */
@@ -54,12 +68,27 @@ public class WaterRepository {
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
             rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"),
-            rs.getString("requester"), rs.getString("status"),
+            rs.getString("requester"), rs.getString("status"), rs.getString("field_key"),
+            rs.getObject("irrigation_nanos") == null ? null : rs.getLong("irrigation_nanos"),
+            rs.getBigDecimal("infiltration_balance"),
             rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
 
     private static final String ALLOCATION_SELECT =
             "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status,"
-                    + " created_nanos, updated_nanos";
+                    + " field_key, irrigation_nanos, infiltration_balance, created_nanos, updated_nanos";
+
+    private static final RowMapper<FieldRow> FIELD_MAPPER = (rs, n) -> new FieldRow(
+            rs.getLong("id"), rs.getString("field_key"), rs.getString("farmer"),
+            rs.getLong("capacity"), rs.getLong("recovery_per_hour"), rs.getLong("enabled_nanos"),
+            rs.getLong("version"), rs.getLong("created_nanos"));
+
+    private static final String FIELD_SELECT =
+            "SELECT id, field_key, farmer, capacity, recovery_per_hour, enabled_nanos, version, created_nanos";
+
+    private static final RowMapper<RequestLogRow> REQUEST_MAPPER = (rs, n) -> new RequestLogRow(
+            rs.getString("request_id"), rs.getString("operation"), rs.getString("actor"),
+            rs.getString("resource"), rs.getString("params_json"), rs.getString("response"),
+            rs.getLong("created_nanos"));
 
     private static final RowMapper<TransferRow> TRANSFER_MAPPER = (rs, n) -> new TransferRow(
             rs.getLong("id"), rs.getString("transfer_key"), rs.getLong("window_id"),
@@ -130,21 +159,39 @@ public class WaterRepository {
         return count != null && count > 0;
     }
 
-    /** 插入申请（初始 REQUESTED）并返回主键。 */
+    /** 插入申请（初始 REQUESTED，不关联田块）并返回主键。 */
     public long insertAllocation(String allocationKey, long windowId, String userId, BigDecimal amount,
                                  String requester, long nowNanos) {
+        return insertAllocation(allocationKey, windowId, userId, amount, requester, null, null, nowNanos);
+    }
+
+    /** 插入申请（初始 REQUESTED）并返回主键；fieldKey/irrigationNanos 可空。 */
+    public long insertAllocation(String allocationKey, long windowId, String userId, BigDecimal amount,
+                                 String requester, String fieldKey, Long irrigationNanos, long nowNanos) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, held_amount, requester, status, created_nanos, updated_nanos)"
-                            + " VALUES (?, ?, ?, ?, 0, ?, 'REQUESTED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
+                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, held_amount, requester,"
+                            + " status, field_key, irrigation_nanos, created_nanos, updated_nanos)"
+                            + " VALUES (?, ?, ?, ?, 0, ?, 'REQUESTED', ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, allocationKey);
             ps.setLong(2, windowId);
             ps.setString(3, userId);
             ps.setBigDecimal(4, amount);
             ps.setString(5, requester);
-            ps.setLong(6, nowNanos);
-            ps.setLong(7, nowNanos);
+            if (fieldKey == null) {
+                ps.setNull(6, Types.VARCHAR);
+            } else {
+                ps.setString(6, fieldKey);
+            }
+            if (irrigationNanos == null) {
+                ps.setNull(7, Types.BIGINT);
+            } else {
+                ps.setLong(7, irrigationNanos);
+            }
+            ps.setLong(8, nowNanos);
+            ps.setLong(9, nowNanos);
             return ps;
         }, keys);
         return Objects.requireNonNull(keys.getKey()).longValue();
@@ -303,5 +350,90 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 田块入渗
+    // ------------------------------------------------------------------
+
+    /** 插入田块（不可变配置，版本恒为 0）并返回主键。 */
+    public long insertField(String fieldKey, String farmer, long capacity, long recoveryPerHour,
+                            long enabledNanos, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO field_plot (field_key, farmer, capacity, recovery_per_hour, enabled_nanos,"
+                            + " version, created_nanos) VALUES (?, ?, ?, ?, ?, 0, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, fieldKey);
+            ps.setString(2, farmer);
+            ps.setLong(3, capacity);
+            ps.setLong(4, recoveryPerHour);
+            ps.setLong(5, enabledNanos);
+            ps.setLong(6, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询田块，不存在返回 null。 */
+    public FieldRow findFieldByKey(String fieldKey) {
+        try {
+            return jdbc.queryForObject(FIELD_SELECT + " FROM field_plot WHERE field_key = ?",
+                    FIELD_MAPPER, fieldKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按业务键锁定田块行（FOR UPDATE），用于串行化跨窗口的入渗重算，不存在返回 null。 */
+    public FieldRow lockFieldByKey(String fieldKey) {
+        try {
+            return jdbc.queryForObject(FIELD_SELECT + " FROM field_plot WHERE field_key = ? FOR UPDATE",
+                    FIELD_MAPPER, fieldKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 田块当前全部 APPROVED 申请（跨全部窗口），按灌溉时刻与申请键升序。 */
+    public List<AllocationRow> listApprovedByField(String fieldKey) {
+        return jdbc.query(
+                ALLOCATION_SELECT + " FROM allocation WHERE field_key = ? AND status = 'APPROVED'"
+                        + " ORDER BY irrigation_nanos, allocation_key",
+                ALLOCATION_MAPPER, fieldKey);
+    }
+
+    /** 批准时冻结扣后入渗余额，冻结后不改写。 */
+    public void setInfiltrationBalance(long id, BigDecimal balance) {
+        jdbc.update("UPDATE allocation SET infiltration_balance = ? WHERE id = ?", balance, id);
+    }
+
+    // ------------------------------------------------------------------
+    // 新增写入幂等日志（requestId）
+    // ------------------------------------------------------------------
+
+    /** 按幂等键查询新增写入日志，不存在返回 null。 */
+    public RequestLogRow findRequest(String requestId) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT request_id, operation, actor, resource, params_json, response, created_nanos"
+                            + " FROM request_log WHERE request_id = ?", REQUEST_MAPPER, requestId);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 先占位插入新增写入日志（响应为空），同事务内业务成功后写回响应；失败回滚不占键。 */
+    public void insertRequest(String requestId, String operation, String actor, String resource,
+                              String paramsJson, long createdNanos) {
+        jdbc.update("INSERT INTO request_log (request_id, operation, actor, resource, params_json, response,"
+                        + " created_nanos) VALUES (?, ?, ?, ?, ?, NULL, ?)",
+                requestId, operation, actor, resource, paramsJson, createdNanos);
+    }
+
+    /** 写回新增写入首次成功响应。 */
+    public void updateRequestResponse(String requestId, String response) {
+        jdbc.update("UPDATE request_log SET response = ? WHERE request_id = ?", response, requestId);
     }
 }

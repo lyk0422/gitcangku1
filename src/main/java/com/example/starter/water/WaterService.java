@@ -3,6 +3,7 @@ package com.example.starter.water;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.FieldRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
@@ -21,7 +22,11 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -84,9 +89,10 @@ public class WaterService {
         });
     }
 
-    /** 提交配水申请，申请人为 actor。 */
+    /** 提交配水申请，申请人为 actor；可关联田块并指定 UTC 整小时灌溉时刻。 */
     public AllocationResponse submitAllocation(String commandKey, String allocationKey, Long windowId,
-                                               String userId, String amount, String actor) {
+                                               String userId, String amount, String fieldKey,
+                                               String irrigationUtc, String actor) {
         requireKey("commandKey", commandKey);
         requireKey("allocationKey", allocationKey);
         requireKey("userId", userId);
@@ -95,14 +101,44 @@ public class WaterService {
             throw ApiException.badRequest("INVALID_ARGUMENT", "windowId 不能为空");
         }
         BigDecimal qty = parseAmount("amount", amount);
+        Long irrigationNanos = null;
+        if (fieldKey != null) {
+            requireKey("fieldKey", fieldKey);
+            if (irrigationUtc == null || irrigationUtc.isBlank()) {
+                throw ApiException.badRequest("INVALID_ARGUMENT", "关联田块时 irrigationUtc 不能为空");
+            }
+            long parsed = parseInstant("irrigationUtc", irrigationUtc);
+            if (Math.floorMod(parsed, InfiltrationEngine.HOUR_NANOS) != 0) {
+                throw ApiException.badRequest("INVALID_ARGUMENT", "irrigationUtc 必须为 UTC 整小时");
+            }
+            irrigationNanos = parsed;
+        } else if (irrigationUtc != null && !irrigationUtc.isBlank()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "未关联田块时不能指定 irrigationUtc");
+        }
         String params = "ALLOCATION_SUBMIT|" + allocationKey + "|" + windowId + "|" + userId + "|"
-                + qty.toPlainString() + "|" + actor;
+                + qty.toPlainString() + "|" + actor + "|" + fieldKey + "|" + irrigationNanos;
+        final Long irrigation = irrigationNanos;
         return runCommand("ALLOCATION_SUBMIT", commandKey, params, AllocationResponse.class, () -> {
             WindowRow window = repository.lockWindowById(windowId);
             if (window == null) {
                 throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
             }
-            long id = repository.insertAllocation(allocationKey, windowId, userId, qty, actor, nowNanos());
+            if (fieldKey != null) {
+                FieldRow field = repository.findFieldByKey(fieldKey);
+                if (field == null) {
+                    throw ApiException.notFound("FIELD_NOT_FOUND", "田块不存在: " + fieldKey);
+                }
+                if (irrigation < field.enabledNanos()) {
+                    throw ApiException.badRequest("IRRIGATION_BEFORE_ENABLED",
+                            "灌溉时刻早于田块启用时刻 " + toIso(field.enabledNanos()));
+                }
+                if (!field.farmer().equals(userId)) {
+                    throw ApiException.forbidden("FIELD_OWNERSHIP_MISMATCH",
+                            "田块 " + fieldKey + " 归属农户 " + field.farmer() + "，与用水户 " + userId + " 不匹配");
+                }
+            }
+            long id = repository.insertAllocation(allocationKey, windowId, userId, qty, actor,
+                    fieldKey, irrigation, nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
@@ -133,7 +169,21 @@ public class WaterService {
             if (approved.add(allocation.amount()).compareTo(available) > 0) {
                 throw ApiException.quotaExceeded("批准后将超过当前可用总量 " + fmt(available));
             }
-            repository.updateAllocationStatus(allocation.id(), STATUS_APPROVED, nowNanos());
+            // 入渗重算：把本申请按批准量加入田块跨全部窗口的最终时序，任一时点不足则 422 整体回滚
+            FieldRow field = allocation.fieldKey() != null ? lockField(allocation.fieldKey()) : null;
+            BigDecimal frozen = null;
+            if (field != null) {
+                List<InfiltrationEngine.Event> events = approvedEvents(field.fieldKey());
+                events.add(new InfiltrationEngine.Event(allocation.allocationKey(),
+                        allocation.irrigationNanos(), allocation.amount()));
+                frozen = evaluateField(field, events).balanceOf(allocation.allocationKey());
+            }
+            long now = nowNanos();
+            repository.updateAllocationStatus(allocation.id(), STATUS_APPROVED, now);
+            if (field != null) {
+                // 批准冻结当时序列下的扣后余额，之后的历史重算不改写该值
+                repository.setInfiltrationBalance(allocation.id(), frozen);
+            }
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
@@ -157,6 +207,18 @@ public class WaterService {
             }
             if (STATUS_CANCELLED.equals(allocation.status())) {
                 throw ApiException.conflict("ALLOCATION_ALREADY_CANCELLED", "申请已取消，不能重复取消");
+            }
+            // 入渗重算：取消后按最终序列（移除本申请）重核；容量恢复只作用于入渗余额，不返还窗口额度
+            if (allocation.fieldKey() != null) {
+                FieldRow field = lockField(allocation.fieldKey());
+                List<InfiltrationEngine.Event> events = new ArrayList<>();
+                for (AllocationRow row : repository.listApprovedByField(field.fieldKey())) {
+                    if (row.id() != allocation.id()) {
+                        events.add(new InfiltrationEngine.Event(row.allocationKey(),
+                                row.irrigationNanos(), row.heldAmount()));
+                    }
+                }
+                evaluateField(field, events);
             }
             repository.updateAllocationStatus(allocation.id(), STATUS_CANCELLED, nowNanos());
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
@@ -216,9 +278,44 @@ public class WaterService {
                 throw ApiException.quotaExceeded("源申请当前持有额度 " + fmt(lockedSource.heldAmount())
                         + " 不足，无法转让 " + fmt(amount));
             }
+            // 入渗重算：目标按批准量加入其田块最终时序，源按扣减后持有额度重算；不足则 422 整体回滚。
+            // 双方田块按业务键字典序加锁，与批准（窗口锁→田块锁）顺序一致，避免死锁
+            List<String> fieldKeys = new ArrayList<>();
+            if (lockedSource.fieldKey() != null) {
+                fieldKeys.add(lockedSource.fieldKey());
+            }
+            if (lockedTarget.fieldKey() != null && !lockedTarget.fieldKey().equals(lockedSource.fieldKey())) {
+                fieldKeys.add(lockedTarget.fieldKey());
+            }
+            Collections.sort(fieldKeys);
+            Map<String, FieldRow> fields = new HashMap<>();
+            for (String fieldKey : fieldKeys) {
+                fields.put(fieldKey, lockField(fieldKey));
+            }
+            BigDecimal targetFrozen = null;
+            if (lockedTarget.fieldKey() != null) {
+                FieldRow field = fields.get(lockedTarget.fieldKey());
+                List<InfiltrationEngine.Event> events = approvedEvents(field.fieldKey());
+                events.add(new InfiltrationEngine.Event(lockedTarget.allocationKey(),
+                        lockedTarget.irrigationNanos(), amount));
+                targetFrozen = evaluateField(field, events).balanceOf(lockedTarget.allocationKey());
+            }
+            if (lockedSource.fieldKey() != null) {
+                FieldRow field = fields.get(lockedSource.fieldKey());
+                List<InfiltrationEngine.Event> events = new ArrayList<>();
+                for (AllocationRow row : repository.listApprovedByField(field.fieldKey())) {
+                    BigDecimal held = row.id() == lockedSource.id()
+                            ? lockedSource.heldAmount().subtract(amount) : row.heldAmount();
+                    events.add(new InfiltrationEngine.Event(row.allocationKey(), row.irrigationNanos(), held));
+                }
+                evaluateField(field, events);
+            }
             long now = nowNanos();
             repository.decrementHeldAmount(lockedSource.id(), amount, now);
             repository.updateAllocationStatus(lockedTarget.id(), STATUS_APPROVED, now);
+            if (targetFrozen != null) {
+                repository.setInfiltrationBalance(lockedTarget.id(), targetFrozen);
+            }
             try {
                 repository.insertTransfer(transferKey, lockedSource.windowId(), sourceAllocationKey,
                         targetAllocationKey, amount, actor, now);
@@ -369,6 +466,40 @@ public class WaterService {
         return active != null ? active.volume() : window.plannedVolume();
     }
 
+    /** 锁定田块行（FOR UPDATE），串行化该田块跨全部窗口的入渗重算。 */
+    private FieldRow lockField(String fieldKey) {
+        FieldRow field = repository.lockFieldByKey(fieldKey);
+        if (field == null) {
+            throw ApiException.notFound("FIELD_NOT_FOUND", "田块不存在: " + fieldKey);
+        }
+        return field;
+    }
+
+    /** 田块当前已批准申请的入渗事件列表（扣量为当前持有额度），可追加候选事件。 */
+    private List<InfiltrationEngine.Event> approvedEvents(String fieldKey) {
+        List<InfiltrationEngine.Event> events = new ArrayList<>();
+        for (AllocationRow row : repository.listApprovedByField(fieldKey)) {
+            events.add(new InfiltrationEngine.Event(row.allocationKey(), row.irrigationNanos(),
+                    row.heldAmount()));
+        }
+        return events;
+    }
+
+    /** 按最终时序核算田块入渗余额；任一时点不足抛 422，报出申请与缺口，调用方整体回滚。 */
+    private InfiltrationEngine.Outcome evaluateField(FieldRow field, List<InfiltrationEngine.Event> events) {
+        InfiltrationEngine.Outcome outcome = InfiltrationEngine.evaluate(field.capacity(),
+                field.recoveryPerHour(), field.enabledNanos(), events);
+        InfiltrationEngine.Step deficit = outcome.deficit();
+        if (deficit != null) {
+            BigDecimal before = deficit.deduct().add(deficit.balanceAfter());
+            throw ApiException.unprocessable("INFILTRATION_INSUFFICIENT",
+                    "田块 " + field.fieldKey() + " 在申请 " + deficit.allocationKey() + "（灌溉时刻 "
+                            + toIso(deficit.irrigationNanos()) + "）入渗余额不足：需扣 " + fmt(deficit.deduct())
+                            + "，扣前余额 " + fmt(before) + "，缺口 " + fmt(deficit.balanceAfter().negate()));
+        }
+        return outcome;
+    }
+
     private WindowResponse toWindowResponse(WindowRow row, CurtailmentRow active) {
         BigDecimal available = active != null ? active.volume() : row.plannedVolume();
         return new WindowResponse(row.id(), row.windowKey(), row.channelId(), toIso(row.startNanos()),
@@ -379,7 +510,9 @@ public class WaterService {
     private AllocationResponse toAllocationResponse(AllocationRow row) {
         return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
                 fmt(row.heldAmount()), row.requester(), row.status(),
-                toIso(row.createdNanos()), toIso(row.updatedNanos()));
+                toIso(row.createdNanos()), toIso(row.updatedNanos()), row.fieldKey(),
+                row.irrigationNanos() == null ? null : toIso(row.irrigationNanos()),
+                row.infiltrationBalance() == null ? null : fmt(row.infiltrationBalance()));
     }
 
     private TransferResponse toTransferResponse(TransferRow row) {
