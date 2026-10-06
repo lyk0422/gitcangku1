@@ -26,6 +26,9 @@ import java.util.Map;
  * @param location        解决后版本的观测地点
  * @param reading         解决后版本的观测读数
  * @param note            解决后版本的观测备注
+ * @param dx              解决后版本的位移 x 分量，米（无位移组时不返回）
+ * @param dy              解决后版本的位移 y 分量，米（无位移组时不返回）
+ * @param w               解决后版本的边长，米（无位移组时不返回）
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ResolutionResponse(
@@ -42,7 +45,10 @@ public record ResolutionResponse(
         Instant resolvedAtUtc,
         String location,
         String reading,
-        String note) {
+        String note,
+        String dx,
+        String dy,
+        String w) {
 
     private static final TypeReference<Map<String, String>> SELECTIONS_TYPE = new TypeReference<>() {
     };
@@ -66,7 +72,10 @@ public record ResolutionResponse(
                 record.resolvedAtUtc(),
                 pointed.location(),
                 pointed.reading(),
-                pointed.note());
+                pointed.note(),
+                pointed.dx(),
+                pointed.dy(),
+                pointed.w());
     }
 
     private static Map<String, String> parseSelections(String json, ObjectMapper objectMapper) {

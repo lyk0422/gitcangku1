@@ -39,9 +39,9 @@ public class ResolutionRepository {
         jdbcTemplate.update(
                 "INSERT INTO conflict_resolution (resolution_id, observation_id, request_id, "
                         + "base_version, previous_version, new_version, candidate_location, candidate_reading, "
-                        + "candidate_note, conflict_fields, field_selections, operator, content_changed, "
-                        + "resolved_at_utc, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                        + "candidate_note, candidate_dx, candidate_dy, candidate_w, conflict_fields, "
+                        + "field_selections, operator, content_changed, resolved_at_utc, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 record.resolutionId(),
                 record.observationId(),
                 record.requestId(),
@@ -51,6 +51,9 @@ public class ResolutionRepository {
                 record.candidateLocation(),
                 record.candidateReading(),
                 record.candidateNote(),
+                record.candidateDx(),
+                record.candidateDy(),
+                record.candidateW(),
                 writeJson(record.conflictFields()),
                 record.fieldSelections(),
                 record.operator(),
@@ -65,6 +68,7 @@ public class ResolutionRepository {
         return jdbcTemplate.query(
                         "SELECT resolution_id, observation_id, request_id, base_version, previous_version, "
                                 + "new_version, candidate_location, candidate_reading, candidate_note, "
+                                + "candidate_dx, candidate_dy, candidate_w, "
                                 + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc "
                                 + "FROM conflict_resolution WHERE resolution_id = ?",
                         RESOLUTION_MAPPER, resolutionId)
@@ -78,6 +82,7 @@ public class ResolutionRepository {
         return jdbcTemplate.query(
                 "SELECT resolution_id, observation_id, request_id, base_version, previous_version, "
                         + "new_version, candidate_location, candidate_reading, candidate_note, "
+                        + "candidate_dx, candidate_dy, candidate_w, "
                         + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc "
                         + "FROM conflict_resolution WHERE observation_id = ? "
                         + "ORDER BY resolved_at_utc ASC, resolution_id ASC",
@@ -121,6 +126,9 @@ public class ResolutionRepository {
             rs.getString("candidate_location"),
             rs.getString("candidate_reading"),
             rs.getString("candidate_note"),
+            rs.getString("candidate_dx"),
+            rs.getString("candidate_dy"),
+            rs.getString("candidate_w"),
             readFieldList(rs.getString("conflict_fields")),
             rs.getString("field_selections"),
             rs.getString("operator"),
