@@ -15,9 +15,18 @@ public class BatchRepository {
 
     /**
      * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
+     * quantity/maxSampleQuantity 仅新类型数量批次有值，普通批次为 null。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, String status, String createdAt,
+                           Integer quantity, Integer maxSampleQuantity, int consumedQuantity) {
+    }
+
+    /**
+     * sample_consumption 表行记录：样本消耗凭证，创建后不可撤销。
+     */
+    public record SampleRow(long id, String batchKey, String sampleKey, String testKey,
+                            int quantity, int remainingAfter, String createdAt) {
     }
 
     /**
@@ -57,7 +66,15 @@ public class BatchRepository {
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
-            rs.getString("status"), rs.getString("created_at"));
+            rs.getString("status"), rs.getString("created_at"),
+            rs.getObject("quantity", Integer.class),
+            rs.getObject("max_sample_quantity", Integer.class),
+            rs.getInt("consumed_quantity"));
+
+    private static final RowMapper<SampleRow> SAMPLE_MAPPER = (rs, n) -> new SampleRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getString("sample_key"),
+            rs.getString("test_key"), rs.getInt("quantity"),
+            rs.getInt("remaining_after"), rs.getString("created_at"));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("test_key"),
@@ -101,10 +118,12 @@ public class BatchRepository {
     }
 
     public void insertBatch(BatchRow row) {
-        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status,"
+                        + " created_at, quantity, max_sample_quantity, consumed_quantity)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(),
-                row.status(), row.createdAt());
+                row.status(), row.createdAt(), row.quantity(), row.maxSampleQuantity(),
+                row.consumedQuantity());
     }
 
     public void insertRequiredTest(String batchKey, String testItem, int seq) {
@@ -208,5 +227,43 @@ public class BatchRepository {
     public List<String> findRecalledKeys() {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
+    }
+
+    /**
+     * 原子累加批次累计消耗量；调用前必须已持有该批次行锁。
+     */
+    public void updateConsumedQuantity(String batchKey, int consumedQuantity) {
+        jdbc.update("UPDATE batch SET consumed_quantity = ? WHERE batch_key = ?",
+                consumedQuantity, batchKey);
+    }
+
+    public void insertSample(SampleRow row) {
+        jdbc.update("INSERT INTO sample_consumption (batch_key, sample_key, test_key, quantity,"
+                        + " remaining_after, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.sampleKey(), row.testKey(), row.quantity(),
+                row.remainingAfter(), row.createdAt());
+    }
+
+    public Optional<SampleRow> findSample(String batchKey, String sampleKey) {
+        return jdbc.query("SELECT * FROM sample_consumption WHERE batch_key = ? AND sample_key = ?",
+                        SAMPLE_MAPPER, batchKey, sampleKey)
+                .stream().findFirst();
+    }
+
+    /**
+     * 某次检验结果关联的样本消耗凭证；一次检验至多绑定一份凭证。
+     */
+    public Optional<SampleRow> findSampleByTestKey(String batchKey, String testKey) {
+        return jdbc.query("SELECT * FROM sample_consumption WHERE batch_key = ? AND test_key = ?",
+                        SAMPLE_MAPPER, batchKey, testKey)
+                .stream().findFirst();
+    }
+
+    /**
+     * 某批次的全部样本消耗凭证，按落定顺序返回。
+     */
+    public List<SampleRow> findSamples(String batchKey) {
+        return jdbc.query("SELECT * FROM sample_consumption WHERE batch_key = ? ORDER BY id",
+                SAMPLE_MAPPER, batchKey);
     }
 }

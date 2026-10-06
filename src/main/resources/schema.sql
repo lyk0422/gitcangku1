@@ -6,8 +6,23 @@ CREATE TABLE IF NOT EXISTS batch (
     batch_no VARCHAR(64) NOT NULL COMMENT '批号，创建后不可修改',
     produced_at VARCHAR(40) NOT NULL COMMENT '生产时间，ISO-8601 UTC  instant 字符串',
     status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT',
+    quantity INT NULL COMMENT '批次总数量（整数件数）；仅新类型数量批次有值，NULL 表示普通批次无数量概念，创建后不可修改',
+    max_sample_quantity INT NULL COMMENT '破坏性检验最大取样量（件），0 至批次数量，创建后不可变；仅新类型数量批次有值，普通批次为 NULL',
+    consumed_quantity INT NOT NULL DEFAULT 0 COMMENT '累计已消耗样本量（件），随样本消耗凭证原子累加，不可回退；普通批次恒为 0',
     created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_batch_key UNIQUE (batch_key)
+);
+
+-- 样本消耗凭证：破坏性检验消耗的实物样本登记；凭证创建后不可撤销，重复凭证不再次扣量。
+CREATE TABLE IF NOT EXISTS sample_consumption (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为消耗落定顺序依据',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键',
+    sample_key VARCHAR(64) NOT NULL COMMENT '样本消耗凭证业务键，同一批次内唯一；重复提交不再次扣量',
+    test_key VARCHAR(64) NOT NULL COMMENT '关联的检验结果业务键，凭证随该次检验原子落账',
+    quantity INT NOT NULL COMMENT '本次消耗数量（件），正整数',
+    remaining_after INT NOT NULL COMMENT '本次消耗落定后的批次剩余量（件）= 批次总数量 - 累计消耗',
+    created_at VARCHAR(40) NOT NULL COMMENT '消耗时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_sample_key UNIQUE (batch_key, sample_key)
 );
 
 CREATE TABLE IF NOT EXISTS batch_required_test (

@@ -8,6 +8,7 @@ import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.RecallResponse;
+import com.example.starter.batch.dto.SampleConsumptionResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
 import com.example.starter.batch.dto.SubmitTestRequest;
@@ -72,36 +73,70 @@ public class BatchService {
 
     /**
      * 创建批次：初始状态 QUARANTINED；batchKey 全局唯一，重复返回 409。
+     * quantity 与 maxSampleQuantity 同时缺省为普通批次；同时提供则为新类型数量批次。
      */
     public StoredResponse createBatch(CreateBatchRequest req) {
         List<String> items = req.requiredTests().stream().map(String::trim).toList();
         if (new HashSet<>(items).size() != items.size()) {
             throw ApiException.badRequest("requiredTests 存在重复检验项");
         }
+        validateQuantitySpec(req.quantity(), req.maxSampleQuantity());
         String fingerprint = fingerprint("create", req.batchKey(), req.productCode(), req.batchNo(),
-                req.producedAt().toString(), String.join(SEP, items));
+                req.producedAt().toString(), String.join(SEP, items),
+                String.valueOf(req.quantity()), String.valueOf(req.maxSampleQuantity()));
         return executeIdempotent(CMD_CREATE, req.commandKey(), fingerprint, () -> {
             repo.findBatch(req.batchKey()).ifPresent(b -> {
                 throw ApiException.conflict("batchKey 已存在: " + req.batchKey());
             });
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now,
+                    req.quantity(), req.maxSampleQuantity(), 0));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
             BatchResponse body = new BatchResponse(req.batchKey(), req.productCode(), req.batchNo(),
-                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now));
+                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now),
+                    req.quantity(), req.maxSampleQuantity(),
+                    req.quantity() == null ? null : 0, req.quantity());
             return new StoredResponse(201, toJson(body));
         });
     }
 
     /**
+     * 数量规格校验：quantity 与 maxSampleQuantity 必须同时缺省（普通批次）或同时提供
+     * （新类型数量批次）；提供时 maxSampleQuantity 取值 0 至 quantity，创建后不可变。
+     */
+    private void validateQuantitySpec(Integer quantity, Integer maxSampleQuantity) {
+        if (quantity == null && maxSampleQuantity == null) {
+            return;
+        }
+        if (quantity == null || maxSampleQuantity == null) {
+            throw ApiException.badRequest("quantity 与 maxSampleQuantity 必须同时提供或同时缺省");
+        }
+        if (quantity < 1) {
+            throw ApiException.badRequest("quantity 必须为正整数");
+        }
+        if (maxSampleQuantity < 0 || maxSampleQuantity > quantity) {
+            throw ApiException.badRequest("maxSampleQuantity 必须取值 0 至批次数量 " + quantity);
+        }
+    }
+
+    /**
      * 提交检验结果：testKey 批次内幂等；任一 FAIL 立即 REJECTED；全部必做项 PASS 后 PENDING_RELEASE。
+     * 新类型数量批次可绑定 sampleKey + 正整数 consumeQuantity：无论合格与否都扣量，
+     * 累计消耗不得超过最大取样量或批次剩余量，超过返回 422 且检验结果与凭证均不落账。
      */
     public StoredResponse submitTest(String batchKey, SubmitTestRequest req) {
+        if ((req.sampleKey() == null) != (req.consumeQuantity() == null)) {
+            throw ApiException.badRequest("sampleKey 与 consumeQuantity 必须同时提供或同时缺省");
+        }
+        if (req.sampleKey() != null && req.sampleKey().isBlank()) {
+            throw ApiException.badRequest("sampleKey 不能为空");
+        }
         String fingerprint = fingerprint("test", batchKey, req.testKey(), req.testItem(),
-                req.result().name(), req.inspector());
+                req.result().name(), req.inspector(),
+                String.valueOf(req.sampleKey()), String.valueOf(req.consumeQuantity()));
         return executeIdempotent(CMD_TEST, req.commandKey(), fingerprint, () -> {
             BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
@@ -109,15 +144,18 @@ public class BatchService {
             var existing = repo.findTest(batchKey, req.testKey());
             if (existing.isPresent()) {
                 BatchRepository.TestRow row = existing.get();
+                BatchRepository.SampleRow sample =
+                        repo.findSampleByTestKey(batchKey, req.testKey()).orElse(null);
                 boolean sameContent = row.testItem().equals(req.testItem())
                         && row.outcome().equals(req.result().name())
-                        && row.inspector().equals(req.inspector());
+                        && row.inspector().equals(req.inspector())
+                        && sameConsumption(sample, req);
                 if (!sameContent) {
                     throw ApiException.conflict("testKey 已以不同内容提交: " + req.testKey());
                 }
                 List<String> required = repo.findRequiredTests(batchKey);
                 BatchStatus snapshot = snapshotAfter(row, repo.findTests(batchKey), required);
-                return new StoredResponse(200, toJson(toTestResponse(row, snapshot.name())));
+                return new StoredResponse(200, toJson(toTestResponse(row, snapshot.name(), sample)));
             }
 
             BatchStatus status = BatchStatus.valueOf(batch.status());
@@ -136,9 +174,37 @@ public class BatchService {
                 throw ApiException.conflict("该检验项已存在检验结果: " + req.testItem());
             }
 
+            // 样本消耗校验：仅新类型数量批次可绑定；累计不得超上限或剩余量，
+            // 超限抛 422，同事务回滚保证检验结果与凭证都不落账
+            Integer remainingAfter = null;
+            if (req.sampleKey() != null) {
+                if (batch.quantity() == null) {
+                    throw ApiException.unprocessable("普通批次不支持样本消耗: " + batchKey);
+                }
+                if (repo.findSample(batchKey, req.sampleKey()).isPresent()) {
+                    throw ApiException.conflict("sampleKey 已被其他检验使用: " + req.sampleKey());
+                }
+                int cumulative = batch.consumedQuantity() + req.consumeQuantity();
+                if (cumulative > batch.maxSampleQuantity()) {
+                    throw ApiException.unprocessable("累计消耗 " + cumulative
+                            + " 超过最大取样量 " + batch.maxSampleQuantity());
+                }
+                if (cumulative > batch.quantity()) {
+                    throw ApiException.unprocessable("累计消耗 " + cumulative
+                            + " 超过批次剩余量 " + (batch.quantity() - batch.consumedQuantity()));
+                }
+                remainingAfter = batch.quantity() - cumulative;
+            }
+
             String now = now();
             repo.insertTest(new BatchRepository.TestRow(0L, batchKey, req.testKey(), req.testItem(),
                     req.result().name(), req.inspector(), now));
+            if (req.sampleKey() != null) {
+                repo.insertSample(new BatchRepository.SampleRow(0L, batchKey, req.sampleKey(),
+                        req.testKey(), req.consumeQuantity(), remainingAfter, now));
+                repo.updateConsumedQuantity(batchKey,
+                        batch.consumedQuantity() + req.consumeQuantity());
+            }
 
             BatchStatus newStatus = status;
             if (req.result() == TestOutcome.FAIL) {
@@ -150,9 +216,22 @@ public class BatchService {
                 repo.updateStatus(batchKey, newStatus.name());
             }
             TestResultResponse body = new TestResultResponse(batchKey, req.testKey(), req.testItem(),
-                    req.result(), req.inspector(), newStatus, Instant.parse(now));
+                    req.result(), req.inspector(), newStatus, Instant.parse(now),
+                    req.sampleKey(), req.consumeQuantity(), remainingAfter);
             return new StoredResponse(201, toJson(body));
         });
+    }
+
+    /**
+     * 重放请求的消耗参数与已落账凭证是否一致：都无消耗，或 sampleKey 与消耗量完全相同。
+     */
+    private boolean sameConsumption(BatchRepository.SampleRow sample, SubmitTestRequest req) {
+        if (sample == null) {
+            return req.sampleKey() == null;
+        }
+        return sample.sampleKey().equals(req.sampleKey())
+                && req.consumeQuantity() != null
+                && sample.quantity() == req.consumeQuantity();
     }
 
     /**
@@ -175,6 +254,10 @@ public class BatchService {
             }
             if (status != BatchStatus.PENDING_RELEASE && status != BatchStatus.RELEASE_REVIEW) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许批准");
+            }
+            // 新类型数量批次：破坏性消耗后剩余量必须大于 0 才允许放行
+            if (batch.quantity() != null && batch.quantity() - batch.consumedQuantity() <= 0) {
+                throw ApiException.unprocessable("批次剩余量为 0，破坏性消耗后不允许放行");
             }
             boolean actorInspected = repo.findTests(batchKey).stream()
                     .anyMatch(t -> t.inspector().equals(actor));
@@ -259,7 +342,8 @@ public class BatchService {
     }
 
     /**
-     * 批次完整历史：批次概要 + 全部检验 + 全部批准 + 召回记录，历史不因召回而删除或改写。
+     * 批次完整历史：批次概要 + 全部检验 + 全部批准 + 召回记录 + 全部样本消耗凭证，
+     * 历史不因召回而删除或改写。
      */
     public BatchHistoryResponse history(String batchKey) {
         BatchRepository.BatchRow batch = repo.findBatch(batchKey)
@@ -270,7 +354,9 @@ public class BatchService {
         // 必做项全部 PASS 时该条→PENDING_RELEASE；其余→QUARANTINED。
         List<TestResultResponse> tests = new java.util.ArrayList<>(testRows.size());
         for (BatchRepository.TestRow t : testRows) {
-            tests.add(toTestResponse(t, snapshotAfter(t, testRows, required).name()));
+            BatchRepository.SampleRow sample =
+                    repo.findSampleByTestKey(batchKey, t.testKey()).orElse(null);
+            tests.add(toTestResponse(t, snapshotAfter(t, testRows, required).name(), sample));
         }
         List<ApprovalResponse> approvals = repo.findApprovals(batchKey).stream()
                 .map(a -> {
@@ -286,7 +372,11 @@ public class BatchService {
                 .map(r -> new RecallResponse(r.batchKey(), r.actorId(), r.reason(),
                         BatchStatus.RECALLED, Instant.parse(r.createdAt())))
                 .orElse(null);
-        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall);
+        List<SampleConsumptionResponse> samples = repo.findSamples(batchKey).stream()
+                .map(s -> new SampleConsumptionResponse(s.batchKey(), s.sampleKey(), s.testKey(),
+                        s.quantity(), s.remainingAfter(), Instant.parse(s.createdAt())))
+                .toList();
+        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall, samples);
     }
 
     /**
@@ -341,15 +431,22 @@ public class BatchService {
     }
 
     private BatchResponse toBatchResponse(BatchRepository.BatchRow row) {
+        Integer remaining = row.quantity() == null ? null : row.quantity() - row.consumedQuantity();
         return new BatchResponse(row.batchKey(), row.productCode(), row.batchNo(),
                 Instant.parse(row.producedAt()), BatchStatus.valueOf(row.status()),
-                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()));
+                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()),
+                row.quantity(), row.maxSampleQuantity(),
+                row.quantity() == null ? null : row.consumedQuantity(), remaining);
     }
 
-    private TestResultResponse toTestResponse(BatchRepository.TestRow row, String batchStatus) {
+    private TestResultResponse toTestResponse(BatchRepository.TestRow row, String batchStatus,
+                                              BatchRepository.SampleRow sample) {
         return new TestResultResponse(row.batchKey(), row.testKey(), row.testItem(),
                 TestOutcome.valueOf(row.outcome()), row.inspector(),
-                BatchStatus.valueOf(batchStatus), Instant.parse(row.createdAt()));
+                BatchStatus.valueOf(batchStatus), Instant.parse(row.createdAt()),
+                sample == null ? null : sample.sampleKey(),
+                sample == null ? null : sample.quantity(),
+                sample == null ? null : sample.remainingAfter());
     }
 
     /**
@@ -417,7 +514,10 @@ public class BatchService {
     /**
      * 拆分：仅当前可用的 RELEASED 批次可一次拆成 2～5 个全新子批。
      * 子批继承产品编码、生产 UTC 时间与必做检验项，初始 QUARANTINED，
-     * 不继承检验或批准记录；父批置为 SPLIT 不再可用。
+     * 不继承检验或批准记录；父批置为 SPLIT 不再可用，父批消耗凭证保留在父批。
+     * 新类型数量批次：每个子批必须携带正整数数量，且子批数量之和等于
+     * 父批总数量减去累计消耗；子批成为数量批次，取样预算置 0（消耗仍归父批）。
+     * 普通批次：子批不得携带数量，行为与原先一致。
      * 创建全部子批、血缘关系与父批状态在同一事务提交；任一子批键已存在或重复，整次 409 且父批不变。
      */
     public StoredResponse split(String parentKey, SplitRequest req) {
@@ -432,6 +532,7 @@ public class BatchService {
         for (SplitRequest.ChildSpec child : children) {
             parts.add(child.batchKey());
             parts.add(child.batchNo());
+            parts.add(String.valueOf(child.quantity()));
         }
         String fingerprint = fingerprint(parts.toArray(new String[0]));
         return executeIdempotent(CMD_SPLIT, req.commandKey(), fingerprint, () -> {
@@ -453,13 +554,38 @@ public class BatchService {
                     throw ApiException.conflict("子批 batchKey 已存在: " + childKey);
                 }
             }
+            // 数量守恒：与消耗检验共用父批行锁，拆分读取的剩余量不会被并发消耗改变
+            if (parent.quantity() == null) {
+                for (SplitRequest.ChildSpec child : children) {
+                    if (child.quantity() != null) {
+                        throw ApiException.unprocessable("普通批次拆分不得携带子批数量");
+                    }
+                }
+            } else {
+                int remaining = parent.quantity() - parent.consumedQuantity();
+                long sum = 0;
+                for (SplitRequest.ChildSpec child : children) {
+                    if (child.quantity() == null) {
+                        throw ApiException.unprocessable(
+                                "数量批次拆分必须为每个子批携带正整数数量");
+                    }
+                    sum += child.quantity();
+                }
+                if (sum != remaining) {
+                    throw ApiException.unprocessable("子批数量之和 " + sum
+                            + " 必须等于父批剩余量 " + remaining
+                            + "（总数量 " + parent.quantity() + " - 已消耗 "
+                            + parent.consumedQuantity() + "）");
+                }
+            }
             String now = now();
             List<String> required = repo.findRequiredTests(parentKey);
             List<SplitResponse.SplitChild> childBodies = new ArrayList<>(children.size());
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now,
+                        spec.quantity(), spec.quantity() == null ? null : 0, 0));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }
@@ -467,7 +593,7 @@ public class BatchService {
                         i + 1, now));
                 childBodies.add(new SplitResponse.SplitChild(spec.batchKey(), spec.batchNo(),
                         parent.productCode(), Instant.parse(parent.producedAt()),
-                        BatchStatus.QUARANTINED, required, Instant.parse(now)));
+                        BatchStatus.QUARANTINED, required, Instant.parse(now), spec.quantity()));
             }
             repo.updateStatus(parentKey, BatchStatus.SPLIT.name());
             SplitResponse body = new SplitResponse(parentKey, BatchStatus.SPLIT, childBodies,
