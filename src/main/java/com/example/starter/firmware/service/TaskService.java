@@ -12,6 +12,7 @@ import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
 import com.example.starter.firmware.repo.DeviceRepository;
+import com.example.starter.firmware.repo.GroupMemberRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.TaskRepository;
@@ -32,6 +33,7 @@ public class TaskService {
     private final TaskRepository taskRepository;
     private final ReleaseRepository releaseRepository;
     private final DeviceRepository deviceRepository;
+    private final GroupMemberRepository groupMemberRepository;
     private final PauseRecordRepository pauseRecordRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
@@ -39,12 +41,14 @@ public class TaskService {
     private final Clock clock;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
-                       DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
+                       DeviceRepository deviceRepository, GroupMemberRepository groupMemberRepository,
+                       PauseRecordRepository pauseRecordRepository,
                        DeviceService deviceService, ReleaseService releaseService,
                        IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
+        this.groupMemberRepository = groupMemberRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
@@ -105,6 +109,12 @@ public class TaskService {
                     .orElseThrow(() -> ApiException.notFound("TASK_NOT_FOUND", "任务不存在: " + taskId));
             return switch (task.status()) {
                 case PENDING -> {
+                    // 组预备屏障：设备属于活动组时，普通 SUCCESS 回执必须被拒，不能绕过屏障切版本
+                    if (request.result() == ReceiptResult.SUCCESS
+                            && groupMemberRepository.existsActiveByDeviceId(task.deviceId())) {
+                        throw ApiException.conflict("DEVICE_GROUP_BARRIER",
+                                "设备 " + task.deviceId() + " 属于活动组发布，普通 SUCCESS 回执被拒绝");
+                    }
                     taskRepository.complete(taskId, request.result());
                     releaseRepository.incrementRoundStats(snapshot.releaseId(), request.result());
                     if (request.result() == ReceiptResult.SUCCESS) {

@@ -63,6 +63,37 @@ CREATE TABLE IF NOT EXISTS release_resume_record (
   PRIMARY KEY (id)
 ) COMMENT='发布单人工恢复记录，历史不可改';
 
+CREATE TABLE IF NOT EXISTS device_group_release (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '组发布单ID',
+  version INT NOT NULL COMMENT '组发布单版本号，从1开始，激活或取消成功加一',
+  model VARCHAR(64) NOT NULL COMMENT '目标设备型号，全体成员同型号',
+  to_version VARCHAR(64) NOT NULL COMMENT '目标固件版本，激活时全组统一切换',
+  status VARCHAR(16) NOT NULL COMMENT '状态：PREPARING准备中，ACTIVATED已激活（终态），ABORTED准备失败中止（终态），CANCELLED已取消（终态）',
+  prepare_generation INT NOT NULL COMMENT '当前准备代次，从1开始；PREPARE回执必须匹配该代次，旧代次回执不影响新组',
+  activation_generation INT NULL COMMENT '组激活代次，激活成功时原子生成并写遍全组成员，未激活为NULL',
+  failed_device_id VARCHAR(64) NULL COMMENT '导致整组ABORTED的失败成员设备ID，未失败为NULL',
+  activated_at_utc VARCHAR(40) NULL COMMENT '激活时刻，UTC，ISO-8601格式（如2026-09-22T07:00:00Z），未激活为NULL',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
+  PRIMARY KEY (id)
+) COMMENT='固定设备组预备屏障发布单，区别于单设备普通灰度升级';
+
+CREATE TABLE IF NOT EXISTS device_group_member (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '组成员任务ID',
+  group_id BIGINT NOT NULL COMMENT '所属组发布单ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  status VARCHAR(16) NOT NULL COMMENT 'PENDING待准备；PREPARED已暂存（未切版本）；FAILED准备失败；CANCELLED已取消；ACTIVATED已激活',
+  prepare_generation INT NOT NULL COMMENT '成员任务所属准备代次，创建时固定，回执按代次校验',
+  activation_generation INT NULL COMMENT '成员激活代次，激活时与组代次一致，未激活为NULL',
+  active_device VARCHAR(64) NULL COMMENT '组活动（PREPARING）时等于device_id，组终态置NULL；用于一台设备至多属于一个活动组的唯一约束',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_group_member_device UNIQUE (group_id, device_id)
+) COMMENT='组发布成员任务，同设备同组发布单最多一条';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_member_active_device ON device_group_member (active_device);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
   request_id VARCHAR(64) NOT NULL COMMENT '全局唯一请求ID',
   api VARCHAR(64) NOT NULL COMMENT '接口标识',
