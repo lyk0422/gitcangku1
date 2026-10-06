@@ -108,6 +108,48 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 资源注册表：resource_key 唯一
+                st.execute("INSERT INTO incident_resources (resource_key, holder_assignment_id,"
+                        + " holder_incident_id, holder_task_id, created_at, updated_at) VALUES"
+                        + " ('RES-1',NULL,NULL,NULL,'" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "')");
+                boolean duplicateResourceRejected = false;
+                try {
+                    st.execute("INSERT INTO incident_resources (resource_key,"
+                            + " holder_assignment_id, holder_incident_id, holder_task_id,"
+                            + " created_at, updated_at) VALUES ('RES-1',NULL,NULL,NULL,'"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateResourceRejected = true;
+                }
+                assertThat(duplicateResourceRejected).isTrue();
+
+                // 租约与证据表可写入并按 id 升序读出（证据只追加）
+                st.execute("INSERT INTO task_resource_assignments (task_id, incident_id,"
+                        + " resource_key, authorization_version, assigned_by, assigned_at,"
+                        + " expires_at, status, released_by, released_at, created_at, updated_at)"
+                        + " VALUES (1,1,'RES-1',1,'alice','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now.plusSeconds(600)) + "','ACTIVE',NULL,NULL,'"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO resource_assignment_events (assignment_id, incident_id,"
+                        + " task_id, resource_key, event_type, old_version, new_version, actor,"
+                        + " occurred_at, detail) VALUES (1,1,1,'RES-1','ASSIGN',NULL,1,'alice','"
+                        + Timestamp.from(now) + "',NULL)");
+                st.execute("INSERT INTO resource_assignment_events (assignment_id, incident_id,"
+                        + " task_id, resource_key, event_type, old_version, new_version, actor,"
+                        + " occurred_at, detail) VALUES (1,1,1,'RES-1','RENEW',1,2,'officer','"
+                        + Timestamp.from(now) + "',NULL)");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT event_type, old_version, new_version FROM"
+                                + " resource_assignment_events WHERE task_id = 1 ORDER BY id")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("event_type")).isEqualTo("ASSIGN");
+                    assertThat(rs.getObject("old_version")).isNull();
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("event_type")).isEqualTo("RENEW");
+                    assertThat(rs.getInt("new_version")).isEqualTo(2);
+                }
             }
         }
     }

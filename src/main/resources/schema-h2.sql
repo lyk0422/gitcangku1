@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     task_key VARCHAR(128) NOT NULL,
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
-    status VARCHAR(16) NOT NULL,
+    status VARCHAR(24) NOT NULL,
     created_by VARCHAR(128) NOT NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
@@ -99,4 +99,54 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS incident_resources (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    resource_key VARCHAR(128) NOT NULL,
+    holder_assignment_id BIGINT NULL,
+    holder_incident_id BIGINT NULL,
+    holder_task_id BIGINT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_resource_key UNIQUE (resource_key)
+);
+
+CREATE TABLE IF NOT EXISTS task_resource_assignments (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    resource_key VARCHAR(128) NOT NULL,
+    authorization_version INT NOT NULL,
+    assigned_by VARCHAR(128) NOT NULL,
+    assigned_at TIMESTAMP(6) NOT NULL,
+    expires_at TIMESTAMP(6) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    released_by VARCHAR(128) NULL,
+    released_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_execution_logs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    entry_type VARCHAR(16) NOT NULL,
+    note VARCHAR(1024) NOT NULL,
+    actor VARCHAR(128) NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS resource_assignment_events (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    assignment_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL,
+    resource_key VARCHAR(128) NOT NULL,
+    event_type VARCHAR(24) NOT NULL,
+    old_version INT NULL,
+    new_version INT NULL,
+    actor VARCHAR(128) NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL,
+    detail VARCHAR(512) NULL
 );

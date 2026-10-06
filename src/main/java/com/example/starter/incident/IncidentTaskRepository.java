@@ -144,6 +144,54 @@ public class IncidentTaskRepository {
     }
 
     /**
+     * 将仍 OPEN 的任务置为 AUTHORIZATION_EXPIRED（命令路径懒判定），返回更新行数。
+     * 并发下仅首个判定生效（1），其余为 0，用于决定是否补写 EXPIRE 证据。
+     */
+    public int markAuthorizationExpiredIfOpen(long id, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'AUTHORIZATION_EXPIRED',"
+                + " updated_at = ? WHERE id = ? AND status = 'OPEN'",
+                Timestamp.from(at), id);
+    }
+
+    /**
+     * 续期成功后将 AUTHORIZATION_EXPIRED 任务恢复为 OPEN。
+     */
+    public void reopenFromExpired(long id, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET status = 'OPEN', updated_at = ?"
+                        + " WHERE id = ? AND status = 'AUTHORIZATION_EXPIRED'",
+                Timestamp.from(at), id);
+    }
+
+    /**
+     * 依赖闭包：从 fromIncidentId 出发沿阻塞边可达的全部事件 id（含起点）。
+     * 用于续期前验证完整依赖闭包中的资源与授权版本。
+     */
+    public Set<Long> listClosureIncidentIds(long fromIncidentId) {
+        List<Edge> edges = jdbc.query(
+                "SELECT t.incident_id, b.blocker_incident_id FROM incident_task_blockers b"
+                        + " JOIN incident_tasks t ON t.id = b.task_id",
+                (rs, n) -> new Edge(rs.getLong(1), rs.getLong(2)));
+        Map<Long, List<Long>> adjacency = new HashMap<>();
+        for (Edge edge : edges) {
+            adjacency.computeIfAbsent(edge.fromIncidentId(), k -> new ArrayList<>())
+                    .add(edge.toIncidentId());
+        }
+        Set<Long> visited = new HashSet<>();
+        Deque<Long> queue = new ArrayDeque<>();
+        queue.add(fromIncidentId);
+        visited.add(fromIncidentId);
+        while (!queue.isEmpty()) {
+            long current = queue.poll();
+            for (Long next : adjacency.getOrDefault(current, List.of())) {
+                if (visited.add(next)) {
+                    queue.add(next);
+                }
+            }
+        }
+        return visited;
+    }
+
+    /**
      * 追加一条阻塞边（任务 → 阻塞事件）。(task_id, blocker_incident_id) 唯一。
      */
     public void insertBlocker(long taskId, long blockerIncidentId, Instant now) {

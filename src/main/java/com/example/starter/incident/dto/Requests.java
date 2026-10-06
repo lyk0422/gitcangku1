@@ -55,4 +55,36 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 资源分配请求：expiresAt 为 UTC 到期时刻，必须晚于分配时刻（左闭右开）；
+     * authorizationVersion 为初始授权版本，必须 >= 1。
+     */
+    public record ResourceAssignRequest(String commandKey, String resourceKey,
+                                        Integer authorizationVersion, Instant expiresAt) {
+    }
+
+    /**
+     * 续期条目：newAuthorizationVersion 必须大于该任务租约当前版本；
+     * newExpiresAt 为 UTC 新到期时刻，必须晚于续期时刻。
+     */
+    public record ResourceRenewItem(String taskKey, Integer newAuthorizationVersion,
+                                    Instant newExpiresAt) {
+    }
+
+    /**
+     * 续期请求：一次可包含多个依赖任务；提交前验证完整依赖闭包中所有资源与
+     * 授权版本，任一冲突 422 且不改变任何任务状态或租约。
+     * 操作人（X-Actor-Id）必须不同于各租约的原分配人。
+     */
+    public record ResourceRenewRequest(String commandKey, List<ResourceRenewItem> items) {
+    }
+
+    /** 任务开始执行请求：note 为可选说明。 */
+    public record TaskStartRequest(String commandKey, String note) {
+    }
+
+    /** 任务继续执行请求：note 为非空执行说明。 */
+    public record TaskExecuteRequest(String commandKey, String note) {
+    }
 }
