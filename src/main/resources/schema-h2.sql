@@ -79,7 +79,10 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
     status VARCHAR(16) NOT NULL,
+    version INT NOT NULL DEFAULT 1,
     created_by VARCHAR(128) NOT NULL,
+    started_by VARCHAR(128) NULL,
+    started_at TIMESTAMP(6) NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
     cancelled_by VARCHAR(128) NULL,
@@ -95,6 +98,22 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
     blocker_incident_id BIGINT NOT NULL,
     created_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_task_blocker UNIQUE (task_id, blocker_incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS task_assignments (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    assignee VARCHAR(128) NOT NULL,
+    start_at TIMESTAMP(6) NOT NULL,
+    end_at TIMESTAMP(6) NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_assignment_task UNIQUE (task_id)
+);
+
+CREATE TABLE IF NOT EXISTS assignment_lock (
+    id TINYINT PRIMARY KEY
 );
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (

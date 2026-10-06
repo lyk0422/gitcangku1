@@ -4,17 +4,24 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.Supplier;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.AssignmentCancelRequest;
+import com.example.starter.incident.dto.Requests.AssignmentRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
@@ -22,14 +29,20 @@ import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.TaskStartRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.AssignmentOverlapView;
+import com.example.starter.incident.dto.Responses.AssignmentView;
+import com.example.starter.incident.dto.Responses.DailyLimitView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.RestShortageView;
+import com.example.starter.incident.dto.Responses.StartWindowView;
 import com.example.starter.incident.dto.Responses.StatusChangeView;
 import com.example.starter.incident.dto.Responses.TaskBlockerView;
 import com.example.starter.incident.dto.Responses.TaskView;
@@ -64,6 +77,18 @@ public class IncidentService {
     /** 每任务阻塞事件上限。 */
     private static final int MAX_BLOCKERS_PER_TASK = 5;
 
+    /** 相邻安排之间的最短休息时长（分钟）。 */
+    private static final long REST_MINUTES = 30L;
+
+    /** 每 UTC 日同一人员的作业总量上限（分钟），跨午夜按交集拆日。 */
+    private static final long DAILY_LIMIT_MINUTES = 480L;
+
+    /** 单段安排时长下限（分钟）。 */
+    private static final long MIN_ASSIGNMENT_MINUTES = 1L;
+
+    /** 单段安排时长上限（分钟）。 */
+    private static final long MAX_ASSIGNMENT_MINUTES = 240L;
+
     /** 视为阻塞已解除的目标事件状态。 */
     private static final Set<IncidentStatus> UNBLOCKING_STATUSES = EnumSet.of(
             IncidentStatus.CONTAINED, IncidentStatus.RESOLVED, IncidentStatus.CLOSED);
@@ -71,16 +96,19 @@ public class IncidentService {
     private final IncidentRepository incidents;
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
+    private final TaskAssignmentRepository assignments;
     private final CommandKeyRepository commandKeys;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
-                           IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           IncidentTaskRepository tasks, TaskAssignmentRepository assignments,
+                           CommandKeyRepository commandKeys,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
+        this.assignments = assignments;
         this.commandKeys = commandKeys;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -265,7 +293,7 @@ public class IncidentService {
                     if (targetStatus == IncidentStatus.RESOLVED) {
                         // 解决门禁：全部处置任务进入 DONE/CANCELLED 后才可解决
                         List<UnfinishedTaskView> unfinished = tasks
-                                .listOpenByIncident(incident.id()).stream()
+                                .listUnfinishedByIncident(incident.id()).stream()
                                 .map(t -> new UnfinishedTaskView(t.groupCode(), t.taskKey()))
                                 .toList();
                         if (!unfinished.isEmpty()) {
@@ -452,8 +480,8 @@ public class IncidentService {
                     }
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
-                            groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
-                            now, now));
+                            groupCode, title, TaskStatus.OPEN, 1, actor, null, null, null, null,
+                            null, null, now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
                     }
@@ -462,8 +490,10 @@ public class IncidentService {
     }
 
     /**
-     * 完成任务：仅当前指挥人；仅 OPEN 可完成；全部阻塞事件进入
-     * CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表。
+     * 完成任务：仅当前指挥人；OPEN（无安排）或 STARTED 可完成；有执行安排的任务
+     * 必须先经开始入口进入 STARTED（结束端点不允许开始，否则 422）；
+     * 全部阻塞事件进入 CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表。
+     * 完成成功版本加一；已开始任务完成后保留原安排作业量，不释放休息约束。
      * DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
@@ -476,9 +506,14 @@ public class IncidentService {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
+                    if (task.status() != TaskStatus.OPEN && task.status() != TaskStatus.STARTED) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能完成");
+                    }
+                    if (task.status() == TaskStatus.OPEN
+                            && assignments.findByTaskId(task.id()).isPresent()) {
+                        throw ApiException.unprocessable(
+                                "任务已有执行安排，必须先经开始入口开始后才能完成", null);
                     }
                     List<String> unresolved = unresolvedBlockers(task.id());
                     if (!unresolved.isEmpty()) {
@@ -491,8 +526,9 @@ public class IncidentService {
     }
 
     /**
-     * 取消任务：仅当前指挥人；仅 OPEN 可取消；DONE/CANCELLED 为终态，
-     * 重复操作按 commandKey 幂等规则返回首次结果。
+     * 取消任务：仅当前指挥人；OPEN 或 STARTED 可取消。取消 OPEN 任务时删除其未开始安排、
+     * 释放人员时段；取消 STARTED 任务保留原安排作业量，不释放休息约束。
+     * 取消成功版本加一；DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
     public TaskView cancelTask(String incidentKey, String taskKey, String actor,
@@ -504,11 +540,130 @@ public class IncidentService {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
-                    if (task.status() != TaskStatus.OPEN) {
+                    if (task.status() != TaskStatus.OPEN && task.status() != TaskStatus.STARTED) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能取消");
                     }
+                    if (task.status() == TaskStatus.OPEN) {
+                        // 未开始安排随取消释放时段；已开始任务的安排保留
+                        assignments.deleteByTaskId(task.id());
+                    }
                     tasks.markCancelled(task.id(), actor, now());
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 创建或替换执行安排：仅当前指挥人（权限先于幂等重放）；仅 OPEN 任务可安排，
+     * 已开始任务不可改时（422），终态任务 409；expectedTaskVersion 不匹配返回 409。
+     * 时段为 UTC 整分钟左闭右开、时长 1~240 分钟；同一人员全部安排不重叠、相邻至少
+     * 休息 30 分钟、每 UTC 日相交作业总量不超过 480 分钟（跨午夜按交集拆日），
+     * 违反返回 422 并给出日期和差额。安排变更成功任务版本加一。
+     */
+    @Transactional
+    public TaskView scheduleAssignment(String incidentKey, String taskKey, String actor,
+                                       AssignmentRequest req) {
+        String requestId = requireText(req.requestId(), "requestId");
+        long expectedVersion = requireVersion(req.expectedTaskVersion());
+        String assignee = requireText(req.assignee(), "assignee");
+        Instant startAt = requireWholeMinute(req.startAt(), "startAt");
+        Instant endAt = requireWholeMinute(req.endAt(), "endAt");
+        long minutes = Duration.between(startAt, endAt).toMinutes();
+        if (minutes < 1 || minutes > MAX_ASSIGNMENT_MINUTES) {
+            throw ApiException.badRequest("安排时长须为 1~" + MAX_ASSIGNMENT_MINUTES + " 分钟");
+        }
+        Incident incident = lockIncident(incidentKey);
+        requireCommander(incident, actor);
+        return runIdempotent(requestId, "task_schedule",
+                structuredHash("task_schedule", incidentKey, taskKey, actor, assignee,
+                        startAt.toString(), endAt.toString(), expectedVersion),
+                TaskView.class, () -> {
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    requireOpenForSchedule(task);
+                    requireVersion(task, expectedVersion);
+                    assignments.lockAssignments();
+                    validateAssignmentConstraints(assignee, startAt, endAt, task.id());
+                    Instant now = now();
+                    var existing = assignments.findByTaskId(task.id());
+                    if (existing.isPresent()) {
+                        assignments.update(existing.get().id(), assignee, startAt, endAt, now);
+                    } else {
+                        assignments.insert(new TaskAssignment(0L, task.id(), assignee, startAt,
+                                endAt, actor, now, now));
+                    }
+                    bumpVersion(task, expectedVersion, now);
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 撤销未开始安排：仅当前指挥人（权限先于幂等重放）；仅 OPEN 任务可撤销，
+     * 撤销后释放人员时段；已开始任务的安排不可撤销（422）。撤销成功任务版本加一。
+     */
+    @Transactional
+    public TaskView cancelAssignment(String incidentKey, String taskKey, String actor,
+                                     AssignmentCancelRequest req) {
+        String requestId = requireText(req.requestId(), "requestId");
+        long expectedVersion = requireVersion(req.expectedTaskVersion());
+        Incident incident = lockIncident(incidentKey);
+        requireCommander(incident, actor);
+        return runIdempotent(requestId, "task_assignment_cancel",
+                structuredHash("task_assignment_cancel", incidentKey, taskKey, actor,
+                        expectedVersion),
+                TaskView.class, () -> {
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    requireOpenForSchedule(task);
+                    requireVersion(task, expectedVersion);
+                    if (assignments.findByTaskId(task.id()).isEmpty()) {
+                        throw ApiException.conflict("任务没有执行安排，不能撤销");
+                    }
+                    assignments.deleteByTaskId(task.id());
+                    bumpVersion(task, expectedVersion, now());
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 开始任务：仅当前指挥人（权限先于幂等重放）；仅 OPEN 任务可开始。
+     * 以服务端 Clock 当前时刻校验落在安排区间 [startAt, endAt) 内且原阻塞依赖已解除，
+     * 否则 422；结束端点不允许开始。开始成功任务版本加一。
+     */
+    @Transactional
+    public TaskView startTask(String incidentKey, String taskKey, String actor,
+                              TaskStartRequest req) {
+        String requestId = requireText(req.requestId(), "requestId");
+        long expectedVersion = requireVersion(req.expectedTaskVersion());
+        Incident incident = lockIncident(incidentKey);
+        requireCommander(incident, actor);
+        return runIdempotent(requestId, "task_start",
+                structuredHash("task_start", incidentKey, taskKey, actor, expectedVersion),
+                TaskView.class, () -> {
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    if (task.status() != TaskStatus.OPEN) {
+                        throw ApiException.conflict(
+                                "任务当前状态为 " + task.status() + "，不能开始");
+                    }
+                    requireVersion(task, expectedVersion);
+                    TaskAssignment assignment = assignments.findByTaskId(task.id())
+                            .orElseThrow(() -> ApiException.unprocessable(
+                                    "任务没有执行安排，不能开始", null));
+                    Instant now = now();
+                    if (now.isBefore(assignment.startAt()) || !now.isBefore(assignment.endAt())) {
+                        throw ApiException.unprocessable("当前时刻不在安排区间内，不能开始",
+                                new StartWindowView(assignment.startAt(), assignment.endAt(), now));
+                    }
+                    List<String> unresolved = unresolvedBlockers(task.id());
+                    if (!unresolved.isEmpty()) {
+                        throw ApiException.unprocessable("存在未解除阻塞的事件: "
+                                + String.join(",", unresolved), List.copyOf(unresolved));
+                    }
+                    int updated = tasks.markStarted(task.id(), (int) expectedVersion, actor, now);
+                    if (updated == 0) {
+                        throw ApiException.conflict("任务版本或状态已变化，不能开始");
+                    }
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
@@ -567,6 +722,104 @@ public class IncidentService {
         return value.strip();
     }
 
+    private static long requireVersion(Long expectedVersion) {
+        if (expectedVersion == null) {
+            throw ApiException.badRequest("expectedTaskVersion 不能为空");
+        }
+        return expectedVersion;
+    }
+
+    private static Instant requireWholeMinute(Instant value, String field) {
+        if (value == null) {
+            throw ApiException.badRequest(field + " 不能为空");
+        }
+        if (value.getEpochSecond() % 60 != 0 || value.getNano() != 0) {
+            throw ApiException.badRequest(field + " 须为 UTC 整分钟");
+        }
+        return value;
+    }
+
+    /**
+     * 安排相关操作仅适用于 OPEN 任务：已开始不可改时（422），终态 409。
+     */
+    private static void requireOpenForSchedule(IncidentTask task) {
+        if (task.status() == TaskStatus.STARTED) {
+            throw ApiException.unprocessable("任务已开始，安排不可改时", null);
+        }
+        if (task.status() != TaskStatus.OPEN) {
+            throw ApiException.conflict("任务已处于终态 " + task.status() + "，不能变更安排");
+        }
+    }
+
+    private static void requireVersion(IncidentTask task, long expectedVersion) {
+        if (task.version() != expectedVersion) {
+            throw ApiException.conflict("任务版本不匹配: 期望 " + expectedVersion
+                    + "，当前 " + task.version());
+        }
+    }
+
+    /**
+     * 安排变更后递增任务版本：条件更新兜底并发，0 行表示版本或状态已被并发修改。
+     */
+    private void bumpVersion(IncidentTask task, long expectedVersion, Instant now) {
+        int updated = tasks.bumpVersionIfOpen(task.id(), (int) expectedVersion, now);
+        if (updated == 0) {
+            throw ApiException.conflict("任务版本或状态已变化，期望版本: " + expectedVersion);
+        }
+    }
+
+    /**
+     * 校验人员安排约束：与同人既有安排（排除本任务旧安排）不重叠、相邻至少休息
+     * REST_MINUTES 分钟、每 UTC 日相交作业总量不超过 DAILY_LIMIT_MINUTES 分钟
+     * （跨午夜按交集拆日）。违反时抛出 422 并携带日期与差额明细。
+     * 调用前须持有 assignments 全局锁，保证校验与写入相对其他安排串行。
+     */
+    private void validateAssignmentConstraints(String assignee, Instant startAt, Instant endAt,
+                                               long excludeTaskId) {
+        List<TaskAssignment> all = new ArrayList<>(assignments.listByAssignee(assignee).stream()
+                .filter(a -> a.taskId() != excludeTaskId).toList());
+        all.add(new TaskAssignment(0L, excludeTaskId, assignee, startAt, endAt, null,
+                startAt, startAt));
+        all.sort(Comparator.comparing(TaskAssignment::startAt)
+                .thenComparing(TaskAssignment::endAt));
+        for (int i = 1; i < all.size(); i++) {
+            TaskAssignment prev = all.get(i - 1);
+            TaskAssignment next = all.get(i);
+            long gap = Duration.between(prev.endAt(), next.startAt()).toMinutes();
+            if (gap < 0) {
+                throw ApiException.unprocessable("与人员 " + assignee + " 的既有安排重叠",
+                        new AssignmentOverlapView(
+                                prev.endAt().atOffset(ZoneOffset.UTC).toLocalDate(),
+                                prev.startAt(), prev.endAt()));
+            }
+            if (gap < REST_MINUTES) {
+                throw ApiException.unprocessable("与人员 " + assignee + " 的既有安排相邻休息不足 "
+                        + REST_MINUTES + " 分钟",
+                        new RestShortageView(prev.endAt().atOffset(ZoneOffset.UTC).toLocalDate(),
+                                REST_MINUTES, gap, REST_MINUTES - gap));
+            }
+        }
+        Map<LocalDate, Long> perDay = new TreeMap<>();
+        for (TaskAssignment assignment : all) {
+            Instant cursor = assignment.startAt();
+            while (cursor.isBefore(assignment.endAt())) {
+                LocalDate day = cursor.atOffset(ZoneOffset.UTC).toLocalDate();
+                Instant dayEnd = day.plusDays(1).atStartOfDay(ZoneOffset.UTC).toInstant();
+                Instant segEnd = assignment.endAt().isBefore(dayEnd) ? assignment.endAt() : dayEnd;
+                perDay.merge(day, Duration.between(cursor, segEnd).toMinutes(), Long::sum);
+                cursor = segEnd;
+            }
+        }
+        for (Map.Entry<LocalDate, Long> entry : perDay.entrySet()) {
+            if (entry.getValue() > DAILY_LIMIT_MINUTES) {
+                throw ApiException.unprocessable("人员 " + assignee + " 当日作业总量超过 "
+                        + DAILY_LIMIT_MINUTES + " 分钟",
+                        new DailyLimitView(entry.getKey(), DAILY_LIMIT_MINUTES, entry.getValue(),
+                                entry.getValue() - DAILY_LIMIT_MINUTES));
+            }
+        }
+    }
+
     /**
      * 幂等执行：同键同参重放首次响应，同键改参 409；并发同键由唯一约束串行化。
      */
@@ -620,6 +873,21 @@ public class IncidentService {
         }
     }
 
+    /**
+     * 结构化幂等身份：操作、操作者、资源与全部参数（含期望版本）序列化为 JSON 后取摘要，
+     * 避免分隔符拼接碰撞。
+     */
+    private String structuredHash(String operation, Object... parts) {
+        try {
+            List<Object> identity = new ArrayList<>();
+            identity.add(operation);
+            identity.addAll(List.of(parts));
+            return hash(objectMapper.writeValueAsString(identity));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("幂等身份序列化失败", e);
+        }
+    }
+
     private IncidentView toView(Incident incident, String pendingTransferTo) {
         return new IncidentView(incident.incidentKey(), incident.severity(), incident.summary(),
                 incident.reporter(), incident.status().name(), incident.commander(), pendingTransferTo,
@@ -632,15 +900,20 @@ public class IncidentService {
     }
 
     /**
-     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务。
+     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务；
+     * assignment 为当前执行安排（无则 null）。
      */
     private TaskView toTaskView(IncidentTask task) {
         List<TaskBlockerView> blockers = incidents.listBlockingIncidents(task.id()).stream()
                 .map(b -> new TaskBlockerView(b.incidentKey(), b.status().name(),
                         UNBLOCKING_STATUSES.contains(b.status())))
                 .toList();
+        AssignmentView assignment = assignments.findByTaskId(task.id())
+                .map(a -> new AssignmentView(a.assignee(), a.startAt(), a.endAt()))
+                .orElse(null);
         return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
-                blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
+                task.version(), blockers, task.createdBy(), task.createdAt(), assignment,
+                task.startedBy(), task.startedAt(), task.doneBy(), task.doneAt(),
                 task.cancelledBy(), task.cancelledAt());
     }
 

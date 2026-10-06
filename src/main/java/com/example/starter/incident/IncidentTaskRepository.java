@@ -42,13 +42,18 @@ public class IncidentTaskRepository {
     private static final RowMapper<IncidentTask> TASK_MAPPER = (rs, n) -> mapTask(rs);
 
     private static IncidentTask mapTask(ResultSet rs) throws SQLException {
+        Timestamp startedAt = rs.getTimestamp("started_at");
         Timestamp doneAt = rs.getTimestamp("done_at");
         Timestamp cancelledAt = rs.getTimestamp("cancelled_at");
         return new IncidentTask(
                 rs.getLong("id"), rs.getLong("incident_id"), rs.getString("task_key"),
                 rs.getString("group_code"), rs.getString("title"),
                 TaskStatus.valueOf(rs.getString("status")),
-                rs.getString("created_by"), rs.getString("done_by"),
+                rs.getInt("version"),
+                rs.getString("created_by"),
+                rs.getString("started_by"),
+                startedAt == null ? null : startedAt.toInstant(),
+                rs.getString("done_by"),
                 doneAt == null ? null : doneAt.toInstant(),
                 rs.getString("cancelled_by"),
                 cancelledAt == null ? null : cancelledAt.toInstant(),
@@ -63,28 +68,32 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 插入 OPEN 任务，返回生成主键。(incident_id, task_key) 唯一约束兜底并发重复插入。
+     * 插入 OPEN 任务（版本初始为 1），返回生成主键。(incident_id, task_key) 唯一约束兜底并发重复插入。
      */
     public long insert(IncidentTask task) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
-                            + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            + " version, created_by, started_by, started_at, done_by, done_at,"
+                            + " cancelled_by, cancelled_at, created_at, updated_at)"
+                            + " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
             ps.setString(3, task.groupCode());
             ps.setString(4, task.title());
             ps.setString(5, task.status().name());
-            ps.setString(6, task.createdBy());
-            ps.setString(7, task.doneBy());
-            ps.setTimestamp(8, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
-            ps.setString(9, task.cancelledBy());
-            ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
-            ps.setTimestamp(11, Timestamp.from(task.createdAt()));
-            ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setInt(6, task.version());
+            ps.setString(7, task.createdBy());
+            ps.setString(8, task.startedBy());
+            ps.setTimestamp(9, task.startedAt() == null ? null : Timestamp.from(task.startedAt()));
+            ps.setString(10, task.doneBy());
+            ps.setTimestamp(11, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
+            ps.setString(12, task.cancelledBy());
+            ps.setTimestamp(13, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
+            ps.setTimestamp(14, Timestamp.from(task.createdAt()));
+            ps.setTimestamp(15, Timestamp.from(task.updatedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -109,11 +118,11 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 查询事件仍 OPEN 的任务（解决门禁用），按创建顺序返回。
+     * 查询事件仍未终结的任务（OPEN 或 STARTED，解决门禁用），按创建顺序返回。
      */
-    public List<IncidentTask> listOpenByIncident(long incidentId) {
-        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ? AND status = 'OPEN'"
-                + " ORDER BY id", TASK_MAPPER, incidentId);
+    public List<IncidentTask> listUnfinishedByIncident(long incidentId) {
+        return jdbc.query("SELECT * FROM incident_tasks WHERE incident_id = ?"
+                + " AND status IN ('OPEN','STARTED') ORDER BY id", TASK_MAPPER, incidentId);
     }
 
     /**
@@ -126,21 +135,42 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻。
+     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻，版本加一。
      */
     public void markDone(long id, String actor, Instant at) {
         jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
-                        + " updated_at = ? WHERE id = ?",
+                        + " version = version + 1, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 
     /**
-     * 将 OPEN 任务置为 CANCELLED，记录取消人与 UTC 时刻。
+     * 将 OPEN/STARTED 任务置为 CANCELLED，记录取消人与 UTC 时刻，版本加一。
      */
     public void markCancelled(long id, String actor, Instant at) {
         jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
-                        + " cancelled_at = ?, updated_at = ? WHERE id = ?",
+                        + " cancelled_at = ?, version = version + 1, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
+    }
+
+    /**
+     * 将 OPEN 任务置为 STARTED，记录开始人与 UTC 时刻，版本加一。
+     * 条件更新（id + 期望版本 + 当前状态 OPEN），返回实际更新行数，0 表示版本或状态已变化。
+     */
+    public int markStarted(long id, int expectedVersion, String actor, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET status = 'STARTED', started_by = ?,"
+                        + " started_at = ?, version = version + 1, updated_at = ?"
+                        + " WHERE id = ? AND version = ? AND status = 'OPEN'",
+                actor, Timestamp.from(at), Timestamp.from(at), id, expectedVersion);
+    }
+
+    /**
+     * 安排变更（创建/替换/撤销）时递增任务版本。
+     * 条件更新（id + 期望版本 + 当前状态 OPEN），返回实际更新行数，0 表示版本或状态已变化。
+     */
+    public int bumpVersionIfOpen(long id, int expectedVersion, Instant at) {
+        return jdbc.update("UPDATE incident_tasks SET version = version + 1, updated_at = ?"
+                        + " WHERE id = ? AND version = ? AND status = 'OPEN'",
+                Timestamp.from(at), id, expectedVersion);
     }
 
     /**

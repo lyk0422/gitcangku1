@@ -1,6 +1,8 @@
 package com.example.starter.incident;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.AssignmentCancelRequest;
+import com.example.starter.incident.dto.Requests.AssignmentRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
@@ -8,6 +10,7 @@ import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.TaskStartRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
@@ -180,12 +183,42 @@ public class IncidentController {
     }
 
     /**
-     * 取消任务（仅当前指挥人；仅 OPEN 可取消）。
+     * 取消任务（仅当前指挥人；OPEN 或 STARTED 可取消）。
      */
     @PostMapping("/{incidentKey}/tasks/{taskKey}/cancel")
     public TaskView cancelTask(@PathVariable String incidentKey, @PathVariable String taskKey,
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 创建或替换执行安排（仅当前指挥人；仅 OPEN 任务，带 expectedTaskVersion）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/assignment")
+    public TaskView scheduleAssignment(@PathVariable String incidentKey, @PathVariable String taskKey,
+                                       @RequestHeader("X-Actor-Id") String actor,
+                                       @RequestBody AssignmentRequest req) {
+        return service.scheduleAssignment(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 撤销未开始安排（仅当前指挥人；仅 OPEN 任务，撤销后释放人员时段）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/assignment/cancel")
+    public TaskView cancelAssignment(@PathVariable String incidentKey, @PathVariable String taskKey,
+                                     @RequestHeader("X-Actor-Id") String actor,
+                                     @RequestBody AssignmentCancelRequest req) {
+        return service.cancelAssignment(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 开始任务（仅当前指挥人；服务端 Clock 当前时刻须在安排区间内且阻塞已解除）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/start")
+    public TaskView startTask(@PathVariable String incidentKey, @PathVariable String taskKey,
+                              @RequestHeader("X-Actor-Id") String actor,
+                              @RequestBody TaskStartRequest req) {
+        return service.startTask(incidentKey, taskKey, actor, req);
     }
 }

@@ -55,4 +55,21 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 任务执行安排创建/替换请求：requestId 为调用方幂等键；
+     * expectedTaskVersion 为期望的任务版本，不匹配返回 409；
+     * assignee 为合成人员标识；startAt/endAt 为 UTC 整分钟左闭右开时段，时长 1~240 分钟。
+     */
+    public record AssignmentRequest(String requestId, Long expectedTaskVersion, String assignee,
+                                    Instant startAt, Instant endAt) {
+    }
+
+    /** 撤销未开始安排的请求：仅 OPEN 任务可撤销，撤销后释放人员时段。 */
+    public record AssignmentCancelRequest(String requestId, Long expectedTaskVersion) {
+    }
+
+    /** 任务开始请求：服务端 Clock 当前时刻须落在安排区间内且阻塞已解除。 */
+    public record TaskStartRequest(String requestId, Long expectedTaskVersion) {
+    }
 }

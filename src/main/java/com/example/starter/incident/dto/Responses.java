@@ -1,6 +1,7 @@
 package com.example.starter.incident.dto;
 
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.List;
 
 /**
@@ -63,12 +64,23 @@ public final class Responses {
     }
 
     /**
-     * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * 处置任务视图：blockers 按阻塞事件键排序；version 初始 1，安排变更、开始、完成、
+     * 取消成功各加一；assignment 为当前执行安排（无则 null）；
+     * startedBy/startedAt 仅 STARTED 及经开始的 DONE 有值；
+     * doneBy/doneAt 仅 DONE 有值，cancelledBy/cancelledAt 仅 CANCELLED 有值。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
-                           List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           int version, List<TaskBlockerView> blockers, String createdBy,
+                           Instant createdAt, AssignmentView assignment, String startedBy,
+                           Instant startedAt, String doneBy, Instant doneAt,
+                           String cancelledBy, Instant cancelledAt) {
+    }
+
+    /**
+     * 任务执行安排视图：assignee 为合成人员标识；
+     * startAt/endAt 为 UTC 整分钟左闭右开时段，时长 1~240 分钟。
+     */
+    public record AssignmentView(String assignee, Instant startAt, Instant endAt) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */
@@ -77,5 +89,24 @@ public final class Responses {
 
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
+    }
+
+    /** 安排重叠冲突明细（422）：date 为冲突发生的 UTC 日期。 */
+    public record AssignmentOverlapView(LocalDate date, Instant conflictStartAt,
+                                        Instant conflictEndAt) {
+    }
+
+    /** 相邻休息不足明细（422）：date 为前一段安排结束所在的 UTC 日期；shortfallMinutes 为休息差额。 */
+    public record RestShortageView(LocalDate date, long requiredRestMinutes, long actualGapMinutes,
+                                   long shortfallMinutes) {
+    }
+
+    /** 日作业上限明细（422）：date 为超限的 UTC 日期；excessMinutes 为超出上限的差额。 */
+    public record DailyLimitView(LocalDate date, long limitMinutes, long scheduledMinutes,
+                                 long excessMinutes) {
+    }
+
+    /** 开始门禁明细（422）：当前时刻 now 不在安排区间 [windowStartAt, windowEndAt) 内。 */
+    public record StartWindowView(Instant windowStartAt, Instant windowEndAt, Instant now) {
     }
 }

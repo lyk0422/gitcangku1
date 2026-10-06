@@ -108,6 +108,28 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 执行安排：task_id 唯一（每任务至多一条当前安排），任务版本默认 1
+                st.execute("INSERT INTO task_assignments (task_id, assignee, start_at, end_at,"
+                        + " created_by, created_at, updated_at) VALUES (1,'worker-1','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now.plusSeconds(3600))
+                        + "','alice','" + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                boolean duplicateAssignmentRejected = false;
+                try {
+                    st.execute("INSERT INTO task_assignments (task_id, assignee, start_at, end_at,"
+                            + " created_by, created_at, updated_at) VALUES (1,'worker-2','"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now.plusSeconds(3600))
+                            + "','alice','" + Timestamp.from(now) + "','" + Timestamp.from(now)
+                            + "')");
+                } catch (Exception e) {
+                    duplicateAssignmentRejected = true;
+                }
+                assertThat(duplicateAssignmentRejected).isTrue();
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT version FROM incident_tasks WHERE id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getInt("version")).isEqualTo(1);
+                }
             }
         }
     }
