@@ -37,6 +37,7 @@ class AirspaceReviewControllerIT {
     void cleanup() {
         jdbc.update("DELETE FROM review");
         jdbc.update("DELETE FROM request_dedup");
+        jdbc.update("DELETE FROM route_energy_profile");
         jdbc.update("DELETE FROM route_point");
         jdbc.update("DELETE FROM route");
         jdbc.update("DELETE FROM no_fly_zone");
@@ -253,5 +254,64 @@ class AirspaceReviewControllerIT {
                                 {"zoneId":"z2","requestId":"req-v6"}"""))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("ZONE_ALREADY_REVOKED"));
+    }
+
+    @Test
+    @DisplayName("能量档案：登记后审查 ENERGY_BLOCKED 并给出点号缺口，缺项 400")
+    void energyProfileOverHttp() throws Exception {
+        // 三航点两段航线
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"er1","requestId":"req-er-route",
+                                 "points":[{"x":0,"y":0},{"x":50,"y":0},{"x":100,"y":0}]}"""))
+                .andExpect(status().isCreated());
+
+        // 缺操作者 → 400（新类型缺项）
+        mockMvc.perform(post("/api/airspace/routes/energy")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"er1","expectedVersion":1,"availableEnergy":100,
+                                 "reserveEnergy":10,"segmentConsumptions":[30,30],
+                                 "diversionEnergies":[0,0,40],"requestId":"req-er-bad"}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("VALIDATION_FAILED"));
+
+        // 合成能量 100、必留 10、两段各 30、终点备降 40 → 登记成功
+        mockMvc.perform(post("/api/airspace/routes/energy")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"er1","expectedVersion":1,"availableEnergy":100,
+                                 "reserveEnergy":10,"segmentConsumptions":[30,30],
+                                 "diversionEnergies":[0,0,40],"operator":"tester",
+                                 "requestId":"req-er-energy"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.routeVersion").value(1))
+                .andExpect(jsonPath("$.data.segments").value(2));
+
+        // 审查 → ENERGY_BLOCKED，终点（点号 2）缺口 10
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"er1","routeVersion":1,"airspaceVersion":0,
+                                 "requestId":"req-er-review"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.conclusion").value("ENERGY_BLOCKED"))
+                .andExpect(jsonPath("$.data.energyBlocks[0].pointIndex").value(2))
+                .andExpect(jsonPath("$.data.energyBlocks[0].deficit").value(10))
+                .andExpect(jsonPath("$.data.energySnapshot.reserveEnergy").value(10))
+                .andExpect(jsonPath("$.data.energySnapshot.points[2].cumulativeConsumption")
+                        .value(60));
+
+        // 同版本重复登记 → 409
+        mockMvc.perform(post("/api/airspace/routes/energy")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"er1","expectedVersion":1,"availableEnergy":100,
+                                 "reserveEnergy":10,"segmentConsumptions":[30,30],
+                                 "diversionEnergies":[0,0,30],"operator":"tester",
+                                 "requestId":"req-er-dup"}"""))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("ENERGY_PROFILE_EXISTS"));
     }
 }

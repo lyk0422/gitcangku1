@@ -1,5 +1,6 @@
 package com.example.starter.api;
 
+import com.example.starter.api.dto.EnergyProfileRegisterRequest;
 import com.example.starter.api.dto.MutationResponse;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
@@ -53,6 +54,13 @@ public class AirspaceReviewController {
     @PostMapping("/routes/replace")
     public ResponseEntity<MutationResponse> replaceRoute(@Valid @RequestBody RouteReplaceRequest request) {
         return ResponseEntity.ok(service.replaceRoute(request));
+    }
+
+    /** 为航线当前版本登记能量档案（每版本一次，随版本冻结）。 */
+    @PostMapping("/routes/energy")
+    public ResponseEntity<MutationResponse> registerEnergyProfile(
+            @Valid @RequestBody EnergyProfileRegisterRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(service.registerEnergyProfile(request));
     }
 
     /** 提交审核。 */

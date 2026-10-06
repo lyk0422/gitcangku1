@@ -44,15 +44,31 @@ CREATE TABLE IF NOT EXISTS route_point (
     PRIMARY KEY (route_id, seq)
 ) COMMENT = '航线当前版本有序航点';
 
+-- 航线版本能量档案：按 (route_id, route_version) 冻结，不可变；
+-- 档案变化必须先通过航线修订生成新版本，再为新版本登记
+CREATE TABLE IF NOT EXISTS route_energy_profile (
+    route_id          VARCHAR(64) NOT NULL COMMENT '所属航线标识',
+    route_version     INT NOT NULL COMMENT '档案绑定的航线版本；档案变更须先修订航线生成新版本',
+    available_energy  BIGINT NOT NULL COMMENT '出发可用能量，单位标准能量，非负，单项上限 1e12',
+    reserve_energy    BIGINT NOT NULL COMMENT '必留余量，非负，每个航点判定都计入',
+    segment_costs     CLOB NOT NULL COMMENT '每段正整数耗能，逗号拼接；条数等于坐标段数（航点数-1），最多 10 段',
+    diversion_costs   CLOB NOT NULL COMMENT '每个航点备降选项的非负整数额外耗能，逗号拼接；条数等于航点数',
+    operator          VARCHAR(64) NOT NULL COMMENT '登记操作者，非空',
+    request_id        VARCHAR(64) NOT NULL COMMENT '登记写操作请求标识',
+    created_at        BIGINT NOT NULL COMMENT '登记时间，epoch 毫秒（UTC）',
+    PRIMARY KEY (route_id, route_version)
+) COMMENT = '航线版本能量档案（随航线版本冻结，不可变）';
+
 -- 审核不可变结果
 CREATE TABLE IF NOT EXISTS review (
     review_id         VARCHAR(64) PRIMARY KEY COMMENT '审核记录唯一标识（不可变）',
     route_id          VARCHAR(64) NOT NULL COMMENT '被审核航线标识',
     route_version     INT NOT NULL COMMENT '审核明确指定的航线版本',
     airspace_version  BIGINT NOT NULL COMMENT '审核明确指定的空域版本',
-    conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过或 BLOCKED 命中，永不改变',
+    conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过、BLOCKED 几何命中或 ENERGY_BLOCKED 能量不足，永不改变',
     hit_zone_ids      CLOB NOT NULL COMMENT '命中的全部 zoneId，字典序去重后逗号拼接；未命中为空串',
     points_snapshot   VARCHAR(4000) NOT NULL COMMENT '审核时航点不可变快照，格式 x,y;x,y',
+    energy_snapshot   CLOB NULL COMMENT '审核时能量评估冻结快照（JSON：出发能量、必留余量、每点累计/备降/需求/缺口）；无能量档案时为 NULL',
     request_id        VARCHAR(64) NOT NULL COMMENT '提交审核的写操作请求标识',
     created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
 ) COMMENT = '审核不可变结果';
@@ -62,7 +78,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
-    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
+    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/ENERGY_REGISTER/REVIEW',
     request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'

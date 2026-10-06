@@ -1,6 +1,9 @@
 package com.example.starter.repo;
 
+import com.example.starter.domain.EnergyAssessment;
 import com.example.starter.domain.Point;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -11,10 +14,13 @@ import java.util.List;
 
 /**
  * 审核结果与幂等去重数据访问。
- * 点快照以 "x,y;x,y" 文本保存，命中 zoneId 以逗号拼接，均为不可变内容。
+ * 点快照以 "x,y;x,y" 文本保存，命中 zoneId 以逗号拼接，
+ * 能量评估快照以 JSON 保存，均为不可变内容。
  */
 @Repository
 public class ReviewRepository {
+
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     private final JdbcTemplate jdbc;
 
@@ -30,6 +36,7 @@ public class ReviewRepository {
             rs.getString("conclusion"),
             decodeZoneIds(rs.getString("hit_zone_ids")),
             decodePoints(rs.getString("points_snapshot")),
+            decodeAssessment(rs.getString("energy_snapshot")),
             rs.getString("request_id"),
             rs.getLong("created_at"));
 
@@ -37,7 +44,7 @@ public class ReviewRepository {
     public ReviewPo findReview(String reviewId) {
         return jdbc.query(
                 "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
+                        + "hit_zone_ids, points_snapshot, energy_snapshot, request_id, created_at "
                         + "FROM review WHERE review_id = ?",
                 REVIEW_MAPPER, reviewId).stream().findFirst().orElse(null);
     }
@@ -46,7 +53,7 @@ public class ReviewRepository {
     public ReviewPo findLatestReview(String routeId) {
         return jdbc.query(
                 "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
+                        + "hit_zone_ids, points_snapshot, energy_snapshot, request_id, created_at "
                         + "FROM review WHERE route_id = ? "
                         + "ORDER BY created_at DESC, review_id DESC LIMIT 1",
                 REVIEW_MAPPER, routeId).stream().findFirst().orElse(null);
@@ -56,11 +63,11 @@ public class ReviewRepository {
     public void insertReview(ReviewPo po) {
         jdbc.update("INSERT INTO review "
                         + "(review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "hit_zone_ids, points_snapshot, energy_snapshot, request_id, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 po.reviewId(), po.routeId(), po.routeVersion(), po.airspaceVersion(),
                 po.conclusion(), encodeZoneIds(po.hitZoneIds()), encodePoints(po.pointsSnapshot()),
-                po.requestId(), po.createdAt());
+                encodeAssessment(po.energyAssessment()), po.requestId(), po.createdAt());
     }
 
     /** 查询幂等去重记录，不存在返回 null。 */
@@ -117,5 +124,29 @@ public class ReviewRepository {
             return new ArrayList<>();
         }
         return new ArrayList<>(Arrays.asList(text.split(",")));
+    }
+
+    /** 能量评估快照编码为 JSON；无档案（null）编码为 null。 */
+    public static String encodeAssessment(EnergyAssessment assessment) {
+        if (assessment == null) {
+            return null;
+        }
+        try {
+            return JSON.writeValueAsString(assessment);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("能量评估快照序列化失败", ex);
+        }
+    }
+
+    /** 能量评估快照 JSON 解码；null/空串返回 null。 */
+    public static EnergyAssessment decodeAssessment(String json) {
+        if (json == null || json.isEmpty()) {
+            return null;
+        }
+        try {
+            return JSON.readValue(json, EnergyAssessment.class);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("能量评估快照反序列化失败", ex);
+        }
     }
 }
