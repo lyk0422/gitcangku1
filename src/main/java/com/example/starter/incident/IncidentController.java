@@ -3,11 +3,14 @@ package com.example.starter.incident;
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.LeaseRenewRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
+import com.example.starter.incident.dto.Requests.ResourceAssignRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
+import com.example.starter.incident.dto.Requests.TaskExecutionRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
@@ -16,6 +19,7 @@ import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.TaskResourceHistoryView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import org.springframework.http.HttpStatus;
@@ -187,5 +191,46 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 为任务分配资源租约（仅当前指挥人；必须携带 UTC 到期时刻与授权版本）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/resource")
+    public TaskView assignResource(@PathVariable String incidentKey, @PathVariable String taskKey,
+                                   @RequestHeader("X-Actor-Id") String actor,
+                                   @RequestBody ResourceAssignRequest req) {
+        return service.assignResource(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 批量续期：taskKeys 必须恰好覆盖事件资源依赖闭包；操作人须为不同于
+     * 原分配人的授权角色，提交新授权版本与新 UTC 到期时刻；任一冲突 422 且整体不变。
+     */
+    @PostMapping("/{incidentKey}/tasks/renew")
+    public IncidentTasksView renewLeases(@PathVariable String incidentKey,
+                                         @RequestHeader("X-Actor-Id") String actor,
+                                         @RequestBody LeaseRenewRequest req) {
+        return service.renewLeases(incidentKey, actor, req);
+    }
+
+    /**
+     * 记录任务执行（START/CONTINUE，仅当前指挥人；授权到期则被拦截并转为
+     * AUTHORIZATION_EXPIRED，返回拦截后的任务视图）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/executions")
+    public TaskView recordExecution(@PathVariable String incidentKey, @PathVariable String taskKey,
+                                    @RequestHeader("X-Actor-Id") String actor,
+                                    @RequestBody TaskExecutionRequest req) {
+        return service.recordExecution(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 查询任务资源明细与历史（当前租约、全部版本、使用证据、执行日志；只读）。
+     */
+    @GetMapping("/{incidentKey}/tasks/{taskKey}/leases")
+    public TaskResourceHistoryView taskResourceHistory(@PathVariable String incidentKey,
+                                                       @PathVariable String taskKey) {
+        return service.taskResourceHistory(incidentKey, taskKey);
     }
 }

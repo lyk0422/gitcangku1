@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     task_key VARCHAR(128) NOT NULL,
     group_code VARCHAR(64) NOT NULL,
     title VARCHAR(512) NOT NULL,
-    status VARCHAR(16) NOT NULL,
+    status VARCHAR(32) NOT NULL,
     created_by VARCHAR(128) NOT NULL,
     done_by VARCHAR(128) NULL,
     done_at TIMESTAMP(6) NULL,
@@ -98,4 +98,53 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS leased_resources (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    resource_key VARCHAR(128) NOT NULL,
+    active_lease_id BIGINT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_resource_key UNIQUE (resource_key)
+);
+
+CREATE TABLE IF NOT EXISTS resource_leases (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    resource_id BIGINT NOT NULL,
+    resource_key VARCHAR(128) NOT NULL,
+    incident_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL,
+    lease_version INT NOT NULL,
+    auth_version VARCHAR(64) NOT NULL,
+    assigned_by VARCHAR(128) NOT NULL,
+    authorized_by VARCHAR(128) NOT NULL,
+    authorizer_role VARCHAR(64) NULL,
+    assigned_at TIMESTAMP(6) NOT NULL,
+    expires_at TIMESTAMP(6) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    ended_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_lease_task_version UNIQUE (task_id, lease_version)
+);
+
+CREATE TABLE IF NOT EXISTS resource_lease_events (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_type VARCHAR(24) NOT NULL,
+    resource_key VARCHAR(128) NOT NULL,
+    incident_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL,
+    lease_id BIGINT NULL,
+    old_auth_version VARCHAR(64) NULL,
+    new_auth_version VARCHAR(64) NULL,
+    actor VARCHAR(128) NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL,
+    detail VARCHAR(256) NULL
+);
+
+CREATE TABLE IF NOT EXISTS incident_task_executions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    action VARCHAR(16) NOT NULL,
+    actor VARCHAR(128) NOT NULL,
+    occurred_at TIMESTAMP(6) NOT NULL
 );

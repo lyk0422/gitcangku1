@@ -111,4 +111,85 @@ class SchemaH2ScriptTest {
             }
         }
     }
+
+    @Test
+    void h2Schema_resourceLeaseConstraints() throws Exception {
+        String url = "jdbc:h2:mem:schema_h2_lease;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=0";
+        try (Connection con = DriverManager.getConnection(url, "sa", "")) {
+            ScriptUtils.executeSqlScript(con, new ClassPathResource("schema-h2.sql"));
+
+            Instant now = Instant.parse("2026-09-22T00:00:00Z");
+            try (Statement st = con.createStatement()) {
+                st.execute("INSERT INTO incidents (incident_key, severity, summary, reporter, status,"
+                        + " commander, created_at, updated_at) VALUES ('IK-L','S2','s','r',"
+                        + "'COMMANDING','alice','" + Timestamp.from(now) + "','"
+                        + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code, title,"
+                        + " status, created_by, created_at, updated_at) VALUES (1,'T-1','G','t',"
+                        + "'OPEN','alice','" + Timestamp.from(now) + "','" + Timestamp.from(now)
+                        + "')");
+
+                // resource_key 唯一约束
+                st.execute("INSERT INTO leased_resources (resource_key, active_lease_id, created_at)"
+                        + " VALUES ('RES-1',NULL,'" + Timestamp.from(now) + "')");
+                boolean duplicateResourceRejected = false;
+                try {
+                    st.execute("INSERT INTO leased_resources (resource_key, active_lease_id,"
+                            + " created_at) VALUES ('RES-1',NULL,'" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateResourceRejected = true;
+                }
+                assertThat(duplicateResourceRejected).isTrue();
+
+                // (task_id, lease_version) 唯一约束：版本历史不可重复
+                st.execute("INSERT INTO resource_leases (resource_id, resource_key, incident_id,"
+                        + " task_id, lease_version, auth_version, assigned_by, authorized_by,"
+                        + " authorizer_role, assigned_at, expires_at, status, ended_at, created_at)"
+                        + " VALUES (1,'RES-1',1,1,1,'v1','alice','alice',NULL,'"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now.plusSeconds(600))
+                        + "','ACTIVE',NULL,'" + Timestamp.from(now) + "')");
+                boolean duplicateVersionRejected = false;
+                try {
+                    st.execute("INSERT INTO resource_leases (resource_id, resource_key, incident_id,"
+                            + " task_id, lease_version, auth_version, assigned_by, authorized_by,"
+                            + " authorizer_role, assigned_at, expires_at, status, ended_at,"
+                            + " created_at) VALUES (1,'RES-1',1,1,1,'v1x','alice','alice',NULL,'"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now.plusSeconds(600))
+                            + "','ACTIVE',NULL,'" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateVersionRejected = true;
+                }
+                assertThat(duplicateVersionRejected).isTrue();
+
+                // 条件结束只作用于 ACTIVE：SUPERSEDED 后再次结束更新 0 行
+                int ended = st.executeUpdate("UPDATE resource_leases SET status='SUPERSEDED',"
+                        + " ended_at='" + Timestamp.from(now) + "' WHERE id = 1"
+                        + " AND status = 'ACTIVE'");
+                assertThat(ended).isEqualTo(1);
+                int reEnded = st.executeUpdate("UPDATE resource_leases SET status='EXPIRED'"
+                        + " WHERE id = 1 AND status = 'ACTIVE'");
+                assertThat(reEnded).isZero();
+
+                // 证据表可追加且保持插入顺序
+                st.execute("INSERT INTO resource_lease_events (event_type, resource_key,"
+                        + " incident_id, task_id, lease_id, old_auth_version, new_auth_version,"
+                        + " actor, occurred_at, detail) VALUES ('ASSIGN','RES-1',1,1,1,NULL,'v1',"
+                        + "'alice','" + Timestamp.from(now) + "',NULL)");
+                st.execute("INSERT INTO resource_lease_events (event_type, resource_key,"
+                        + " incident_id, task_id, lease_id, old_auth_version, new_auth_version,"
+                        + " actor, occurred_at, detail) VALUES ('RENEW','RES-1',1,1,1,'v1','v2',"
+                        + "'authorizer-1','" + Timestamp.from(now) + "',NULL)");
+                try (ResultSet rs = st.executeQuery("SELECT event_type, old_auth_version,"
+                        + " new_auth_version FROM resource_lease_events ORDER BY id")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("event_type")).isEqualTo("ASSIGN");
+                    assertThat(rs.getString("old_auth_version")).isNull();
+                    assertThat(rs.getString("new_auth_version")).isEqualTo("v1");
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("event_type")).isEqualTo("RENEW");
+                    assertThat(rs.getString("old_auth_version")).isEqualTo("v1");
+                }
+            }
+        }
+    }
 }

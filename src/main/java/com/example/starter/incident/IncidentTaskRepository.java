@@ -144,6 +144,44 @@ public class IncidentTaskRepository {
     }
 
     /**
+     * 将 OPEN 任务置为 AUTHORIZATION_EXPIRED（授权到期，终态）；不记录完成/取消人。
+     */
+    public void markAuthorizationExpired(long id, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET status = 'AUTHORIZATION_EXPIRED', updated_at = ?"
+                        + " WHERE id = ? AND status = 'OPEN'",
+                Timestamp.from(at), id);
+    }
+
+    /**
+     * 追加任务执行日志（START/CONTINUE），只追加不改写。
+     */
+    public void insertExecution(long taskId, ExecutionAction action, String actor, Instant at) {
+        jdbc.update("INSERT INTO incident_task_executions (task_id, action, actor, occurred_at)"
+                + " VALUES (?,?,?,?)", taskId, action.name(), actor, Timestamp.from(at));
+    }
+
+    /**
+     * 查询任务全部执行日志，按发生顺序返回。
+     */
+    public List<TaskExecution> listExecutions(long taskId) {
+        return jdbc.query("SELECT * FROM incident_task_executions WHERE task_id = ? ORDER BY id",
+                (rs, n) -> new TaskExecution(rs.getLong("id"), rs.getLong("task_id"),
+                        ExecutionAction.valueOf(rs.getString("action")), rs.getString("actor"),
+                        rs.getTimestamp("occurred_at").toInstant()),
+                taskId);
+    }
+
+    /**
+     * 判断任务是否已存在指定动作的执行日志（START 唯一性、CONTINUE 前置校验用）。
+     */
+    public boolean hasExecution(long taskId, ExecutionAction action) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM incident_task_executions WHERE task_id = ? AND action = ?",
+                Integer.class, taskId, action.name());
+        return count != null && count > 0;
+    }
+
+    /**
      * 追加一条阻塞边（任务 → 阻塞事件）。(task_id, blocker_incident_id) 唯一。
      */
     public void insertBlocker(long taskId, long blockerIncidentId, Instant now) {

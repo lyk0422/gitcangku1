@@ -37,6 +37,11 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST", message, null);
     }
 
+    /** 400：携带结构化明细的参数非法（如到期时刻不晚于分配时刻时的实际值/要求值/差额）。 */
+    public static ApiException badRequest(String message, Object details) {
+        return new ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST", message, details);
+    }
+
     /** 404：事件不存在。 */
     public static ApiException notFound(String message) {
         return new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", message, null);
@@ -55,5 +60,10 @@ public class ApiException extends RuntimeException {
     /** 422：非法状态流转。 */
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
+    }
+
+    /** 422：续期冲突（依赖闭包、租约状态、授权版本或授权人校验未通过），携带结构化明细。 */
+    public static ApiException renewalConflict(String message, Object details) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "RENEWAL_CONFLICT", message, details);
     }
 }

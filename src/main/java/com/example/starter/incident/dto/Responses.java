@@ -64,11 +64,50 @@ public final class Responses {
 
     /**
      * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * cancelledBy/cancelledAt 仅 CANCELLED 有值；lease 为当前活动租约，无租约或租约已结束时为 null。
+     * status 为按读取时钟判定的有效状态：OPEN 任务的活动租约到期时显示 AUTHORIZATION_EXPIRED
+     * （只读判定，不写回）。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
                            List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt,
+                           TaskLeaseView lease) {
+    }
+
+    /**
+     * 资源租约视图：leaseVersion 初始分配为 1、每次续期 +1；assignedBy 为原分配人，
+     * authorizedBy 为本版本授权人，authorizerRole 仅续期版本有值；
+     * status 为按读取时钟判定的有效状态（ACTIVE 且当前时刻 ≥ expiresAt 时显示 EXPIRED）；
+     * remainingSeconds 为剩余授权秒数（实际值，仅有效活动租约有值，到期为 0，其余状态为 null）。
+     */
+    public record TaskLeaseView(String resourceKey, String authVersion, int leaseVersion,
+                                String assignedBy, String authorizedBy, String authorizerRole,
+                                Instant assignedAt, Instant expiresAt, String status,
+                                Long remainingSeconds) {
+    }
+
+    /**
+     * 资源使用证据视图：eventType 取值 ASSIGN/RENEW/EXPIRE/RELEASE/EXECUTION_BLOCKED；
+     * oldAuthVersion 在 ASSIGN 时为 null，newAuthVersion 在 EXPIRE/RELEASE/EXECUTION_BLOCKED 时为 null；
+     * detail 仅 EXECUTION_BLOCKED（被拦截操作）与 RELEASE（回收原因）有值。
+     */
+    public record LeaseEventView(long id, String eventType, String resourceKey,
+                                 String oldAuthVersion, String newAuthVersion, String actor,
+                                 Instant occurredAt, String detail) {
+    }
+
+    /** 任务执行日志视图：action 取值 START/CONTINUE，occurredAt 为服务端 UTC 时刻。 */
+    public record ExecutionLogView(String action, String actor, Instant occurredAt) {
+    }
+
+    /**
+     * 任务资源明细与历史视图（只读，不改变状态）：currentLease 为当前活动租约（无则 null），
+     * leases 为全部租约版本（按版本升序），events 为资源使用证据（按发生顺序），
+     * executions 为执行日志（按发生顺序，任务到期后保留）。
+     */
+    public record TaskResourceHistoryView(String taskKey, TaskLeaseView currentLease,
+                                          List<TaskLeaseView> leases, List<LeaseEventView> events,
+                                          List<ExecutionLogView> executions) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */
