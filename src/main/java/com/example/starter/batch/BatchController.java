@@ -1,13 +1,16 @@
 package com.example.starter.batch;
 
 import com.example.starter.batch.dto.ApproveRequest;
+import com.example.starter.batch.dto.AssayRoundResponse;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.OpenAssayRoundRequest;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
+import com.example.starter.batch.dto.WriteAssayReadingRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -104,6 +107,34 @@ public class BatchController {
     @GetMapping("/{batchKey}/ancestors")
     public List<LineageEntryResponse> ancestors(@PathVariable String batchKey) {
         return service.listAncestors(batchKey);
+    }
+
+    /**
+     * 开启平行测定轮次：为必做检验项建立固定 3 读数的测定轮次，X-Actor-Id 为操作人。
+     */
+    @PostMapping("/{batchKey}/assay-rounds")
+    public ResponseEntity<String> openAssayRound(@PathVariable String batchKey,
+                                                 @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+                                                 @Valid @RequestBody OpenAssayRoundRequest request) {
+        return stored(service.openAssayRound(batchKey, actorId, request));
+    }
+
+    /**
+     * 写入平行测定读数：写入该检验项当前进行中的轮次，写满 3 条即封结判定。
+     */
+    @PostMapping("/{batchKey}/assay-readings")
+    public ResponseEntity<String> writeAssayReading(@PathVariable String batchKey,
+                                                    @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+                                                    @Valid @RequestBody WriteAssayReadingRequest request) {
+        return stored(service.writeAssayReading(batchKey, actorId, request));
+    }
+
+    /**
+     * 批次全部平行测定轮次（含读数原值与封结判定）。
+     */
+    @GetMapping("/{batchKey}/assay-rounds")
+    public List<AssayRoundResponse> assayRounds(@PathVariable String batchKey) {
+        return service.listAssayRounds(batchKey);
     }
 
     /**

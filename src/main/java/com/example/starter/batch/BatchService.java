@@ -2,23 +2,29 @@ package com.example.starter.batch;
 
 import com.example.starter.batch.dto.ApprovalResponse;
 import com.example.starter.batch.dto.ApproveRequest;
+import com.example.starter.batch.dto.AssayRoundResponse;
 import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.OpenAssayRoundRequest;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.RecallResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import com.example.starter.batch.dto.TestResultResponse;
+import com.example.starter.batch.dto.WriteAssayReadingRequest;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.math.BigDecimal;
+import java.math.MathContext;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -50,6 +56,21 @@ public class BatchService {
     private static final String CMD_APPROVE = "APPROVE";
     private static final String CMD_RECALL = "RECALL";
     private static final String CMD_SPLIT = "SPLIT";
+    private static final String CMD_OPEN_ROUND = "OPEN_ASSAY_ROUND";
+    private static final String CMD_WRITE_READING = "WRITE_ASSAY_READING";
+
+    /**
+     * 平行测定轮次状态：OPEN 进行中；PASSED/FAILED 为封结后的终态。
+     */
+    private static final String ROUND_OPEN = "OPEN";
+    private static final String ROUND_PASSED = "PASSED";
+    private static final String ROUND_FAILED = "FAILED";
+
+    /**
+     * 每轮固定读数条数与每项最大轮次数。
+     */
+    private static final int READINGS_PER_ROUND = 3;
+    private static final int MAX_ROUNDS_PER_ITEM = 3;
 
     /**
      * 指纹拼接分隔符（NUL）：业务参数不可能包含该字符，避免拼接碰撞。
@@ -135,6 +156,9 @@ public class BatchService {
             if (itemAlreadyTested) {
                 throw ApiException.conflict("该检验项已存在检验结果: " + req.testItem());
             }
+            if (!repo.findAssayRounds(batchKey, req.testItem()).isEmpty()) {
+                throw ApiException.conflict("该检验项已建立平行测定轮次，按轮次判定: " + req.testItem());
+            }
 
             String now = now();
             repo.insertTest(new BatchRepository.TestRow(0L, batchKey, req.testKey(), req.testItem(),
@@ -181,8 +205,16 @@ public class BatchService {
             if (actorInspected) {
                 throw ApiException.unprocessable("批准人不得为该批次任一检验结果的检验人: " + actor);
             }
+            // 平行测定门禁：凡建立轮次的必做项，其当前轮必须已封结合格，否则 422
+            for (String item : repo.findRequiredTests(batchKey)) {
+                List<BatchRepository.AssayRoundRow> rounds = repo.findAssayRounds(batchKey, item);
+                if (!rounds.isEmpty() && !ROUND_PASSED.equals(rounds.get(rounds.size() - 1).status())) {
+                    throw ApiException.unprocessable(
+                            "检验项 " + item + " 当前平行测定轮次未齐或不合格，不能批准");
+                }
+            }
 
-            List<BatchRepository.ApprovalRow> approvals = repo.findApprovals(batchKey);
+            List<BatchRepository.ApprovalRow> approvals = repo.findValidApprovals(batchKey);
             String now = now();
             int seq;
             BatchStatus newStatus;
@@ -201,7 +233,7 @@ public class BatchService {
                 newStatus = BatchStatus.RELEASED;
             }
             repo.insertApproval(new BatchRepository.ApprovalRow(0L, batchKey, req.commandKey(),
-                    actor, role.name(), seq, now));
+                    actor, role.name(), seq, assaySnapshotJson(batchKey), 1, now));
             repo.updateStatus(batchKey, newStatus.name());
             ApprovalResponse body = new ApprovalResponse(batchKey, actor, role, seq, newStatus,
                     Instant.parse(now));
@@ -286,7 +318,10 @@ public class BatchService {
                 .map(r -> new RecallResponse(r.batchKey(), r.actorId(), r.reason(),
                         BatchStatus.RECALLED, Instant.parse(r.createdAt())))
                 .orElse(null);
-        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall);
+        List<AssayRoundResponse> assayRounds = repo.findAllAssayRounds(batchKey).stream()
+                .map(r -> toAssayRoundResponse(r, BatchStatus.valueOf(batch.status())))
+                .toList();
+        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall, assayRounds);
     }
 
     /**
@@ -335,6 +370,17 @@ public class BatchService {
         for (BatchRepository.TestRow t : repo.findTests(batchKey)) {
             if (TestOutcome.PASS.name().equals(t.outcome())) {
                 passed.add(t.testItem());
+            }
+        }
+        // 平行测定项：当前轮（序号最大）封结合格才算通过；开新轮后旧轮合格不再作数
+        for (String item : required) {
+            List<BatchRepository.AssayRoundRow> rounds = repo.findAssayRounds(batchKey, item);
+            if (!rounds.isEmpty()) {
+                if (ROUND_PASSED.equals(rounds.get(rounds.size() - 1).status())) {
+                    passed.add(item);
+                } else {
+                    passed.remove(item);
+                }
             }
         }
         return passed.containsAll(required);
@@ -574,5 +620,264 @@ public class BatchService {
         return new LineageEntryResponse(row.batchKey(), row.batchNo(),
                 BatchStatus.valueOf(row.status()),
                 recalledAncestor(batchKey, parentOf, recalled).orElse(null));
+    }
+
+    /**
+     * 开启平行测定轮次：仅隔离流程中（QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW）批次可为
+     * 尚未判定的必做检验项开轮；expectedVersion 须等于该项已有轮次数；最多 3 轮；
+     * 新轮开启使该批次旧批准失效并回退批次状态；已放行批次不可开轮。
+     */
+    public StoredResponse openAssayRound(String batchKey, String actorId, OpenAssayRoundRequest req) {
+        String actor = requireActor(actorId);
+        BigDecimal meanMin = new BigDecimal(req.meanMin());
+        BigDecimal meanMax = new BigDecimal(req.meanMax());
+        BigDecimal maxRange = new BigDecimal(req.maxRange());
+        if (meanMin.compareTo(meanMax) > 0) {
+            throw ApiException.badRequest("meanMin 不能大于 meanMax");
+        }
+        if (maxRange.signum() < 0) {
+            throw ApiException.badRequest("maxRange 不能为负数");
+        }
+        String fingerprint = structuredFingerprint("assay.open", actor, batchKey, req.testItem(),
+                "meanMin", req.meanMin(), "meanMax", req.meanMax(), "maxRange", req.maxRange(),
+                "expectedVersion", String.valueOf(req.expectedVersion()));
+        return executeIdempotent(CMD_OPEN_ROUND, req.requestId(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            // 批次行锁后重查命令快照：并发同键请求在锁等待期间可能已由对方提交，须重放首次结果
+            var logged = loggedResponse(CMD_OPEN_ROUND, req.requestId(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            BatchStatus status = BatchStatus.valueOf(batch.status());
+            assertNoRecalledAncestor(batchKey);
+            if (status == BatchStatus.REJECTED || status == BatchStatus.RELEASED
+                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT) {
+                throw ApiException.conflict("批次状态 " + status + " 不允许开启平行测定轮次");
+            }
+            List<String> required = repo.findRequiredTests(batchKey);
+            if (!required.contains(req.testItem())) {
+                throw ApiException.unprocessable("检验项不属于该批次必做项: " + req.testItem());
+            }
+            boolean itemTested = repo.findTests(batchKey).stream()
+                    .anyMatch(t -> t.testItem().equals(req.testItem()));
+            if (itemTested) {
+                throw ApiException.conflict("该检验项已存在检验结果，不能建立平行测定轮次: " + req.testItem());
+            }
+            List<BatchRepository.AssayRoundRow> rounds = repo.findAssayRounds(batchKey, req.testItem());
+            if (rounds.size() != req.expectedVersion()) {
+                throw ApiException.conflict("expectedVersion 不符: 期望 " + req.expectedVersion()
+                        + "，当前轮次数 " + rounds.size());
+            }
+            if (rounds.size() >= MAX_ROUNDS_PER_ITEM) {
+                throw ApiException.conflict("该检验项已达最大轮次数 " + MAX_ROUNDS_PER_ITEM);
+            }
+            if (!rounds.isEmpty() && ROUND_OPEN.equals(rounds.get(rounds.size() - 1).status())) {
+                throw ApiException.conflict("当前轮次未封结，不能开启新轮次");
+            }
+            String now = now();
+            int roundNo = rounds.size() + 1;
+            long roundId = repo.insertAssayRound(new BatchRepository.AssayRoundRow(0L, batchKey,
+                    req.testItem(), roundNo, req.meanMin(), req.meanMax(), req.maxRange(),
+                    ROUND_OPEN, 0, null, null, actor, now, null));
+            // 新轮开始：该项旧批准失效，不能用旧轮合格授权新轮；批次状态随之回退
+            repo.invalidateApprovals(batchKey);
+            BatchStatus newStatus = recomputeAssayStatus(batchKey);
+            if (newStatus != status) {
+                repo.updateStatus(batchKey, newStatus.name());
+            }
+            BatchRepository.AssayRoundRow opened = new BatchRepository.AssayRoundRow(roundId,
+                    batchKey, req.testItem(), roundNo, req.meanMin(), req.meanMax(), req.maxRange(),
+                    ROUND_OPEN, 0, null, null, actor, now, null);
+            return new StoredResponse(201, toJson(toAssayRoundResponse(opened, newStatus)));
+        });
+    }
+
+    /**
+     * 写入平行测定读数：写入该检验项当前 OPEN 轮次；expectedVersion 须等于该轮已写入读数条数；
+     * 序号 1～3 轮内唯一，封结后不能覆写；写满 3 条即封结判定——均值（不舍入）落在闭区间
+     * 且最大减最小不超过极差才合格。判定通过可能推动批次进入 PENDING_RELEASE。
+     */
+    public StoredResponse writeAssayReading(String batchKey, String actorId,
+                                            WriteAssayReadingRequest req) {
+        String actor = requireActor(actorId);
+        String fingerprint = structuredFingerprint("assay.read", actor, batchKey, req.testItem(),
+                "seq", String.valueOf(req.seq()), "value", req.value(),
+                "expectedVersion", String.valueOf(req.expectedVersion()));
+        return executeIdempotent(CMD_WRITE_READING, req.requestId(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            // 批次行锁后重查命令快照：并发同键请求在锁等待期间可能已由对方提交，须重放首次结果
+            var logged = loggedResponse(CMD_WRITE_READING, req.requestId(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            BatchStatus status = BatchStatus.valueOf(batch.status());
+            assertNoRecalledAncestor(batchKey);
+            if (status == BatchStatus.REJECTED || status == BatchStatus.RELEASED
+                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT) {
+                throw ApiException.conflict("批次状态 " + status + " 不允许写入平行测定读数");
+            }
+            List<BatchRepository.AssayRoundRow> rounds = repo.findAssayRounds(batchKey, req.testItem());
+            if (rounds.isEmpty()) {
+                throw ApiException.conflict("该检验项不存在平行测定轮次: " + req.testItem());
+            }
+            BatchRepository.AssayRoundRow current = rounds.get(rounds.size() - 1);
+            if (!ROUND_OPEN.equals(current.status())) {
+                throw ApiException.conflict("当前轮次已封结，读数不能覆写");
+            }
+            if (current.version() != req.expectedVersion()) {
+                throw ApiException.conflict("expectedVersion 不符: 期望 " + req.expectedVersion()
+                        + "，当前轮次版本 " + current.version());
+            }
+            List<BatchRepository.AssayReadingRow> readings = repo.findAssayReadings(current.id());
+            boolean seqTaken = readings.stream().anyMatch(r -> r.seq() == req.seq());
+            if (seqTaken) {
+                throw ApiException.conflict("读数序号已写入，不能覆写: " + req.seq());
+            }
+            String now = now();
+            repo.insertAssayReading(new BatchRepository.AssayReadingRow(0L, current.id(), batchKey,
+                    req.testItem(), req.seq(), req.value(), actor, now));
+            int newVersion = current.version() + 1;
+            BatchRepository.AssayRoundRow updated = new BatchRepository.AssayRoundRow(current.id(),
+                    current.batchKey(), current.testItem(), current.roundNo(), current.meanMin(),
+                    current.meanMax(), current.maxRange(), current.status(), newVersion,
+                    current.meanValue(), current.rangeValue(), current.createdBy(),
+                    current.createdAt(), current.sealedAt());
+            BatchStatus newStatus = status;
+            if (newVersion >= READINGS_PER_ROUND) {
+                List<BigDecimal> values = new ArrayList<>(readings.size() + 1);
+                for (BatchRepository.AssayReadingRow r : readings) {
+                    values.add(new BigDecimal(r.value()));
+                }
+                values.add(new BigDecimal(req.value()));
+                BigDecimal sum = BigDecimal.ZERO;
+                BigDecimal max = values.get(0);
+                BigDecimal min = values.get(0);
+                for (BigDecimal v : values) {
+                    sum = sum.add(v);
+                    max = max.max(v);
+                    min = min.min(v);
+                }
+                // 均值不舍入、不取整，按全精度与闭区间比较；极差为最大减最小
+                BigDecimal mean = sum.divide(BigDecimal.valueOf(READINGS_PER_ROUND),
+                        MathContext.DECIMAL128);
+                BigDecimal range = max.subtract(min);
+                boolean passed = mean.compareTo(new BigDecimal(current.meanMin())) >= 0
+                        && mean.compareTo(new BigDecimal(current.meanMax())) <= 0
+                        && range.compareTo(new BigDecimal(current.maxRange())) <= 0;
+                String sealStatus = passed ? ROUND_PASSED : ROUND_FAILED;
+                String meanText = mean.stripTrailingZeros().toPlainString();
+                String rangeText = range.stripTrailingZeros().toPlainString();
+                repo.sealAssayRound(current.id(), sealStatus, newVersion, meanText, rangeText, now);
+                updated = new BatchRepository.AssayRoundRow(current.id(), current.batchKey(),
+                        current.testItem(), current.roundNo(), current.meanMin(), current.meanMax(),
+                        current.maxRange(), sealStatus, newVersion, meanText, rangeText,
+                        current.createdBy(), current.createdAt(), now);
+                newStatus = recomputeAssayStatus(batchKey);
+                if (newStatus != status) {
+                    repo.updateStatus(batchKey, newStatus.name());
+                }
+            } else {
+                repo.bumpAssayRoundVersion(current.id(), newVersion);
+            }
+            return new StoredResponse(201, toJson(toAssayRoundResponse(updated, newStatus)));
+        });
+    }
+
+    /**
+     * 批次全部平行测定轮次（含读数原值），按检验项与轮次序号排序。
+     */
+    public List<AssayRoundResponse> listAssayRounds(String batchKey) {
+        BatchRepository.BatchRow batch = repo.findBatch(batchKey)
+                .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+        BatchStatus status = BatchStatus.valueOf(batch.status());
+        return repo.findAllAssayRounds(batchKey).stream()
+                .map(r -> toAssayRoundResponse(r, status))
+                .toList();
+    }
+
+    /**
+     * 平行测定变更后的批次状态重算：必做项未全部通过回退 QUARANTINED；
+     * 全部通过后按有效批准数推导 PENDING_RELEASE/RELEASE_REVIEW/RELEASED。
+     */
+    private BatchStatus recomputeAssayStatus(String batchKey) {
+        List<String> required = repo.findRequiredTests(batchKey);
+        if (!allRequiredPassed(batchKey, required)) {
+            return BatchStatus.QUARANTINED;
+        }
+        int validApprovals = repo.findValidApprovals(batchKey).size();
+        if (validApprovals >= 2) {
+            return BatchStatus.RELEASED;
+        }
+        if (validApprovals == 1) {
+            return BatchStatus.RELEASE_REVIEW;
+        }
+        return BatchStatus.PENDING_RELEASE;
+    }
+
+    /**
+     * 轮次响应装配：附带该轮全部读数原值（按序号升序）。
+     */
+    private AssayRoundResponse toAssayRoundResponse(BatchRepository.AssayRoundRow round,
+                                                    BatchStatus batchStatus) {
+        List<AssayRoundResponse.ReadingView> readings = repo.findAssayReadings(round.id()).stream()
+                .map(r -> new AssayRoundResponse.ReadingView(r.seq(), r.value()))
+                .toList();
+        return new AssayRoundResponse(round.batchKey(), round.testItem(), round.roundNo(),
+                round.status(), round.version(), round.meanMin(), round.meanMax(), round.maxRange(),
+                readings, round.meanValue(), round.rangeValue(), batchStatus.name(),
+                Instant.parse(round.createdAt()),
+                round.sealedAt() == null ? null : Instant.parse(round.sealedAt()));
+    }
+
+    /**
+     * 批准时冻结的平行测定快照：各平行项当前轮次号、三条原值、均值与极差；无平行项返回 null。
+     */
+    private String assaySnapshotJson(String batchKey) {
+        List<BatchRepository.AssayRoundRow> rounds = repo.findAllAssayRounds(batchKey);
+        if (rounds.isEmpty()) {
+            return null;
+        }
+        var root = objectMapper.createArrayNode();
+        for (BatchRepository.AssayRoundRow round : rounds) {
+            var node = root.addObject();
+            node.put("testItem", round.testItem());
+            node.put("roundNo", round.roundNo());
+            node.put("status", round.status());
+            if (round.meanValue() != null) {
+                node.put("mean", round.meanValue());
+                node.put("range", round.rangeValue());
+            }
+            var values = node.putArray("readings");
+            for (BatchRepository.AssayReadingRow r : repo.findAssayReadings(round.id())) {
+                values.addObject().put("seq", r.seq()).put("value", r.value());
+            }
+        }
+        return root.toString();
+    }
+
+    /**
+     * 结构化命令指纹：操作、操作者、资源与全部参数（含期望版本）按键值对写入 JSON 再取摘要，
+     * 避免字符串拼接的分隔符碰撞。
+     */
+    private String structuredFingerprint(String operation, String actor, String batchKey,
+                                         String testItem, String... params) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("operation", operation);
+        node.put("actor", actor);
+        node.put("batchKey", batchKey);
+        node.put("testItem", testItem);
+        for (int i = 0; i + 1 < params.length; i += 2) {
+            node.put(params[i], params[i + 1]);
+        }
+        return fingerprint(node.toString());
+    }
+
+    private String requireActor(String actorId) {
+        if (actorId == null || actorId.isBlank()) {
+            throw ApiException.badRequest("X-Actor-Id 不能为空");
+        }
+        return actorId.trim();
     }
 }
