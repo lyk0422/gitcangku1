@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS artifact_dependency (
     name            VARCHAR(128) NOT NULL,
     minimum_version INT          NOT NULL,
     maximum_version INT          NOT NULL,
+    scope           VARCHAR(8)   NOT NULL DEFAULT 'PUBLIC',
     CONSTRAINT fk_dep_artifact FOREIGN KEY (artifact_id) REFERENCES artifact (id)
 );
 COMMENT ON TABLE artifact_dependency IS '制品声明的依赖区间（闭区间），登记后不可改';
@@ -36,6 +37,7 @@ COMMENT ON COLUMN artifact_dependency.artifact_id IS '所属制品版本 ID';
 COMMENT ON COLUMN artifact_dependency.name IS '依赖制品名称，同一制品内唯一';
 COMMENT ON COLUMN artifact_dependency.minimum_version IS '依赖最低版本（含），正整数';
 COMMENT ON COLUMN artifact_dependency.maximum_version IS '依赖最高版本（含），正整数';
+COMMENT ON COLUMN artifact_dependency.scope IS '依赖作用域：PUBLIC=当前作用域共享唯一版本，PRIVATE=隔离到子作用域；历史数据默认 PUBLIC';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_dep_artifact_name ON artifact_dependency (artifact_id, name);
 
@@ -71,6 +73,77 @@ COMMENT ON COLUMN lock_file_entry.version IS '被锁定的精确版本号，正�
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_entry_lock_name ON lock_file_entry (lock_file_id, name);
 
+CREATE TABLE IF NOT EXISTS scoped_lock (
+    id                 BIGINT AUTO_INCREMENT PRIMARY KEY,
+    root_name          VARCHAR(128) NOT NULL,
+    root_version       INT          NOT NULL,
+    repository_version BIGINT       NOT NULL,
+    request_id         VARCHAR(64)  NOT NULL,
+    created_at         TIMESTAMP(6) NOT NULL
+);
+COMMENT ON TABLE scoped_lock IS '私有作用域锁文件：新锁入口一次成功锁定的根及读取时的仓库版本';
+COMMENT ON COLUMN scoped_lock.root_name IS '根制品名称（精确版本，锁定时固定）';
+COMMENT ON COLUMN scoped_lock.root_version IS '根制品版本号，正整数';
+COMMENT ON COLUMN scoped_lock.repository_version IS '锁定时读取的仓库版本号';
+COMMENT ON COLUMN scoped_lock.request_id IS '触发锁定的全局唯一请求 ID';
+COMMENT ON COLUMN scoped_lock.created_at IS '锁定生成时间，UTC 时间戳';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_scoped_lock_request ON scoped_lock (request_id);
+
+CREATE TABLE IF NOT EXISTS scoped_lock_scope (
+    id                   BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_id              BIGINT       NOT NULL,
+    parent_scope_id      BIGINT       NULL,
+    parent_artifact_name VARCHAR(128) NULL,
+    depth                INT          NOT NULL,
+    CONSTRAINT fk_scope_lock FOREIGN KEY (lock_id) REFERENCES scoped_lock (id),
+    CONSTRAINT fk_scope_parent FOREIGN KEY (parent_scope_id) REFERENCES scoped_lock_scope (id)
+);
+COMMENT ON TABLE scoped_lock_scope IS '锁文件中的作用域：以（父作用域, 父制品名称）结构化定位，不用分隔符拼接路径';
+COMMENT ON COLUMN scoped_lock_scope.lock_id IS '所属锁文件 ID';
+COMMENT ON COLUMN scoped_lock_scope.parent_scope_id IS '父作用域 ID，NULL 表示根作用域';
+COMMENT ON COLUMN scoped_lock_scope.parent_artifact_name IS '创建本作用域的父制品名称，NULL 表示根作用域';
+COMMENT ON COLUMN scoped_lock_scope.depth IS '嵌套层数：根作用域为 1，每条 PRIVATE 边深入一层，最大 4';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_scope_parent_name
+    ON scoped_lock_scope (lock_id, parent_scope_id, parent_artifact_name);
+
+CREATE TABLE IF NOT EXISTS scoped_lock_entry (
+    id       BIGINT AUTO_INCREMENT PRIMARY KEY,
+    scope_id BIGINT       NOT NULL,
+    name     VARCHAR(128) NOT NULL,
+    version  INT          NOT NULL,
+    CONSTRAINT fk_sentry_scope FOREIGN KEY (scope_id) REFERENCES scoped_lock_scope (id)
+);
+COMMENT ON TABLE scoped_lock_entry IS '作用域内锁定的精确制品版本，每个作用域内同一名称仅一个版本';
+COMMENT ON COLUMN scoped_lock_entry.scope_id IS '所属作用域 ID';
+COMMENT ON COLUMN scoped_lock_entry.name IS '被锁定制品名称';
+COMMENT ON COLUMN scoped_lock_entry.version IS '被锁定的精确版本号，正整数';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_sentry_scope_name ON scoped_lock_entry (scope_id, name);
+
+CREATE TABLE IF NOT EXISTS scoped_lock_edge (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_id       BIGINT       NOT NULL,
+    from_scope_id BIGINT       NOT NULL,
+    from_name     VARCHAR(128) NOT NULL,
+    to_name       VARCHAR(128) NOT NULL,
+    to_version    INT          NOT NULL,
+    scope_type    VARCHAR(8)   NOT NULL,
+    to_scope_id   BIGINT       NOT NULL,
+    CONSTRAINT fk_sedge_lock FOREIGN KEY (lock_id) REFERENCES scoped_lock (id)
+);
+COMMENT ON TABLE scoped_lock_edge IS '锁文件中冻结的依赖边：来源作用域与制品、目标名称与精确版本、作用域类型';
+COMMENT ON COLUMN scoped_lock_edge.lock_id IS '所属锁文件 ID';
+COMMENT ON COLUMN scoped_lock_edge.from_scope_id IS '声明依赖的制品所在作用域 ID';
+COMMENT ON COLUMN scoped_lock_edge.from_name IS '声明依赖的制品名称';
+COMMENT ON COLUMN scoped_lock_edge.to_name IS '依赖目标名称';
+COMMENT ON COLUMN scoped_lock_edge.to_version IS '目标解析出的精确版本号，正整数';
+COMMENT ON COLUMN scoped_lock_edge.scope_type IS '依赖作用域：PUBLIC=同作用域共享，PRIVATE=目标在子作用域';
+COMMENT ON COLUMN scoped_lock_edge.to_scope_id IS '目标所在作用域 ID';
+
+CREATE INDEX IF NOT EXISTS idx_sedge_lock ON scoped_lock_edge (lock_id);
+
 CREATE TABLE IF NOT EXISTS idempotent_request (
     request_id     VARCHAR(64)  NOT NULL PRIMARY KEY,
     operation      VARCHAR(32)  NOT NULL,
@@ -81,7 +154,7 @@ CREATE TABLE IF NOT EXISTS idempotent_request (
 );
 COMMENT ON TABLE idempotent_request IS '写操作幂等记录，仅保存成功请求；失败不占键';
 COMMENT ON COLUMN idempotent_request.request_id IS '客户端提供的全局唯一请求 ID';
-COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK';
+COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK/CREATE_SCOPED_LOCK';
 COMMENT ON COLUMN idempotent_request.request_hash IS '规范化请求参数的 SHA-256 摘要，异参重放用于冲突判定';
 COMMENT ON COLUMN idempotent_request.http_status IS '原成功响应 HTTP 状态码';
 COMMENT ON COLUMN idempotent_request.response_json IS '原成功响应 JSON，重放时原样返回';

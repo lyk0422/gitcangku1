@@ -2,6 +2,7 @@ package com.example.starter.repo;
 
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
+import com.example.starter.domain.DependencyScope;
 import com.example.starter.domain.RepositorySnapshot;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
@@ -61,12 +62,14 @@ public class RepositoryDao {
                         rs.getInt("version"), rs.getInt("withdrawn") == 1));
 
         List<DepRow> depRows = jdbcTemplate.query(
-                "SELECT artifact_id, name, minimum_version, maximum_version FROM artifact_dependency",
+                "SELECT artifact_id, name, minimum_version, maximum_version, scope FROM artifact_dependency",
                 (rs, n) -> new DepRow(rs.getLong("artifact_id"), rs.getString("name"),
-                        rs.getInt("minimum_version"), rs.getInt("maximum_version")));
+                        rs.getInt("minimum_version"), rs.getInt("maximum_version"),
+                        rs.getString("scope")));
         Map<Long, List<DependencyRange>> depsByArtifact = depRows.stream()
                 .collect(Collectors.groupingBy(DepRow::artifactId,
-                        Collectors.mapping(d -> new DependencyRange(d.name(), d.minimumVersion(), d.maximumVersion()),
+                        Collectors.mapping(d -> new DependencyRange(d.name(), d.minimumVersion(),
+                                        d.maximumVersion(), DependencyScope.valueOf(d.scope())),
                                 Collectors.toList())));
 
         Map<String, List<ArtifactVersion>> artifacts = new LinkedHashMap<>();
@@ -121,11 +124,12 @@ public class RepositoryDao {
     }
 
     /** 为制品版本写入一条依赖声明。 */
-    public void insertDependency(long artifactId, String name, int minimumVersion, int maximumVersion) {
+    public void insertDependency(long artifactId, String name, int minimumVersion, int maximumVersion,
+                                 String scope) {
         jdbcTemplate.update(
-                "INSERT INTO artifact_dependency (artifact_id, name, minimum_version, maximum_version) "
-                        + "VALUES (?, ?, ?, ?)",
-                artifactId, name, minimumVersion, maximumVersion);
+                "INSERT INTO artifact_dependency (artifact_id, name, minimum_version, maximum_version, scope) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                artifactId, name, minimumVersion, maximumVersion, scope);
     }
 
     /** 读取单个制品版本（含依赖），不存在返回 null。 */
@@ -140,9 +144,10 @@ public class RepositoryDao {
         }
         ArtifactRow row = rows.get(0);
         List<DependencyRange> deps = jdbcTemplate.query(
-                "SELECT name, minimum_version, maximum_version FROM artifact_dependency WHERE artifact_id = ?",
+                "SELECT name, minimum_version, maximum_version, scope FROM artifact_dependency WHERE artifact_id = ?",
                 (rs, n) -> new DependencyRange(rs.getString("name"),
-                        rs.getInt("minimum_version"), rs.getInt("maximum_version")),
+                        rs.getInt("minimum_version"), rs.getInt("maximum_version"),
+                        DependencyScope.valueOf(rs.getString("scope"))),
                 row.id());
         return new ArtifactVersion(row.id(), row.name(), row.version(), row.withdrawn(),
                 List.copyOf(deps));
@@ -274,9 +279,152 @@ public class RepositoryDao {
                 lockFileId);
     }
 
+    // ------------------------------------------------------------------
+    // 私有作用域锁文件
+    // ------------------------------------------------------------------
+
+    /** 新增作用域锁文件主记录，返回自增主键。 */
+    public long insertScopedLock(String rootName, int rootVersion, long repositoryVersion,
+                                 String requestId, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO scoped_lock (root_name, root_version, repository_version, request_id, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, rootName);
+            ps.setInt(2, rootVersion);
+            ps.setLong(3, repositoryVersion);
+            ps.setString(4, requestId);
+            ps.setTimestamp(5, Timestamp.from(createdAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入作用域锁文件未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 新增作用域，返回自增主键；parentScopeId 为 null 表示根作用域。 */
+    public long insertScopedLockScope(long lockId, Long parentScopeId, String parentArtifactName,
+                                      int depth) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO scoped_lock_scope (lock_id, parent_scope_id, parent_artifact_name, depth) "
+                            + "VALUES (?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, lockId);
+            if (parentScopeId == null) {
+                ps.setNull(2, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(2, parentScopeId);
+            }
+            ps.setString(3, parentArtifactName);
+            ps.setInt(4, depth);
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入作用域未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 新增作用域内精确版本条目。 */
+    public void insertScopedLockEntry(long scopeId, String name, int version) {
+        jdbcTemplate.update(
+                "INSERT INTO scoped_lock_entry (scope_id, name, version) VALUES (?, ?, ?)",
+                scopeId, name, version);
+    }
+
+    /** 新增冻结的依赖边。 */
+    public void insertScopedLockEdge(long lockId, long fromScopeId, String fromName, String toName,
+                                     int toVersion, String scopeType, long toScopeId) {
+        jdbcTemplate.update(
+                "INSERT INTO scoped_lock_edge (lock_id, from_scope_id, from_name, to_name, to_version, "
+                        + "scope_type, to_scope_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                lockId, fromScopeId, fromName, toName, toVersion, scopeType, toScopeId);
+    }
+
+    /** 作用域锁文件列表行：不含作用域与边明细。 */
+    public record ScopedLockRow(long id, String rootName, int rootVersion,
+                                long repositoryVersion, Instant createdAt) {
+    }
+
+    /** 作用域行：以（父作用域, 父制品名称）结构化定位。 */
+    public record ScopedScopeRow(long id, long lockId, Long parentScopeId,
+                                 String parentArtifactName, int depth) {
+    }
+
+    /** 作用域内精确版本条目行。 */
+    public record ScopedEntryRow(long scopeId, String name, int version) {
+    }
+
+    /** 依赖边行。 */
+    public record ScopedEdgeRow(long id, long fromScopeId, String fromName, String toName,
+                                int toVersion, String scopeType, long toScopeId) {
+    }
+
+    /** 查询全部作用域锁文件，按 ID 升序。 */
+    public List<ScopedLockRow> listScopedLocks() {
+        return jdbcTemplate.query(
+                "SELECT id, root_name, root_version, repository_version, created_at "
+                        + "FROM scoped_lock ORDER BY id ASC",
+                (rs, n) -> new ScopedLockRow(rs.getLong("id"), rs.getString("root_name"),
+                        rs.getInt("root_version"), rs.getLong("repository_version"),
+                        rs.getTimestamp("created_at").toInstant()));
+    }
+
+    /** 按主键查询作用域锁文件，不存在返回 null。 */
+    public ScopedLockRow getScopedLock(long id) {
+        List<ScopedLockRow> rows = jdbcTemplate.query(
+                "SELECT id, root_name, root_version, repository_version, created_at "
+                        + "FROM scoped_lock WHERE id = ?",
+                (rs, n) -> new ScopedLockRow(rs.getLong("id"), rs.getString("root_name"),
+                        rs.getInt("root_version"), rs.getLong("repository_version"),
+                        rs.getTimestamp("created_at").toInstant()),
+                id);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 查询某锁文件的全部作用域，按 ID 升序（父作用域恒先于子作用域插入）。 */
+    public List<ScopedScopeRow> listScopedLockScopes(long lockId) {
+        return jdbcTemplate.query(
+                "SELECT id, lock_id, parent_scope_id, parent_artifact_name, depth "
+                        + "FROM scoped_lock_scope WHERE lock_id = ? ORDER BY id ASC",
+                (rs, n) -> new ScopedScopeRow(rs.getLong("id"), rs.getLong("lock_id"),
+                        rs.getObject("parent_scope_id") == null ? null : rs.getLong("parent_scope_id"),
+                        rs.getString("parent_artifact_name"), rs.getInt("depth")),
+                lockId);
+    }
+
+    /** 查询某作用域的全部条目，按名称升序。 */
+    public List<ScopedEntryRow> listScopedLockEntries(long scopeId) {
+        return jdbcTemplate.query(
+                "SELECT scope_id, name, version FROM scoped_lock_entry "
+                        + "WHERE scope_id = ? ORDER BY name ASC",
+                (rs, n) -> new ScopedEntryRow(rs.getLong("scope_id"),
+                        rs.getString("name"), rs.getInt("version")),
+                scopeId);
+    }
+
+    /** 查询某锁文件的全部依赖边，按 ID 升序。 */
+    public List<ScopedEdgeRow> listScopedLockEdges(long lockId) {
+        return jdbcTemplate.query(
+                "SELECT id, from_scope_id, from_name, to_name, to_version, scope_type, to_scope_id "
+                        + "FROM scoped_lock_edge WHERE lock_id = ? ORDER BY id ASC",
+                (rs, n) -> new ScopedEdgeRow(rs.getLong("id"), rs.getLong("from_scope_id"),
+                        rs.getString("from_name"), rs.getString("to_name"), rs.getInt("to_version"),
+                        rs.getString("scope_type"), rs.getLong("to_scope_id")),
+                lockId);
+    }
+
     private record ArtifactRow(long id, String name, int version, boolean withdrawn) {
     }
 
-    private record DepRow(long artifactId, String name, int minimumVersion, int maximumVersion) {
+    private record DepRow(long artifactId, String name, int minimumVersion, int maximumVersion,
+                          String scope) {
     }
 }
