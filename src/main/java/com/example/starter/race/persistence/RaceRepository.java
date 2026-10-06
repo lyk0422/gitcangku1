@@ -2,6 +2,7 @@ package com.example.starter.race.persistence;
 
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
+import com.example.starter.race.domain.RaceMode;
 import com.example.starter.race.domain.RaceStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
@@ -40,7 +41,7 @@ public class RaceRepository {
     /** 按ID查询赛事。 */
     public Optional<RaceRow> findRace(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ?",
+                .query("SELECT race_id, version, status, mode, created_at FROM race WHERE race_id = ?",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -53,7 +54,7 @@ public class RaceRepository {
      */
     public Optional<RaceRow> findRaceForUpdate(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ? FOR UPDATE",
+                .query("SELECT race_id, version, status, mode, created_at FROM race WHERE race_id = ? FOR UPDATE",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -216,11 +217,33 @@ public class RaceRepository {
                 entries, checkpoints));
     }
 
-    /** 新建赛事，初始版本1、状态OPEN。 */
+    /** 新建赛事，初始版本1、状态OPEN、模式STANDARD。 */
     public void insertRace(String raceId, long now) {
         jdbcTemplate.update(
-                "INSERT INTO race (race_id, version, status, created_at) VALUES (?, 1, 'OPEN', ?)",
+                "INSERT INTO race (race_id, version, status, mode, created_at) "
+                        + "VALUES (?, 1, 'OPEN', 'STANDARD', ?)",
                 raceId, now);
+    }
+
+    /**
+     * 条件启用追逐模式：仅当赛事仍为 OPEN、版本等于 expectedVersion 且仍是 STANDARD 时
+     * 转为 PURSUIT 并推进版本。
+     *
+     * @return 受影响行数；0 表示不存在、已封榜、版本不匹配或已启用 PURSUIT
+     */
+    public int enablePursuitIfStandardAtVersion(String raceId, int expectedVersion, int newVersion) {
+        return jdbcTemplate.update(
+                "UPDATE race SET version = ?, mode = 'PURSUIT' "
+                        + "WHERE race_id = ? AND version = ? AND status = 'OPEN' AND mode = 'STANDARD'",
+                newVersion, raceId, expectedVersion);
+    }
+
+    /** 统计赛事下已录入原始完赛耗时的选手数（用于“计时前才能启用PURSUIT”）。 */
+    public int countTimedRunners(String raceId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM runner WHERE race_id = ? AND finish_time_ms IS NOT NULL",
+                Integer.class, raceId);
+        return count == null ? 0 : count;
     }
 
     /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
@@ -370,10 +393,16 @@ public class RaceRepository {
 
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM result_snapshot_pursuit_sample");
+        jdbcTemplate.update("DELETE FROM result_snapshot_pursuit_pair");
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
+        jdbcTemplate.update("DELETE FROM pursuit_adjudication");
+        jdbcTemplate.update("DELETE FROM pursuit_sample");
+        jdbcTemplate.update("DELETE FROM pursuit_trajectory");
+        jdbcTemplate.update("DELETE FROM pursuit_pair");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
@@ -388,6 +417,7 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getInt("version"),
                     RaceStatus.valueOf(rs.getString("status")),
+                    RaceMode.valueOf(rs.getString("mode")),
                     rs.getLong("created_at"));
         }
     }

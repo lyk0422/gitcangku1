@@ -1,5 +1,6 @@
 package com.example.starter.race.persistence;
 
+import com.example.starter.race.domain.RaceMode;
 import com.example.starter.race.domain.RaceStatus;
 
 /**
@@ -8,7 +9,8 @@ import com.example.starter.race.domain.RaceStatus;
  * @param raceId    赛事ID，全局唯一
  * @param version   版本号，从1开始
  * @param status    赛事状态
+ * @param mode      赛事模式：STANDARD-普通计时赛，PURSUIT-追逐赛
  * @param createdAt 创建时间，Unix毫秒时间戳
  */
-public record RaceRow(String raceId, int version, RaceStatus status, long createdAt) {
+public record RaceRow(String raceId, int version, RaceStatus status, RaceMode mode, long createdAt) {
 }

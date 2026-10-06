@@ -113,6 +113,43 @@ public class RaceController {
         return raceService.getMissingCheckpoints(raceId);
     }
 
+    /** 计时前启用追逐赛并固定追逐对。 */
+    @PostMapping("/{raceId}/pursuit")
+    public ResponseEntity<Object> configurePursuit(
+            @PathVariable String raceId,
+            @Valid @RequestBody ConfigurePursuitRequest request) {
+        return toResponse(raceService.configurePursuit(raceId, request));
+    }
+
+    /** 提交/更正选手轨迹采样。 */
+    @PostMapping("/{raceId}/pursuit/trajectories/{bib}")
+    public ResponseEntity<Object> submitTrajectory(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody SubmitTrajectoryRequest request) {
+        return toResponse(raceService.submitTrajectory(raceId, bib, request));
+    }
+
+    /** 裁定追逐对最早交会时刻。 */
+    @PostMapping("/{raceId}/pursuit/adjudications")
+    public ResponseEntity<Object> adjudicatePursuit(
+            @PathVariable String raceId,
+            @Valid @RequestBody AdjudicatePursuitRequest request) {
+        return toResponse(raceService.adjudicatePursuit(raceId, request));
+    }
+
+    /** 查询追逐赛当前状态。 */
+    @GetMapping("/{raceId}/pursuit")
+    public PursuitStateResponse getPursuitState(@PathVariable String raceId) {
+        return raceService.getPursuitState(raceId);
+    }
+
+    /** 查询追逐赛封榜冻结快照。 */
+    @GetMapping("/{raceId}/pursuit/snapshot")
+    public PursuitSnapshotResponse getPursuitSnapshot(@PathVariable String raceId) {
+        return raceService.getPursuitSnapshot(raceId);
+    }
+
     private ResponseEntity<Object> toResponse(ServiceResult result) {
         return ResponseEntity.status(result.status()).body(result.body());
     }

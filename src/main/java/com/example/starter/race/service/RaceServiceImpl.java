@@ -1,11 +1,20 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.AdjudicatePursuitRequest;
+import com.example.starter.race.api.AdjudicationResponse;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.ConfigurePursuitRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
+import com.example.starter.race.api.PursuitConfigResponse;
+import com.example.starter.race.api.PursuitPairResponse;
+import com.example.starter.race.api.PursuitSnapshotPairResponse;
+import com.example.starter.race.api.PursuitSnapshotResponse;
+import com.example.starter.race.api.PursuitSnapshotSampleResponse;
+import com.example.starter.race.api.PursuitStateResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
@@ -15,19 +24,32 @@ import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
+import com.example.starter.race.api.SubmitTrajectoryRequest;
+import com.example.starter.race.api.TrajectoryResponse;
+import com.example.starter.race.domain.CatchTime;
 import com.example.starter.race.domain.CheckpointRules;
 import com.example.starter.race.domain.PenaltyType;
+import com.example.starter.race.domain.PursuitCatchCalculator;
+import com.example.starter.race.domain.RaceMode;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.TrajectoryPoint;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
+import com.example.starter.race.persistence.PursuitAdjudicationRow;
+import com.example.starter.race.persistence.PursuitPairRow;
+import com.example.starter.race.persistence.PursuitRepository;
+import com.example.starter.race.persistence.PursuitSampleRow;
+import com.example.starter.race.persistence.PursuitTrajectoryRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
+import com.example.starter.race.persistence.SnapshotPursuitPairRow;
+import com.example.starter.race.persistence.SnapshotPursuitSampleRow;
 import com.example.starter.race.persistence.SnapshotRow;
 import com.example.starter.race.persistence.RaceRepository;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -72,11 +94,14 @@ public class RaceServiceImpl implements RaceService {
     private static final long INFLIGHT_WAIT_MAX_MS = 30_000L;
 
     private final RaceRepository repository;
+    private final PursuitRepository pursuitRepository;
     private final Clock clock;
     private final ObjectMapper objectMapper;
 
-    public RaceServiceImpl(RaceRepository repository, Clock clock, ObjectMapper objectMapper) {
+    public RaceServiceImpl(RaceRepository repository, PursuitRepository pursuitRepository,
+                           Clock clock, ObjectMapper objectMapper) {
         this.repository = repository;
+        this.pursuitRepository = pursuitRepository;
         this.clock = clock;
         this.objectMapper = objectMapper;
     }
@@ -95,7 +120,8 @@ public class RaceServiceImpl implements RaceService {
                     }
                     RaceRow race = repository.findRace(request.raceId()).orElseThrow();
                     return ServiceResult.created(new RaceResponse(
-                            race.raceId(), race.version(), race.status(), race.createdAt()));
+                            race.raceId(), race.version(), race.status(), race.mode(),
+                            race.createdAt()));
                 });
     }
 
@@ -111,6 +137,10 @@ public class RaceServiceImpl implements RaceService {
                 () -> {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
                     Long finishTimeMs = request.finishTimeMs();
+                    // 追逐赛禁止直接录入完赛耗时：成绩由轨迹裁定产生，原单条成绩入口不得绕过。
+                    if (race.mode() == RaceMode.PURSUIT && finishTimeMs != null) {
+                        throw new ConflictException("追逐赛禁止直接录入完赛耗时: " + raceId);
+                    }
                     validateFinishTime(finishTimeMs, true);
                     long now = clock.millis();
                     bumpVersion(race, request.expectedVersion());
@@ -135,6 +165,9 @@ public class RaceServiceImpl implements RaceService {
                         "finishTimeMs", request.finishTimeMs()),
                 () -> {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    if (race.mode() == RaceMode.PURSUIT) {
+                        throw new ConflictException("追逐赛禁止直接修订完赛耗时: " + raceId);
+                    }
                     RunnerRow runner = requireRunner(raceId, request.bib());
                     validateFinishTime(request.finishTimeMs(), false);
                     // 修订后原始完赛耗时仍须严格大于该选手每一条已有分段耗时，否则分段不变量被破坏。
@@ -247,6 +280,9 @@ public class RaceServiceImpl implements RaceService {
                                 .toList()),
                 () -> {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    if (race.mode() == RaceMode.PURSUIT) {
+                        throw new ConflictException("追逐赛不模拟赛道，禁止配置检查点: " + raceId);
+                    }
                     validateCheckpointDefinitions(request.checkpoints());
                     if (!repository.findCheckpoints(raceId).isEmpty()) {
                         throw new ConflictException("赛事已配置检查点，配置后不可修改: " + raceId);
@@ -289,6 +325,9 @@ public class RaceServiceImpl implements RaceService {
                     }
 
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    if (race.mode() == RaceMode.PURSUIT) {
+                        throw new ConflictException("追逐赛不模拟赛道，禁止提交分段记录: " + raceId);
+                    }
                     RunnerRow runner = requireRunner(raceId, bib);
                     CheckpointRow checkpoint = repository
                             .findCheckpoint(raceId, request.checkpointCode())
@@ -362,6 +401,19 @@ public class RaceServiceImpl implements RaceService {
                     List<ResultEntry> entries =
                             ResultCalculator.compute(runners, penalties, checkpoints, timings);
 
+                    // 追逐赛封榜前置：所有声明追逐对都必须有当前裁定（轨迹更正会删除旧裁定，
+                    // 因此此处存在的裁定必然对应当前轨迹版本）；在同一事务内冻结完整轨迹点与交会分数。
+                    List<SnapshotPursuitPairRow> pursuitSnapshotPairs = List.of();
+                    List<SnapshotPursuitSampleRow> pursuitSnapshotSamples = List.of();
+                    if (race.mode() == RaceMode.PURSUIT) {
+                        pursuitSnapshotPairs = buildPursuitSnapshotPairs(raceId);
+                        pursuitSnapshotSamples = pursuitRepository.findAllSamples(raceId).stream()
+                                .map(sample -> new SnapshotPursuitSampleRow(
+                                        raceId, sample.bib(), sample.seq(),
+                                        sample.timeMs(), sample.distanceMm()))
+                                .toList();
+                    }
+
                     int newVersion = request.expectedVersion() + 1;
                     int updated = repository.sealIfOpenAtVersion(
                             raceId, request.expectedVersion(), newVersion);
@@ -390,6 +442,10 @@ public class RaceServiceImpl implements RaceService {
                             buildSnapshotCheckpoints(raceId, runners, checkpoints, timings);
                     repository.insertSnapshot(new SnapshotRow(raceId, newVersion, now,
                             snapshotEntries, snapshotCheckpoints));
+                    if (race.mode() == RaceMode.PURSUIT) {
+                        pursuitRepository.insertSnapshotPursuit(
+                                pursuitSnapshotPairs, pursuitSnapshotSamples);
+                    }
                     return ServiceResult.ok(new StandingResponse(
                             raceId, newVersion, RaceStatus.SEALED, now,
                             snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
@@ -496,6 +552,228 @@ public class RaceServiceImpl implements RaceService {
         SnapshotRow snapshot = repository.findSnapshot(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事尚未封榜: " + raceId));
         return ResponseMapper.snapshotStanding(snapshot);
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult configurePursuit(String raceId, ConfigurePursuitRequest request) {
+        List<ConfigurePursuitRequest.PursuitPairDefinition> definitions =
+                request.pairs().stream()
+                        .sorted(java.util.Comparator
+                                .comparingInt(ConfigurePursuitRequest.PursuitPairDefinition::pairNo))
+                        .toList();
+        return withIdempotency(request.requestId(), "CONFIGURE_PURSUIT",
+                orderedParams(
+                        "raceId", raceId,
+                        "expectedVersion", request.expectedVersion(),
+                        "operator", request.operator(),
+                        "pairs", definitions.stream()
+                                .map(def -> def.pairNo() + ":" + def.chaserBib() + ":"
+                                        + def.chasedBib() + ":" + def.chaserStartMm() + ":"
+                                        + def.chasedStartMm())
+                                .toList()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    if (race.mode() == RaceMode.PURSUIT) {
+                        throw new ConflictException("赛事已启用PURSUIT: " + raceId);
+                    }
+                    // 必须在计时前启用：已有任何完赛耗时或分段记录即拒绝。
+                    if (repository.countTimedRunners(raceId) > 0
+                            || repository.countTimings(raceId) > 0) {
+                        throw new ConflictException("赛事已开始计时，不能启用PURSUIT: " + raceId);
+                    }
+                    validatePursuitPairs(raceId, definitions);
+                    int newVersion = request.expectedVersion() + 1;
+                    int updated = repository.enablePursuitIfStandardAtVersion(
+                            raceId, request.expectedVersion(), newVersion);
+                    if (updated == 0) {
+                        throw new ConflictException("版本冲突或赛事已启用PURSUIT");
+                    }
+                    long now = clock.millis();
+                    List<PursuitPairRow> rows = definitions.stream()
+                            .map(def -> new PursuitPairRow(
+                                    raceId, def.pairNo(), def.chaserBib(), def.chasedBib(),
+                                    def.chaserStartMm(), def.chasedStartMm(), now,
+                                    request.operator()))
+                            .toList();
+                    pursuitRepository.insertPairs(rows);
+                    return ServiceResult.created(new PursuitConfigResponse(
+                            raceId, newVersion,
+                            rows.stream().map(RaceServiceImpl::toPairResponse).toList()));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult submitTrajectory(
+            String raceId, String bib, SubmitTrajectoryRequest request) {
+        return withIdempotency(request.requestId(), "SUBMIT_TRAJECTORY",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "trajectoryVersion", request.trajectoryVersion(),
+                        "expectedVersion", request.expectedVersion(),
+                        "operator", request.operator(),
+                        "samples", request.samples().stream()
+                                .map(sample -> sample.timeMs() + ":" + sample.distanceMm())
+                                .toList()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requirePursuitMode(race);
+                    requireRunner(raceId, bib);
+                    validateSamples(request.samples());
+                    Optional<PursuitTrajectoryRow> current =
+                            pursuitRepository.findTrajectory(raceId, bib);
+                    int newTrajectoryVersion;
+                    if (current.isEmpty()) {
+                        if (request.trajectoryVersion() != 0) {
+                            throw new ConflictException("轨迹版本冲突: 该选手尚无轨迹，expected="
+                                    + request.trajectoryVersion());
+                        }
+                        newTrajectoryVersion = 1;
+                    } else {
+                        if (current.get().version() != request.trajectoryVersion()) {
+                            throw new ConflictException("轨迹版本冲突: expected="
+                                    + request.trajectoryVersion()
+                                    + ", actual=" + current.get().version());
+                        }
+                        newTrajectoryVersion = current.get().version() + 1;
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    if (current.isEmpty()) {
+                        pursuitRepository.insertTrajectory(new PursuitTrajectoryRow(
+                                raceId, bib, newTrajectoryVersion, now, request.operator()));
+                    } else {
+                        pursuitRepository.bumpTrajectoryVersion(
+                                raceId, bib, newTrajectoryVersion, now, request.operator());
+                    }
+                    List<PursuitSampleRow> rows = new ArrayList<>(request.samples().size());
+                    for (int i = 0; i < request.samples().size(); i++) {
+                        SubmitTrajectoryRequest.SamplePoint sample = request.samples().get(i);
+                        rows.add(new PursuitSampleRow(
+                                raceId, bib, i + 1, sample.timeMs(), sample.distanceMm()));
+                    }
+                    pursuitRepository.replaceSamples(raceId, bib, rows);
+                    // 轨迹更正使涉及该选手的旧裁定失效（同事务删除，封榜须重新裁定）。
+                    pursuitRepository.deleteAdjudicationsForBib(raceId, bib);
+                    return ServiceResult.created(new TrajectoryResponse(
+                            raceId, bib, newTrajectoryVersion,
+                            rows.stream()
+                                    .map(row -> new TrajectoryPoint(row.timeMs(), row.distanceMm()))
+                                    .toList()));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult adjudicatePursuit(String raceId, AdjudicatePursuitRequest request) {
+        return withIdempotency(request.requestId(), "ADJUDICATE_PURSUIT",
+                orderedParams(
+                        "raceId", raceId,
+                        "pairNo", request.pairNo(),
+                        "chaserTrajectoryVersion", request.chaserTrajectoryVersion(),
+                        "chasedTrajectoryVersion", request.chasedTrajectoryVersion(),
+                        "expectedVersion", request.expectedVersion(),
+                        "operator", request.operator()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requirePursuitMode(race);
+                    PursuitPairRow pair = pursuitRepository
+                            .findPair(raceId, request.pairNo())
+                            .orElseThrow(() -> new NotFoundException(
+                                    "追逐对不存在: " + request.pairNo()));
+                    PursuitTrajectoryRow chaserTrajectory = pursuitRepository
+                            .findTrajectory(raceId, pair.chaserBib())
+                            .orElseThrow(() -> new UnprocessableEntityException(
+                                    "追赶者缺少轨迹: " + pair.chaserBib()));
+                    PursuitTrajectoryRow chasedTrajectory = pursuitRepository
+                            .findTrajectory(raceId, pair.chasedBib())
+                            .orElseThrow(() -> new UnprocessableEntityException(
+                                    "被追者缺少轨迹: " + pair.chasedBib()));
+                    // 裁定必须基于双方当前轨迹版本，与并发更正不混版本。
+                    if (chaserTrajectory.version() != request.chaserTrajectoryVersion()
+                            || chasedTrajectory.version() != request.chasedTrajectoryVersion()) {
+                        throw new ConflictException("轨迹版本冲突: chaser expected="
+                                + request.chaserTrajectoryVersion() + ", actual="
+                                + chaserTrajectory.version() + "; chased expected="
+                                + request.chasedTrajectoryVersion() + ", actual="
+                                + chasedTrajectory.version());
+                    }
+                    if (pair.chaserStartMm() >= pair.chasedStartMm()) {
+                        throw new UnprocessableEntityException(
+                                "追赶者必须起始落后: chaserStartMm=" + pair.chaserStartMm()
+                                        + ", chasedStartMm=" + pair.chasedStartMm());
+                    }
+                    List<TrajectoryPoint> chaserSamples = toPoints(
+                            pursuitRepository.findSamples(raceId, pair.chaserBib()));
+                    List<TrajectoryPoint> chasedSamples = toPoints(
+                            pursuitRepository.findSamples(raceId, pair.chasedBib()));
+                    CatchTime catchTime = PursuitCatchCalculator.earliestCatch(
+                            pair.chaserStartMm(), pair.chasedStartMm(),
+                            chaserSamples, chasedSamples)
+                            .orElseThrow(() -> new UnprocessableEntityException(
+                                    "双方轨迹公共区间内未交会，不予裁定"));
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    PursuitAdjudicationRow row = new PursuitAdjudicationRow(
+                            raceId, pair.pairNo(), pair.chaserBib(), pair.chasedBib(),
+                            chaserTrajectory.version(), chasedTrajectory.version(),
+                            catchTime.numerator(), catchTime.denominator(), now,
+                            request.operator());
+                    pursuitRepository.replaceAdjudication(row);
+                    return ServiceResult.created(toAdjudicationResponse(row));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public PursuitStateResponse getPursuitState(String raceId) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        if (race.mode() != RaceMode.PURSUIT) {
+            throw new NotFoundException("赛事未启用PURSUIT: " + raceId);
+        }
+        List<PursuitPairResponse> pairs = pursuitRepository.findPairs(raceId).stream()
+                .map(RaceServiceImpl::toPairResponse)
+                .toList();
+        List<TrajectoryResponse> trajectories = pursuitRepository.findTrajectories(raceId).stream()
+                .map(trajectory -> new TrajectoryResponse(
+                        raceId, trajectory.bib(), trajectory.version(),
+                        toPoints(pursuitRepository.findSamples(raceId, trajectory.bib()))))
+                .toList();
+        List<AdjudicationResponse> adjudications =
+                pursuitRepository.findAdjudications(raceId).stream()
+                        .map(RaceServiceImpl::toAdjudicationResponse)
+                        .toList();
+        return new PursuitStateResponse(raceId, race.version(), pairs, trajectories, adjudications);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public PursuitSnapshotResponse getPursuitSnapshot(String raceId) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        if (race.mode() != RaceMode.PURSUIT) {
+            throw new NotFoundException("赛事未启用PURSUIT: " + raceId);
+        }
+        SnapshotRow snapshot = repository.findSnapshot(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事尚未封榜: " + raceId));
+        List<PursuitSnapshotPairResponse> pairs =
+                pursuitRepository.findSnapshotPursuitPairs(raceId).stream()
+                        .map(row -> new PursuitSnapshotPairResponse(
+                                row.pairNo(), row.chaserBib(), row.chasedBib(),
+                                row.chaserStartMm(), row.chasedStartMm(),
+                                row.chaserTrajectoryVersion(), row.chasedTrajectoryVersion(),
+                                row.catchTimeNum(), row.catchTimeDen()))
+                        .toList();
+        List<PursuitSnapshotSampleResponse> samples =
+                pursuitRepository.findSnapshotPursuitSamples(raceId).stream()
+                        .map(row -> new PursuitSnapshotSampleResponse(
+                                row.bib(), row.seq(), row.timeMs(), row.distanceMm()))
+                        .toList();
+        return new PursuitSnapshotResponse(
+                raceId, snapshot.version(), snapshot.sealedAt(), pairs, samples);
     }
 
     /**
@@ -723,5 +1001,102 @@ public class RaceServiceImpl implements RaceService {
         String message = cause.getMessage();
         return message != null
                 && message.toUpperCase(java.util.Locale.ROOT).contains(constraintName.toUpperCase(java.util.Locale.ROOT));
+    }
+
+    /** 要求赛事为追逐模式，否则拒绝写入。 */
+    private static void requirePursuitMode(RaceRow race) {
+        if (race.mode() != RaceMode.PURSUIT) {
+            throw new ConflictException("赛事未启用PURSUIT: " + race.raceId());
+        }
+    }
+
+    /**
+     * 校验追逐对配置：1~5对、pairNo 从1连续递增、同对两人不同、起始距离非负，
+     * 且双方都是本赛事已登记选手。
+     */
+    private void validatePursuitPairs(
+            String raceId, List<ConfigurePursuitRequest.PursuitPairDefinition> definitions) {
+        if (definitions.isEmpty() || definitions.size() > 5) {
+            throw new BadRequestException("追逐对数量必须在 1~5 之间");
+        }
+        for (int i = 0; i < definitions.size(); i++) {
+            ConfigurePursuitRequest.PursuitPairDefinition def = definitions.get(i);
+            if (def.pairNo() != i + 1) {
+                throw new BadRequestException("追逐对序号必须从1连续递增，缺少 pairNo=" + (i + 1));
+            }
+            if (def.chaserBib().equals(def.chasedBib())) {
+                throw new BadRequestException("同一追逐对的追赶者与被追者不能相同: " + def.chaserBib());
+            }
+            if (def.chaserStartMm() < 0 || def.chasedStartMm() < 0) {
+                throw new BadRequestException("起始距离必须为非负整数毫米");
+            }
+            requireRunner(raceId, def.chaserBib());
+            requireRunner(raceId, def.chasedBib());
+        }
+    }
+
+    /**
+     * 校验轨迹采样：1~10点；起点固定为(0,0)，故首点时刻必须为正；
+     * 时刻严格递增、累计距离非负且不减。
+     */
+    private static void validateSamples(List<SubmitTrajectoryRequest.SamplePoint> samples) {
+        if (samples.isEmpty() || samples.size() > 10) {
+            throw new BadRequestException("采样点数量必须在 1~10 之间");
+        }
+        long previousTimeMs = 0L;
+        long previousDistanceMm = 0L;
+        for (SubmitTrajectoryRequest.SamplePoint sample : samples) {
+            if (sample.timeMs() <= previousTimeMs) {
+                throw new BadRequestException("采样时刻必须为正且严格递增: " + sample.timeMs());
+            }
+            if (sample.distanceMm() < 0 || sample.distanceMm() < previousDistanceMm) {
+                throw new BadRequestException("累计前进距离必须非负且不减: " + sample.distanceMm());
+            }
+            previousTimeMs = sample.timeMs();
+            previousDistanceMm = sample.distanceMm();
+        }
+    }
+
+    /** 封榜前置：为每个声明追逐对取当前裁定并组装冻结行；任一追逐对缺少当前裁定即422。 */
+    private List<SnapshotPursuitPairRow> buildPursuitSnapshotPairs(String raceId) {
+        List<PursuitPairRow> pairs = pursuitRepository.findPairs(raceId);
+        Map<Integer, PursuitAdjudicationRow> adjudicationByPairNo = new TreeMap<>();
+        for (PursuitAdjudicationRow adjudication : pursuitRepository.findAdjudications(raceId)) {
+            adjudicationByPairNo.put(adjudication.pairNo(), adjudication);
+        }
+        List<SnapshotPursuitPairRow> rows = new ArrayList<>(pairs.size());
+        for (PursuitPairRow pair : pairs) {
+            PursuitAdjudicationRow adjudication = adjudicationByPairNo.get(pair.pairNo());
+            if (adjudication == null) {
+                throw new UnprocessableEntityException(
+                        "追逐对缺少当前裁定，不能封榜: pairNo=" + pair.pairNo());
+            }
+            rows.add(new SnapshotPursuitPairRow(
+                    raceId, pair.pairNo(), pair.chaserBib(), pair.chasedBib(),
+                    pair.chaserStartMm(), pair.chasedStartMm(),
+                    adjudication.chaserTrajectoryVersion(),
+                    adjudication.chasedTrajectoryVersion(),
+                    adjudication.catchTimeNum(), adjudication.catchTimeDen()));
+        }
+        return rows;
+    }
+
+    private static List<TrajectoryPoint> toPoints(List<PursuitSampleRow> rows) {
+        return rows.stream()
+                .map(row -> new TrajectoryPoint(row.timeMs(), row.distanceMm()))
+                .toList();
+    }
+
+    private static PursuitPairResponse toPairResponse(PursuitPairRow row) {
+        return new PursuitPairResponse(
+                row.pairNo(), row.chaserBib(), row.chasedBib(),
+                row.chaserStartMm(), row.chasedStartMm());
+    }
+
+    private static AdjudicationResponse toAdjudicationResponse(PursuitAdjudicationRow row) {
+        return new AdjudicationResponse(
+                row.raceId(), row.pairNo(), row.chaserBib(), row.chasedBib(),
+                row.chaserTrajectoryVersion(), row.chasedTrajectoryVersion(),
+                row.catchTimeNum(), row.catchTimeDen(), row.createdAt());
     }
 }

@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS race (
     race_id VARCHAR(64) NOT NULL COMMENT '赛事ID，全局唯一',
     version INT NOT NULL COMMENT '版本号，从1开始，每次写操作加一',
     status VARCHAR(16) NOT NULL COMMENT '赛事状态：OPEN-开放可写，SEALED-已封榜只读',
+    mode VARCHAR(16) NOT NULL DEFAULT 'STANDARD' COMMENT '赛事模式：STANDARD-普通计时赛，PURSUIT-追逐赛（启用后禁止直接录入完赛耗时）',
     created_at BIGINT NOT NULL COMMENT '创建时间，Unix毫秒时间戳',
     CONSTRAINT pk_race PRIMARY KEY (race_id)
 );
@@ -97,10 +98,86 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
 
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/CONFIGURE_PURSUIT/SUBMIT_TRAJECTORY/ADJUDICATE_PURSUIT',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',
     created_at BIGINT NOT NULL COMMENT '首次成功提交时间，Unix毫秒时间戳',
     CONSTRAINT pk_idempotency_record PRIMARY KEY (request_id)
+);
+
+-- 追逐赛（PURSUIT）领域表：合成直线进度，不模拟赛道。
+-- 距离单位均为毫米（非负整数），时刻为起跑起非负整数毫秒；位置=起始距离+累计前进量。
+
+CREATE TABLE IF NOT EXISTS pursuit_pair (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    pair_no INT NOT NULL COMMENT '追逐对序号，从1连续递增，启用PURSUIT时一次性固定（1~5对）',
+    chaser_bib VARCHAR(64) NOT NULL COMMENT '追赶者参赛号',
+    chased_bib VARCHAR(64) NOT NULL COMMENT '被追者参赛号',
+    chaser_start_mm BIGINT NOT NULL COMMENT '追赶者起始距离（毫米，非负），必须小于被追者起始距离',
+    chased_start_mm BIGINT NOT NULL COMMENT '被追者起始距离（毫米，非负）',
+    created_at BIGINT NOT NULL COMMENT '配置时间，Unix毫秒时间戳',
+    created_by VARCHAR(64) NOT NULL COMMENT '配置操作者，非空',
+    CONSTRAINT pk_pursuit_pair PRIMARY KEY (race_id, pair_no),
+    CONSTRAINT fk_pursuit_pair_race FOREIGN KEY (race_id) REFERENCES race (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS pursuit_trajectory (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    version INT NOT NULL COMMENT '轨迹版本号，首次采样为1，每次更正加一',
+    updated_at BIGINT NOT NULL COMMENT '最近一次采样/更正时间，Unix毫秒时间戳',
+    updated_by VARCHAR(64) NOT NULL COMMENT '最近一次采样/更正操作者，非空',
+    CONSTRAINT pk_pursuit_trajectory PRIMARY KEY (race_id, bib),
+    CONSTRAINT fk_pursuit_trajectory_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib)
+);
+
+CREATE TABLE IF NOT EXISTS pursuit_sample (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    seq INT NOT NULL COMMENT '采样序号，从1连续递增；隐含起点固定为(0,0)不占序号',
+    time_ms BIGINT NOT NULL COMMENT '从起跑起的时刻（毫秒，正整数，同一人严格递增）',
+    distance_mm BIGINT NOT NULL COMMENT '累计前进距离（毫米，非负，同一人不减）',
+    CONSTRAINT pk_pursuit_sample PRIMARY KEY (race_id, bib, seq),
+    CONSTRAINT fk_pursuit_sample_trajectory FOREIGN KEY (race_id, bib) REFERENCES pursuit_trajectory (race_id, bib)
+);
+
+CREATE TABLE IF NOT EXISTS pursuit_adjudication (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    pair_no INT NOT NULL COMMENT '追逐对序号；每个追逐对仅保留一条当前裁定，轨迹更正即删除旧裁定',
+    chaser_bib VARCHAR(64) NOT NULL COMMENT '追赶者参赛号（裁定时的快照）',
+    chased_bib VARCHAR(64) NOT NULL COMMENT '被追者参赛号（裁定时的快照）',
+    chaser_trajectory_version INT NOT NULL COMMENT '裁定依据的追赶者轨迹版本',
+    chased_trajectory_version INT NOT NULL COMMENT '裁定依据的被追者轨迹版本',
+    catch_time_num BIGINT NOT NULL COMMENT '最早交会时刻（起跑起毫秒）精确有理数的分子，已约分',
+    catch_time_den BIGINT NOT NULL COMMENT '最早交会时刻（起跑起毫秒）精确有理数的分母，已约分，正整数',
+    created_at BIGINT NOT NULL COMMENT '裁定时间，Unix毫秒时间戳',
+    created_by VARCHAR(64) NOT NULL COMMENT '裁定操作者，非空',
+    CONSTRAINT pk_pursuit_adjudication PRIMARY KEY (race_id, pair_no),
+    CONSTRAINT fk_pursuit_adjudication_pair FOREIGN KEY (race_id, pair_no) REFERENCES pursuit_pair (race_id, pair_no)
+);
+
+CREATE TABLE IF NOT EXISTS result_snapshot_pursuit_pair (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
+    pair_no INT NOT NULL COMMENT '追逐对序号',
+    chaser_bib VARCHAR(64) NOT NULL COMMENT '追赶者参赛号',
+    chased_bib VARCHAR(64) NOT NULL COMMENT '被追者参赛号',
+    chaser_start_mm BIGINT NOT NULL COMMENT '追赶者起始距离（毫米）',
+    chased_start_mm BIGINT NOT NULL COMMENT '被追者起始距离（毫米）',
+    chaser_trajectory_version INT NOT NULL COMMENT '封榜时裁定依据的追赶者轨迹版本',
+    chased_trajectory_version INT NOT NULL COMMENT '封榜时裁定依据的被追者轨迹版本',
+    catch_time_num BIGINT NOT NULL COMMENT '封榜冻结的最早交会时刻（毫秒）有理数分子，已约分',
+    catch_time_den BIGINT NOT NULL COMMENT '封榜冻结的最早交会时刻（毫秒）有理数分母，已约分',
+    CONSTRAINT pk_snapshot_pursuit_pair PRIMARY KEY (race_id, pair_no),
+    CONSTRAINT fk_snapshot_pursuit_pair_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS result_snapshot_pursuit_sample (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    seq INT NOT NULL COMMENT '采样序号，从1连续递增；隐含起点固定为(0,0)不占序号',
+    time_ms BIGINT NOT NULL COMMENT '从起跑起的时刻（毫秒）',
+    distance_mm BIGINT NOT NULL COMMENT '累计前进距离（毫米）',
+    CONSTRAINT pk_snapshot_pursuit_sample PRIMARY KEY (race_id, bib, seq),
+    CONSTRAINT fk_snapshot_pursuit_sample_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
