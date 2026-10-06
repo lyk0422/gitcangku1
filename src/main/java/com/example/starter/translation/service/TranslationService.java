@@ -38,42 +38,98 @@ public class TranslationService {
         this.objectMapper = objectMapper;
     }
 
-    /** 建文档：1~5 种目标语言，可携带初始段落，初始草稿版本 1、发布版本 0。 */
+    /** 建文档：1~5 种目标语言，可携带初始段落，初始草稿版本 1、发布版本 0；字幕模式校验时间轴。 */
     @Transactional
-    public ApiDtos.DocumentResponse createDocument(ApiDtos.CreateDocumentRequest request) {
+    public ApiDtos.DocumentResponse createDocument(ApiDtos.CreateDocumentRequest request, String actorId) {
+        String mode = normalizeMode(request.mode());
+        boolean subtitle = "subtitle".equals(mode);
+        if (subtitle) {
+            requireActor(actorId);
+        }
         List<String> languages = normalizeLanguages(request.targetLanguages());
         List<ApiDtos.SegmentInput> segments = request.segments();
         long distinct = segments.stream().map(ApiDtos.SegmentInput::segmentId).distinct().count();
         if (distinct != segments.size()) {
             throw ApiException.unprocessable("初始段落 segmentId 重复");
         }
-        long documentId = repository.insertDocument(languages);
+        List<SegmentRow> timeline = new ArrayList<>();
         for (ApiDtos.SegmentInput segment : segments) {
-            repository.insertSegment(documentId, segment.segmentId(), segment.sourceText());
+            if (subtitle) {
+                timeline.add(new SegmentRow(segment.segmentId(), segment.sourceText(), 1,
+                        segment.zeroPointMs(), segment.startMs(), segment.endMs()));
+            } else {
+                requireNoTiming(segment.segmentId(), segment.zeroPointMs(), segment.startMs(), segment.endMs());
+            }
         }
-        return new ApiDtos.DocumentResponse(documentId, 1, 0, languages);
+        if (subtitle) {
+            SubtitleTiming.validateTimeline(timeline);
+        }
+        long documentId = repository.insertDocument(languages, mode);
+        for (ApiDtos.SegmentInput segment : segments) {
+            repository.insertSegment(documentId, segment.segmentId(), segment.sourceText(),
+                    subtitle ? segment.zeroPointMs() : null,
+                    subtitle ? segment.startMs() : null,
+                    subtitle ? segment.endMs() : null);
+        }
+        return new ApiDtos.DocumentResponse(documentId, 1, 0, languages, mode);
     }
 
-    /** 增加段落：segmentId 文档内唯一，草稿版本加一。 */
+    /** 增加段落：segmentId 文档内唯一，草稿版本加一；字幕文档校验时段与整段无重叠。 */
     @Transactional
-    public ApiDtos.SegmentResponse addSegment(long documentId, ApiDtos.AddSegmentRequest request) {
+    public ApiDtos.SegmentResponse addSegment(long documentId, ApiDtos.AddSegmentRequest request, String actorId) {
         DocumentRow document = lockDocument(documentId);
+        boolean subtitle = document.isSubtitle();
+        if (subtitle) {
+            requireActor(actorId);
+        }
         if (repository.findSegment(documentId, request.segmentId()).isPresent()) {
             throw ApiException.conflict("段落已存在: " + request.segmentId());
         }
-        repository.insertSegment(documentId, request.segmentId(), request.sourceText());
+        if (subtitle) {
+            List<SegmentRow> timeline = new ArrayList<>(repository.listSegments(documentId));
+            timeline.add(new SegmentRow(request.segmentId(), request.sourceText(), 1,
+                    request.zeroPointMs(), request.startMs(), request.endMs()));
+            SubtitleTiming.validateTimeline(timeline);
+            repository.insertSegment(documentId, request.segmentId(), request.sourceText(),
+                    request.zeroPointMs(), request.startMs(), request.endMs());
+        } else {
+            requireNoTiming(request.segmentId(), request.zeroPointMs(), request.startMs(), request.endMs());
+            repository.insertSegment(documentId, request.segmentId(), request.sourceText(), null, null, null);
+        }
         int draftVersion = bumpDraftVersion(document);
         return new ApiDtos.SegmentResponse(documentId, request.segmentId(), 1, draftVersion);
     }
 
-    /** 源文修订：源文版本加一、草稿版本加一；相关译文因源文版本落后而待更新。 */
+    /**
+     * 源文修订：源文版本加一、草稿版本加一；相关译文因源文版本落后而待更新。
+     * 字幕文档须同时携带修订后时段，文本虽未改变也推进源版本并使原批准失效。
+     */
     @Transactional
     public ApiDtos.SegmentResponse reviseSource(long documentId, String segmentId,
-                                              ApiDtos.ReviseSourceRequest request) {
+                                              ApiDtos.ReviseSourceRequest request, String actorId) {
         DocumentRow document = lockDocument(documentId);
+        boolean subtitle = document.isSubtitle();
+        if (subtitle) {
+            requireActor(actorId);
+        }
         SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
         int sourceVersion = segment.sourceVersion() + 1;
-        repository.updateSegmentSource(documentId, segmentId, request.sourceText(), sourceVersion);
+        if (subtitle) {
+            List<SegmentRow> timeline = new ArrayList<>();
+            for (SegmentRow row : repository.listSegments(documentId)) {
+                timeline.add(row.segmentId().equals(segmentId)
+                        ? new SegmentRow(segmentId, request.sourceText(), sourceVersion,
+                                request.zeroPointMs(), request.startMs(), request.endMs())
+                        : row);
+            }
+            SubtitleTiming.validateTimeline(timeline);
+            repository.updateSegmentSource(documentId, segmentId, request.sourceText(), sourceVersion,
+                    request.zeroPointMs(), request.startMs(), request.endMs());
+        } else {
+            requireNoTiming(segmentId, request.zeroPointMs(), request.startMs(), request.endMs());
+            repository.updateSegmentSource(documentId, segmentId, request.sourceText(), sourceVersion,
+                    null, null, null);
+        }
         int draftVersion = bumpDraftVersion(document);
         return new ApiDtos.SegmentResponse(documentId, segmentId, sourceVersion, draftVersion);
     }
@@ -102,6 +158,10 @@ public class TranslationService {
         if (!violations.isEmpty()) {
             throw ApiException.termViolation("译文违反 " + violations.size() + " 条术语规则", violations);
         }
+        if (document.isSubtitle()) {
+            SubtitleTiming.checkReadingSpeed(request.content(), segment.durationMs(),
+                    segmentId + "/" + normalizedLanguage);
+        }
         int translationVersion = repository.findTranslation(documentId, segmentId, normalizedLanguage)
                 .map(TranslationRow::translationVersion).orElse(0) + 1;
         repository.upsertTranslation(documentId, new TranslationRow(segmentId, normalizedLanguage,
@@ -111,11 +171,11 @@ public class TranslationService {
                 translationVersion, segment.sourceVersion(), document.termVersion(), draftVersion);
     }
 
-    /** 译文批准：审核人不得是作者，且必须同时匹配当前源文与译文版本。 */
+    /** 译文批准：审核人不得是作者，且必须同时匹配当前源文与译文版本；字幕文档重新检查当前时间轴与速率。 */
     @Transactional
     public ApiDtos.ApprovalResponse approveTranslation(long documentId, String segmentId, String language,
                                                        String actorId, ApiDtos.ApproveTranslationRequest request) {
-        lockDocument(documentId);
+        DocumentRow document = lockDocument(documentId);
         String normalizedLanguage = normalizeLanguage(language);
         SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
         TranslationRow translation = repository.findTranslation(documentId, segmentId, normalizedLanguage)
@@ -131,6 +191,11 @@ public class TranslationService {
         if (translation.sourceVersion() != segment.sourceVersion()) {
             throw ApiException.unprocessable("译文基于源文版本 " + translation.sourceVersion()
                     + "，当前源文版本 " + segment.sourceVersion() + "，译文待更新，不能批准");
+        }
+        if (document.isSubtitle()) {
+            SubtitleTiming.validateTimeline(repository.listSegments(documentId));
+            SubtitleTiming.checkReadingSpeed(translation.content(), segment.durationMs(),
+                    segmentId + "/" + normalizedLanguage);
         }
         repository.upsertApproval(documentId, new ApprovalRow(segmentId, normalizedLanguage, actorId,
                 segment.sourceVersion(), translation.translationVersion()));
@@ -189,6 +254,9 @@ public class TranslationService {
                     + request.expectedDraftVersion() + "/" + request.expectedPublishedVersion() + " 不一致");
         }
         List<SegmentRow> segments = repository.listSegments(documentId);
+        if (document.isSubtitle()) {
+            SubtitleTiming.validateTimeline(segments);
+        }
         Map<String, TranslationRow> translations = repository.listTranslations(documentId).stream()
                 .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
         Map<String, ApprovalRow> approvals = repository.listApprovals(documentId).stream()
@@ -221,6 +289,10 @@ public class TranslationService {
                         || approval.sourceVersion() != segment.sourceVersion()) {
                     throw ApiException.unprocessable("批准已失效: " + segment.segmentId() + "/" + language
                             + "，源文或译文版本已改变");
+                }
+                if (document.isSubtitle()) {
+                    SubtitleTiming.checkReadingSpeed(translation.content(), segment.durationMs(),
+                            segment.segmentId() + "/" + language);
                 }
                 termViolations.addAll(findViolations(
                         segment.sourceText(), language, translation.content(), termRules));
@@ -323,6 +395,32 @@ public class TranslationService {
         return normalized;
     }
 
+    /** 文档模式归一：缺省 standard，仅接受 standard/subtitle（大小写不敏感）。 */
+    private static String normalizeMode(String mode) {
+        if (mode == null || mode.isBlank()) {
+            return "standard";
+        }
+        String normalized = mode.trim().toLowerCase(Locale.ROOT);
+        if (!normalized.equals("standard") && !normalized.equals("subtitle")) {
+            throw ApiException.unprocessable("未知文档模式: " + mode);
+        }
+        return normalized;
+    }
+
+    /** 字幕写操作必须携带非空操作者（X-Actor-Id）。 */
+    private static void requireActor(String actorId) {
+        if (actorId == null || actorId.isBlank()) {
+            throw ApiException.badRequest("字幕文档写操作缺少非空操作者 X-Actor-Id");
+        }
+    }
+
+    /** 普通文档不允许携带字幕时段参数。 */
+    private static void requireNoTiming(String segmentId, Long zeroPointMs, Long startMs, Long endMs) {
+        if (zeroPointMs != null || startMs != null || endMs != null) {
+            throw ApiException.unprocessable("普通文档段落不允许携带字幕时段参数: " + segmentId);
+        }
+    }
+
     /**
      * 术语违规判定：源文按 Unicode 原文、区分大小写做连续子串匹配；仅源文命中 sourceTerm 的规则参与校验，
      * 译文正文（同样区分大小写）不含 requiredTranslation 即为违规。返回全部违规规则。
@@ -356,6 +454,7 @@ public class TranslationService {
         snapshot.put("publishedVersion", publishedVersion);
         snapshot.put("draftVersion", document.draftVersion());
         snapshot.put("termVersion", document.termVersion());
+        snapshot.put("mode", document.mode());
         snapshot.put("targetLanguages", document.targetLanguages());
         List<Map<String, Object>> termList = new ArrayList<>();
         for (TermRuleRow rule : termRules) {
@@ -372,6 +471,12 @@ public class TranslationService {
             segmentJson.put("segmentId", segment.segmentId());
             segmentJson.put("sourceText", segment.sourceText());
             segmentJson.put("sourceVersion", segment.sourceVersion());
+            if (document.isSubtitle()) {
+                segmentJson.put("zeroPointMs", segment.zeroPointMs());
+                segmentJson.put("startMs", segment.startMs());
+                segmentJson.put("endMs", segment.endMs());
+                segmentJson.put("durationMs", segment.durationMs());
+            }
             List<Map<String, Object>> translationList = new ArrayList<>();
             for (String language : document.targetLanguages()) {
                 TranslationRow translation = translations.get(key(segment.segmentId(), language));
@@ -384,6 +489,9 @@ public class TranslationService {
                 translationJson.put("sourceVersion", translation.sourceVersion());
                 translationJson.put("termVersion", translation.termVersion());
                 translationJson.put("reviewer", approval.reviewer());
+                if (document.isSubtitle()) {
+                    translationJson.put("codePointCount", SubtitleTiming.codePointCount(translation.content()));
+                }
                 translationList.add(translationJson);
             }
             segmentJson.put("translations", translationList);

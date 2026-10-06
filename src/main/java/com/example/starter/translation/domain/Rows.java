@@ -15,22 +15,35 @@ public final class Rows {
      *
      * @param documentId       全局唯一文档 ID，自增
      * @param targetLanguages  目标语言列表，小写语言码，1~5 种
+     * @param mode             文档模式：standard 普通文档，subtitle 字幕文档
      * @param draftVersion     文档草稿版本，从 1 开始；增段落或修改源文/译文/术语时加一
      * @param publishedVersion 已发布版本号，从 0 开始，每次成功发布加一
      * @param termVersion      当前术语版本，从 0 开始（0 表示尚未建立术语版本）
      */
-    public record DocumentRow(long documentId, List<String> targetLanguages,
+    public record DocumentRow(long documentId, List<String> targetLanguages, String mode,
                               int draftVersion, int publishedVersion, int termVersion) {
+        /** 是否字幕文档模式。 */
+        public boolean isSubtitle() {
+            return "subtitle".equals(mode);
+        }
     }
 
     /**
-     * 段落：文档内唯一 segmentId，含源文及源文版本。
+     * 段落：文档内唯一 segmentId，含源文及源文版本；字幕模式下另含时间轴。
      *
      * @param segmentId     文档内唯一段落 ID
      * @param sourceText    源文正文，UTF-8
      * @param sourceVersion 源文版本，从 1 开始，每次源文修订加一
+     * @param zeroPointMs   字幕段相对零点，UTC 毫秒（epoch 毫秒）；仅字幕模式非空
+     * @param startMs       字幕段起始毫秒（相对零点，非负，左闭）；仅字幕模式非空
+     * @param endMs         字幕段结束毫秒（相对零点，右开）；end-start 至少 500 毫秒；仅字幕模式非空
      */
-    public record SegmentRow(String segmentId, String sourceText, int sourceVersion) {
+    public record SegmentRow(String segmentId, String sourceText, int sourceVersion,
+                             Long zeroPointMs, Long startMs, Long endMs) {
+        /** 字幕段时长毫秒（end-start），调用前须已通过时段校验。 */
+        public long durationMs() {
+            return endMs - startMs;
+        }
     }
 
     /**

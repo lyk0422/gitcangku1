@@ -40,29 +40,34 @@ public class TranslationController {
         this.objectMapper = objectMapper;
     }
 
-    /** 建文档：1~5 种目标语言，可携带初始段落。 */
+    /** 建文档：1~5 种目标语言，可携带初始段落；字幕模式（mode=subtitle）须携带非空 X-Actor-Id。 */
     @PostMapping
-    public ResponseEntity<String> createDocument(@Valid @RequestBody ApiDtos.CreateDocumentRequest request) {
-        return writeExecutor.execute(request.requestId(), hash("POST /api/documents", request),
-                () -> WriteResult.of(201, translationService.createDocument(request))).toResponseEntity();
+    public ResponseEntity<String> createDocument(
+            @RequestHeader(value = "X-Actor-Id", required = false) String actorId,
+            @Valid @RequestBody ApiDtos.CreateDocumentRequest request) {
+        return writeExecutor.execute(request.requestId(), hash("POST /api/documents", actorId, request),
+                () -> WriteResult.of(201, translationService.createDocument(request, actorId))).toResponseEntity();
     }
 
-    /** 增加段落：文档草稿版本加一。 */
+    /** 增加段落：文档草稿版本加一；字幕文档须携带非空 X-Actor-Id 与时段参数。 */
     @PostMapping("/{documentId}/segments")
     public ResponseEntity<String> addSegment(@PathVariable long documentId,
+                                             @RequestHeader(value = "X-Actor-Id", required = false) String actorId,
                                              @Valid @RequestBody ApiDtos.AddSegmentRequest request) {
         String operation = "POST /api/documents/" + documentId + "/segments";
-        return writeExecutor.execute(request.requestId(), hash(operation, request),
-                () -> WriteResult.of(201, translationService.addSegment(documentId, request))).toResponseEntity();
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(201, translationService.addSegment(documentId, request, actorId)))
+                .toResponseEntity();
     }
 
-    /** 源文修订：源文版本加一、相关译文待更新、草稿版本加一；不影响已发布快照。 */
+    /** 源文修订：源文版本加一、相关译文待更新、草稿版本加一；不影响已发布快照。字幕文档须同时修订时段。 */
     @PutMapping("/{documentId}/segments/{segmentId}/source")
     public ResponseEntity<String> reviseSource(@PathVariable long documentId, @PathVariable String segmentId,
+                                               @RequestHeader(value = "X-Actor-Id", required = false) String actorId,
                                                @Valid @RequestBody ApiDtos.ReviseSourceRequest request) {
         String operation = "PUT /api/documents/" + documentId + "/segments/" + segmentId + "/source";
-        return writeExecutor.execute(request.requestId(), hash(operation, request),
-                () -> WriteResult.of(200, translationService.reviseSource(documentId, segmentId, request)))
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200, translationService.reviseSource(documentId, segmentId, request, actorId)))
                 .toResponseEntity();
     }
 

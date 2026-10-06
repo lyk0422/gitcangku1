@@ -18,31 +18,35 @@ public final class ApiDtos {
     private ApiDtos() {
     }
 
-    /** 初始段落输入。 */
+    /** 初始段落输入；字幕模式需携带 zeroPointMs/startMs/endMs。 */
     public record SegmentInput(
             @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
-            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            Long zeroPointMs, Long startMs, Long endMs) {
     }
 
-    /** 建文档请求：1~5 种目标语言，可携带初始段落。 */
+    /** 建文档请求：1~5 种目标语言，可携带初始段落；mode 缺省 standard，可选 subtitle。 */
     public record CreateDocumentRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @NotNull(message = "targetLanguages 不能为空") @Size(min = 1, max = 5, message = "目标语言须为 1~5 种")
             List<@NotBlank(message = "语言码不能为空") String> targetLanguages,
-            @NotNull(message = "segments 不能为空") List<@Valid SegmentInput> segments) {
+            @NotNull(message = "segments 不能为空") List<@Valid SegmentInput> segments,
+            String mode) {
     }
 
-    /** 增加段落请求。 */
+    /** 增加段落请求；字幕文档需携带时段参数。 */
     public record AddSegmentRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
-            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            Long zeroPointMs, Long startMs, Long endMs) {
     }
 
-    /** 源文修订请求。 */
+    /** 源文修订请求；字幕文档需同时携带修订后的时段参数（文本未变也推进源版本）。 */
     public record ReviseSourceRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
-            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            Long zeroPointMs, Long startMs, Long endMs) {
     }
 
     /** 译文提交请求；作者取 X-Actor-Id 请求头。 */
@@ -82,7 +86,7 @@ public final class ApiDtos {
 
     /** 建文档响应。 */
     public record DocumentResponse(long documentId, int draftVersion, int publishedVersion,
-                                   List<String> targetLanguages) {
+                                   List<String> targetLanguages, String mode) {
     }
 
     /** 段落相关写操作响应。 */

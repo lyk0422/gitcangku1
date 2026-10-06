@@ -43,6 +43,11 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", message);
     }
 
+    /** 400：请求缺少必要条件（如字幕写操作缺少操作者）。 */
+    public static ApiException badRequest(String message) {
+        return new ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST", message);
+    }
+
     /** 409：版本冲突、段落冲突或 requestId 同键异参。 */
     public static ApiException conflict(String message) {
         return new ApiException(HttpStatus.CONFLICT, "CONFLICT", message);
