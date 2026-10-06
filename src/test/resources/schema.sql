@@ -15,7 +15,9 @@ CREATE TABLE IF NOT EXISTS consent_record (
     purpose VARCHAR(32) NOT NULL,
     epoch INT NOT NULL,
     record_key VARCHAR(128) NOT NULL,
+    record_type VARCHAR(8) NOT NULL DEFAULT 'TEXT',
     payload TEXT NOT NULL,
+    num_value INT NULL DEFAULT NULL,
     request_id VARCHAR(128) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (subject_key, purpose, epoch, record_key)
@@ -26,6 +28,16 @@ CREATE TABLE IF NOT EXISTS idempotency_request (
     operation VARCHAR(32) NOT NULL,
     params_fingerprint VARCHAR(512) NOT NULL,
     response_body TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (request_id)
+);
+
+CREATE TABLE IF NOT EXISTS cohort_aggregate_snapshot (
+    request_id VARCHAR(128) NOT NULL,
+    purpose VARCHAR(32) NOT NULL,
+    member_count INT NOT NULL,
+    total BIGINT NOT NULL,
+    members_json TEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (request_id)
 );

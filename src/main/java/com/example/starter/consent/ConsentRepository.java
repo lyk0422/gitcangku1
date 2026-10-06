@@ -24,7 +24,9 @@ public class ConsentRepository {
             Purpose.valueOf(rs.getString("purpose")),
             rs.getInt("epoch"),
             rs.getString("record_key"),
-            rs.getString("payload"));
+            RecordType.valueOf(rs.getString("record_type")),
+            rs.getString("payload"),
+            (Integer) rs.getObject("num_value"));
 
     private final JdbcTemplate jdbc;
 
@@ -50,9 +52,12 @@ public class ConsentRepository {
      * @param purpose    用途
      * @param epoch      所属代次
      * @param recordKey  记录键
-     * @param payload    记录内容
+     * @param recordType 记录类型：TEXT 字符串 / NUMBER 数值
+     * @param payload    记录内容；数值记录为其十进制字符串形式
+     * @param numValue   数值记录的值（0-1000 非负整数），仅 NUMBER 类型有值，否则为 null
      */
-    public record RecordRow(String subjectKey, Purpose purpose, int epoch, String recordKey, String payload) {
+    public record RecordRow(String subjectKey, Purpose purpose, int epoch, String recordKey,
+                            RecordType recordType, String payload, Integer numValue) {
     }
 
     Optional<GrantRow> findGrant(String subjectKey, Purpose purpose, int epoch) {
@@ -91,7 +96,7 @@ public class ConsentRepository {
 
     Optional<RecordRow> findRecord(String subjectKey, Purpose purpose, int epoch, String recordKey) {
         List<RecordRow> rows = jdbc.query(
-                "SELECT subject_key, purpose, epoch, record_key, payload FROM consent_record"
+                "SELECT subject_key, purpose, epoch, record_key, record_type, payload, num_value FROM consent_record"
                         + " WHERE subject_key = ? AND purpose = ? AND epoch = ? AND record_key = ?",
                 RECORD_MAPPER, subjectKey, purpose.name(), epoch, recordKey);
         return rows.stream().findFirst();
@@ -99,8 +104,18 @@ public class ConsentRepository {
 
     void insertRecord(String subjectKey, Purpose purpose, int epoch, String recordKey, String payload, String requestId) {
         jdbc.update(
-                "INSERT INTO consent_record (subject_key, purpose, epoch, record_key, payload, request_id)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO consent_record (subject_key, purpose, epoch, record_key, record_type, payload, num_value, request_id)"
+                        + " VALUES (?, ?, ?, ?, 'TEXT', ?, NULL, ?)",
                 subjectKey, purpose.name(), epoch, recordKey, payload, requestId);
+    }
+
+    /**
+     * 写入数值记录：num_value 保存数值本身，payload 保存其十进制字符串形式。
+     */
+    void insertNumericRecord(String subjectKey, Purpose purpose, int epoch, String recordKey, int value, String requestId) {
+        jdbc.update(
+                "INSERT INTO consent_record (subject_key, purpose, epoch, record_key, record_type, payload, num_value, request_id)"
+                        + " VALUES (?, ?, ?, ?, 'NUMBER', ?, ?, ?)",
+                subjectKey, purpose.name(), epoch, recordKey, String.valueOf(value), value, requestId);
     }
 }
