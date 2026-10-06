@@ -39,4 +39,10 @@ public class DeviceController {
     public PullResponse pull(@PathVariable String deviceId, @Valid @RequestBody RequestIdBody request) {
         return taskService.pull(deviceId, request.requestId());
     }
+
+    @PostMapping("/{deviceId}/maintenance")
+    public DeviceView maintenance(@PathVariable String deviceId,
+                                  @Valid @RequestBody MaintenanceRequest request) {
+        return deviceService.maintenance(deviceId, request);
+    }
 }

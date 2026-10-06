@@ -53,14 +53,13 @@ public class ReleaseService {
         }
         int sampleFloor = request.effectiveSampleFloor();
         int threshold = request.effectiveFailureThresholdPercent();
-        String fingerprint = String.join("|", "release.create", request.model(), request.fromVersion(),
-                request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
-                String.valueOf(threshold));
+        String fingerprint = Fingerprints.of("release.create", request.model(), request.fromVersion(),
+                request.toVersion(), request.ratio(), sampleFloor, threshold, request.targetIndex());
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
             long id;
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
-                        request.ratio(), sampleFloor, threshold);
+                        request.ratio(), sampleFloor, threshold, request.targetIndex());
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
             }
@@ -69,8 +68,8 @@ public class ReleaseService {
     }
 
     public ReleaseView expand(long releaseId, ExpandReleaseRequest request) {
-        String fingerprint = String.join("|", "release.expand", String.valueOf(releaseId),
-                String.valueOf(request.expectedVersion()), String.valueOf(request.ratio()));
+        String fingerprint = Fingerprints.of("release.expand", releaseId,
+                request.expectedVersion(), request.ratio());
         return idempotency.execute(request.requestId(), "release.expand", fingerprint, () -> {
             ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
@@ -95,8 +94,8 @@ public class ReleaseService {
      * 与取消并发时按行锁提交顺序决定唯一结果：取消先提交则恢复 409。
      */
     public ReleaseView resume(long releaseId, ResumeReleaseRequest request) {
-        String fingerprint = String.join("|", "release.resume", String.valueOf(releaseId),
-                String.valueOf(request.expectedVersion()), request.reason());
+        String fingerprint = Fingerprints.of("release.resume", releaseId,
+                request.expectedVersion(), request.reason());
         return idempotency.execute(request.requestId(), "release.resume", fingerprint, () -> {
             ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
@@ -120,7 +119,7 @@ public class ReleaseService {
     }
 
     public ReleaseView cancel(long releaseId, String requestId) {
-        String fingerprint = String.join("|", "release.cancel", String.valueOf(releaseId));
+        String fingerprint = Fingerprints.of("release.cancel", releaseId);
         return idempotency.execute(requestId, "release.cancel", fingerprint, () -> {
             ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));

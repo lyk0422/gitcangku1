@@ -5,6 +5,8 @@ CREATE TABLE IF NOT EXISTS device (
   model VARCHAR(64) NOT NULL COMMENT '设备型号，登记后不可修改',
   current_version VARCHAR(64) NOT NULL COMMENT '设备当前固件版本',
   bucket_no INT NOT NULL COMMENT '灰度分桶号，取值0~99，登记后不可修改',
+  security_floor INT NOT NULL DEFAULT 0 COMMENT '安全底线（不可逆安全索引下限），登记时为非负整数，维护与首次成功安装只增不减',
+  security_version INT NOT NULL DEFAULT 1 COMMENT '安全档案版本，从1开始，维护与首次成功安装加一',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
   PRIMARY KEY (device_id)
 ) COMMENT='设备登记表';
@@ -23,6 +25,7 @@ CREATE TABLE IF NOT EXISTS release_order (
   round_success INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入SUCCESS的任务数，重复回执不重复计数',
   round_failed INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入FAILED的任务数，重复回执不重复计数',
   active_model VARCHAR(64) NULL COMMENT 'ACTIVE或PAUSED时等于model，取消后置NULL；用于同型号至多一张未终结发布单的唯一约束',
+  target_index INT NULL COMMENT '目标安全索引，NULL表示旧发布未填写、不参与安全索引裁决',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id)
@@ -36,6 +39,8 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  target_index INT NULL COMMENT '任务创建时冻结的目标安全索引，NULL表示旧发布不适用',
+  proof_index INT NULL COMMENT '安装证据索引，SUCCESS回执时写入且与冻结目标一致，未回执或FAILED为NULL',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
@@ -66,7 +71,7 @@ CREATE TABLE IF NOT EXISTS release_resume_record (
 CREATE TABLE IF NOT EXISTS idempotency_record (
   request_id VARCHAR(64) NOT NULL COMMENT '全局唯一请求ID',
   api VARCHAR(64) NOT NULL COMMENT '接口标识',
-  fingerprint VARCHAR(256) NOT NULL COMMENT '请求参数指纹，同键异参返回409',
+  fingerprint VARCHAR(512) NOT NULL COMMENT '请求参数指纹（JSON数组结构化序列化，防分隔符碰撞），同键异参返回409',
   response_body CLOB NOT NULL COMMENT '成功响应快照（JSON），用于同键同参重放',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   PRIMARY KEY (request_id)

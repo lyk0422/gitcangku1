@@ -23,10 +23,12 @@ public class TaskRepository {
         String firstResult = rs.getString("first_result");
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                (Integer) rs.getObject("target_index"), (Integer) rs.getObject("proof_index"));
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result,"
+            + " target_index, proof_index";
 
     private final JdbcTemplate jdbc;
 
@@ -34,14 +36,16 @@ public class TaskRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(long releaseId, String deviceId) {
+    public long insert(long releaseId, String deviceId, Integer targetIndex) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rollout_task (release_id, device_id, status) VALUES (?, ?, 'PENDING')",
+                    "INSERT INTO rollout_task (release_id, device_id, status, target_index)"
+                            + " VALUES (?, ?, 'PENDING', ?)",
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            ps.setObject(3, targetIndex);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -62,9 +66,13 @@ public class TaskRepository {
                 MAPPER, releaseId, deviceId).stream().findFirst();
     }
 
-    public void complete(long id, ReceiptResult result) {
-        jdbc.update("UPDATE rollout_task SET status = ?, first_result = ?, updated_at = CURRENT_TIMESTAMP"
-                + " WHERE id = ?", result.name(), result.name(), id);
+    /**
+     * 首次回执终结任务；proofIndex 为 SUCCESS 时写入的安装证据索引（与冻结目标一致），FAILED 为 null。
+     */
+    public void complete(long id, ReceiptResult result, Integer proofIndex) {
+        jdbc.update("UPDATE rollout_task SET status = ?, first_result = ?, proof_index = ?,"
+                        + " updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                result.name(), result.name(), proofIndex, id);
     }
 
     public int cancelPendingByRelease(long releaseId) {
