@@ -59,3 +59,46 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
 );
+
+-- 越限观测当前状态表：新类型观测，每条记录一行，version 从 1 开始单调递增。
+CREATE TABLE IF NOT EXISTS excursion_current (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    station_id VARCHAR(64) NOT NULL COMMENT '站号（可编辑字段，参与三方合并）',
+    minute_utc VARCHAR(32) NULL COMMENT 'UTC 整分钟时刻，ISO-8601 原文（YYYY-MM-DDThh:mm:00Z，可编辑字段，参与三方合并）；删除墓碑置 NULL 以释放同站同分钟唯一约束',
+    reading VARCHAR(64) NULL COMMENT '观测读数，十进制字符串，最多三位小数，比较按数值（可编辑字段）；删除墓碑版本无意义',
+    version INT NOT NULL COMMENT '当前版本号，从 1 开始',
+    deleted BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已删除：TRUE 表示当前状态为删除墓碑',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次变更时间（服务器时区）',
+    PRIMARY KEY (observation_id),
+    -- 同站同分钟唯一；墓碑行 minute_utc 为 NULL，不占用该约束（H2/MySQL 唯一键均允许多个 NULL）。
+    UNIQUE (station_id, minute_utc)
+);
+
+-- 越限观测版本快照表：每次成功变更（创建/合并/删除）追加一行完整快照，历史永不删除。
+CREATE TABLE IF NOT EXISTS excursion_version (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    version INT NOT NULL COMMENT '版本号，从 1 开始，与 excursion_current.version 对应',
+    station_id VARCHAR(64) NULL COMMENT '该版本站号快照；删除墓碑版本为 NULL',
+    minute_utc VARCHAR(32) NULL COMMENT '该版本 UTC 整分钟时刻快照（ISO-8601 原文）；删除墓碑版本为 NULL',
+    reading VARCHAR(64) NULL COMMENT '该版本观测读数快照（十进制字符串原文）；删除墓碑版本为 NULL',
+    deleted BOOLEAN NOT NULL COMMENT '该版本是否为删除墓碑：TRUE 时业务字段无意义',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '该版本生成时间（服务器时区）',
+    PRIMARY KEY (observation_id, version)
+);
+
+-- 越限区间分析结果表：生成后冻结，永不更新或删除；后续观测更正只影响新分析。
+CREATE TABLE IF NOT EXISTS excursion_analysis (
+    analysis_id VARCHAR(64) NOT NULL COMMENT '分析结果唯一标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '生成该分析的请求标识（requestId），全局唯一',
+    station_id VARCHAR(64) NOT NULL COMMENT '被分析观测的共同站号',
+    threshold_h VARCHAR(64) NOT NULL COMMENT '越限阈值 H（十进制字符串原文，最多三位小数），严格大于才算越限',
+    consecutive_minutes INT NOT NULL COMMENT '连续分钟数 N，取值 2 至 5',
+    reference_count INT NOT NULL COMMENT '引用观测条数，1 至 20',
+    references_json VARCHAR(4000) NOT NULL COMMENT '引用快照（JSON 数组原文）：observationId/version/minuteUtc/reading，按时刻升序',
+    intervals_json VARCHAR(4000) NOT NULL COMMENT '越限区间（JSON 数组原文）：startUtc/endUtc，左闭右开，可能为空数组',
+    operator VARCHAR(128) NOT NULL COMMENT '提交分析的操作者标识',
+    created_at_utc VARCHAR(32) NOT NULL COMMENT '分析生成时刻（UTC，ISO-8601）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (analysis_id),
+    UNIQUE (request_id)
+);
