@@ -26,14 +26,15 @@ public class EvidenceRepository {
     }
 
     /**
-     * 插入新证物，初始状态 SEALED，保管人为入库操作人。
+     * 插入新证物，初始状态 SEALED，保管人为入库操作人，版本初始为 1。
      */
     public void insert(String evidenceKey, String caseKey, String category, String sealNo,
                        String custodianId, LocalDateTime now) {
         jdbc.update("""
                         INSERT INTO evidence
-                            (evidence_key, case_key, category, seal_no, custodian_id, status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (evidence_key, case_key, category, seal_no, custodian_id, status,
+                             version, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
                         """,
                 evidenceKey, caseKey, category, sealNo, custodianId,
                 EvidenceStatus.SEALED.name(), now, now);
@@ -58,22 +59,50 @@ public class EvidenceRepository {
     }
 
     /**
-     * 更新证物状态与保管人（交接接受时原子切换保管人）。
+     * 更新证物状态与保管人（交接接受时原子切换保管人），同时推进版本。
      */
     public void updateCustody(String evidenceKey, String custodianId, EvidenceStatus status,
                               LocalDateTime now) {
         jdbc.update(
-                "UPDATE evidence SET custodian_id = ?, status = ?, updated_at = ? WHERE evidence_key = ?",
+                "UPDATE evidence SET custodian_id = ?, status = ?, version = version + 1, updated_at = ?"
+                        + " WHERE evidence_key = ?",
                 custodianId, status.name(), now, evidenceKey);
     }
 
     /**
-     * 仅更新证物状态（交接发起/取消、核验失败）。
+     * 仅更新证物状态（交接发起/取消、核验失败），同时推进版本。
      */
     public void updateStatus(String evidenceKey, EvidenceStatus status, LocalDateTime now) {
         jdbc.update(
-                "UPDATE evidence SET status = ?, updated_at = ? WHERE evidence_key = ?",
+                "UPDATE evidence SET status = ?, version = version + 1, updated_at = ? WHERE evidence_key = ?",
                 status.name(), now, evidenceKey);
+    }
+
+    /**
+     * 合并时推进主号版本：仅当当前版本等于期望版本时生效（调用前必须已锁定证物行）。
+     *
+     * @return 是否成功推进（false 表示版本已被并发改变）
+     */
+    public boolean advanceVersion(String evidenceKey, long expectedVersion, LocalDateTime now) {
+        int updated = jdbc.update(
+                "UPDATE evidence SET version = version + 1, updated_at = ?"
+                        + " WHERE evidence_key = ? AND version = ?",
+                now, evidenceKey, expectedVersion);
+        return updated == 1;
+    }
+
+    /**
+     * 合并时将被合并证物转为 ALIAS 并推进版本：仅当当前版本等于期望版本时生效
+     * （调用前必须已锁定证物行）。保管人与业务字段保持不变。
+     *
+     * @return 是否成功转换（false 表示版本已被并发改变）
+     */
+    public boolean markAlias(String evidenceKey, long expectedVersion, LocalDateTime now) {
+        int updated = jdbc.update(
+                "UPDATE evidence SET status = ?, version = version + 1, updated_at = ?"
+                        + " WHERE evidence_key = ? AND version = ?",
+                EvidenceStatus.ALIAS.name(), now, evidenceKey, expectedVersion);
+        return updated == 1;
     }
 
     /**
@@ -96,6 +125,7 @@ public class EvidenceRepository {
                     rs.getString("seal_no"),
                     rs.getString("custodian_id"),
                     EvidenceStatus.valueOf(rs.getString("status")),
+                    rs.getLong("version"),
                     rs.getObject("created_at", LocalDateTime.class),
                     rs.getObject("updated_at", LocalDateTime.class));
         }

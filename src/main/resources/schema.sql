@@ -8,8 +8,9 @@ CREATE TABLE IF NOT EXISTS evidence (
     case_key VARCHAR(64) NOT NULL COMMENT '所属案件键，入库后不可修改',
     category VARCHAR(64) NOT NULL COMMENT '证物类别，入库后不可修改',
     seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库后不可修改',
-    custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变',
-    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）',
+    custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变；合并为别名后不再变化',
+    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态） / ALIAS 已合并为别名（终态，写入口一律拒绝）',
+    version BIGINT NOT NULL DEFAULT 1 COMMENT '乐观锁版本：入库为 1，每次状态/保管人写入及合并均推进 1；合并时需携带期望版本',
     created_at DATETIME(6) NOT NULL COMMENT '入库时间，Asia/Shanghai',
     updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态或保管人变更时间，Asia/Shanghai',
     CONSTRAINT uk_evidence_key UNIQUE (evidence_key)
@@ -65,10 +66,27 @@ CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/MERGE',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
     created_at DATETIME(6) NOT NULL COMMENT '首次执行时间，Asia/Shanghai',
     CONSTRAINT uk_command_key UNIQUE (command_key)
+);
+
+-- 证物合并记录：只追加、不可变。冻结合并时两证物的身份、版本与完整保管链快照；
+-- 后续主号交接/借出不影响此处冻结内容，副号历史仍按原号读取。
+CREATE TABLE IF NOT EXISTS evidence_merge (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    primary_key VARCHAR(64) NOT NULL COMMENT '主号证物业务键（保留身份的一方）',
+    alias_key VARCHAR(64) NOT NULL COMMENT '被合并证物业务键，合并后状态转 ALIAS，全局至多参与一次合并',
+    custodian_id VARCHAR(64) NOT NULL COMMENT '合并时两证物共同的当前保管人（冻结，不随后续交接变化）',
+    primary_version BIGINT NOT NULL COMMENT '合并时主号版本（冻结，为推进前的当前版本）',
+    alias_version BIGINT NOT NULL COMMENT '合并时副号版本（冻结，为推进前的当前版本）',
+    primary_chain TEXT NOT NULL COMMENT '合并时主号完整保管链快照 JSON（冻结，只读）',
+    alias_chain TEXT NOT NULL COMMENT '合并时副号完整保管链快照 JSON（冻结，只读）',
+    merged_by VARCHAR(64) NOT NULL COMMENT '合并操作人（当时的当前保管人）',
+    created_at DATETIME(6) NOT NULL COMMENT '合并时间，Asia/Shanghai',
+    CONSTRAINT uk_merge_alias UNIQUE (alias_key),
+    KEY idx_merge_primary (primary_key)
 );
