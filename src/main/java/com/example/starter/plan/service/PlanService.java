@@ -1,12 +1,15 @@
 package com.example.starter.plan.service;
 
 import com.example.starter.plan.model.DayPlan;
+import com.example.starter.plan.model.Direction;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.model.SectionConfig;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
+import com.example.starter.plan.repo.SectionConfigRepository;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
@@ -19,9 +22,6 @@ import com.example.starter.plan.web.dto.RescheduleRequest;
 import com.example.starter.plan.web.dto.RescheduleResponse;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
@@ -60,13 +60,16 @@ public class PlanService {
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
+    private final SectionConfigRepository configRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+                       SectionConfigRepository configRepo,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
+        this.configRepo = configRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
     }
@@ -113,6 +116,11 @@ public class PlanService {
             return tx.execute(status -> {
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
+                // 行锁内复查：并发同键更新在首次提交后进入时直接重放
+                Optional<PlanResponse> replayed = replayIfPresent(OP_UPDATE, req.requestKey(), hash);
+                if (replayed.isPresent()) {
+                    return replayed.get();
+                }
                 if (plan.status() != PlanStatus.DRAFT) {
                     throw conflict("PLAN_STATE_CONFLICT",
                             "仅草稿可修改占用，当前状态: " + plan.status());
@@ -135,8 +143,9 @@ public class PlanService {
     }
 
     /**
-     * 发布计划：全局发布锁内原子校验本计划列车重叠与跨计划区段重叠，
-     * 任一冲突则整张计划保持草稿并抛出 422（携带冲突区段与计划）。
+     * 发布计划：全局发布锁内原子校验本计划列车重叠、跨计划区段互斥与单线区段换向间隔，
+     * 任一冲突则整张计划保持草稿并抛出 422（不写任何占用）；
+     * 成功时冻结各配置区段的方向与配置版本。
      */
     public PlanResponse publish(String scheduleKey, String requestKey) {
         String hash = hashAction(OP_PUBLISH, scheduleKey);
@@ -147,6 +156,11 @@ public class PlanService {
         try {
             return tx.execute(status -> {
                 planRepo.acquirePublishLock();
+                // 串行边界内复查：并发同键发布在首次提交后进入时直接重放
+                Optional<PlanResponse> replayed = replayIfPresent(OP_PUBLISH, requestKey, hash);
+                if (replayed.isPresent()) {
+                    return replayed.get();
+                }
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.DRAFT) {
@@ -154,14 +168,16 @@ public class PlanService {
                             "仅草稿可发布，当前状态: " + plan.status());
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(plan.id());
+                Map<String, SectionConfig> configs = loadConfigs(occupancies);
                 List<Map<String, Object>> conflicts = new ArrayList<>();
                 conflicts.addAll(findTrainOverlaps(scheduleKey, occupancies));
-                conflicts.addAll(findSectionConflicts(plan, occupancies, List.of(plan.id())));
+                conflicts.addAll(findSectionConflicts(plan, occupancies, List.of(plan.id()), configs));
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
                 long now = System.currentTimeMillis();
+                freezeClearanceVersions(plan.id(), occupancies, configs);
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
@@ -173,7 +189,8 @@ public class PlanService {
     }
 
     /**
-     * 取消已发布计划：时隙立即释放，历史计划与占用保留不改写。
+     * 取消已发布计划：时隙立即释放，历史计划与占用（含冻结的方向与配置版本）保留不改写。
+     * 与发布、改签、配置更新共用同一全局串行边界。
      */
     public PlanResponse cancel(String scheduleKey, String requestKey) {
         String hash = hashAction(OP_CANCEL, scheduleKey);
@@ -183,6 +200,12 @@ public class PlanService {
         }
         try {
             return tx.execute(status -> {
+                planRepo.acquirePublishLock();
+                // 串行边界内复查：并发同键取消在首次提交后进入时直接重放
+                Optional<PlanResponse> replayed = replayIfPresent(OP_CANCEL, requestKey, hash);
+                if (replayed.isPresent()) {
+                    return replayed.get();
+                }
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.PUBLISHED) {
@@ -218,6 +241,13 @@ public class PlanService {
         try {
             return tx.execute(status -> {
                 planRepo.acquirePublishLock();
+                // 串行边界内复查：并发同键改签在首次提交后进入时直接重放
+                Optional<RescheduleResponse> replayed =
+                        replayIfPresent(OP_RESCHEDULE, req.requestKey(), hash,
+                                RescheduleResponse.class);
+                if (replayed.isPresent()) {
+                    return replayed.get();
+                }
                 DayPlan oldPlan = planRepo.findByKeyForUpdate(oldScheduleKey)
                         .orElseThrow(() -> notFound(oldScheduleKey));
                 DayPlan newPlan = planRepo.findByKeyForUpdate(req.newScheduleKey())
@@ -251,17 +281,20 @@ public class PlanService {
                     throw conflict("LINK_CONFLICT", "新计划已存在直接前驱: " + req.newScheduleKey());
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(newPlan.id());
+                Map<String, SectionConfig> configs = loadConfigs(occupancies);
                 List<Map<String, Object>> conflicts = new ArrayList<>();
                 conflicts.addAll(findTrainOverlaps(req.newScheduleKey(), occupancies));
-                // 仅排除旧计划与自身占用，第三方已发布计划照常参与冲突裁决
+                // 移除旧计划占用后，对改签后全部相邻对重新裁决；仅排除新旧两个计划，
+                // 第三方已发布计划照常参与冲突裁决
                 conflicts.addAll(findSectionConflicts(newPlan, occupancies,
-                        List.of(newPlan.id(), oldPlan.id())));
+                        List.of(newPlan.id(), oldPlan.id()), configs));
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "新草稿存在时隙冲突，改签未生效", conflicts);
                 }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
+                freezeClearanceVersions(newPlan.id(), occupancies, configs);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
                 RescheduleResponse response = new RescheduleResponse(
@@ -329,7 +362,7 @@ public class PlanService {
     public List<PublishedSlotView> getPublishedSlots(LocalDate opDate, String sectionId) {
         return planRepo.findPublishedSlots(opDate, List.of(sectionId), List.of(-1L)).stream()
                 .map(s -> new PublishedSlotView(s.scheduleKey(), s.trainNo(), s.sectionId(),
-                        s.startUtc(), s.endUtc()))
+                        s.startUtc(), s.endUtc(), s.direction()))
                 .toList();
     }
 
@@ -339,7 +372,8 @@ public class PlanService {
         DayPlan plan = planRepo.findByKey(scheduleKey)
                 .orElseThrow(() -> notFound(scheduleKey));
         List<OccupancyView> views = planRepo.findOccupancies(plan.id()).stream()
-                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
+                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc(),
+                        o.direction(), o.clearanceVersion()))
                 .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
                 plan.status().name(), views);
@@ -349,7 +383,8 @@ public class PlanService {
         List<Occupancy> result = new ArrayList<>(requests.size());
         for (int i = 0; i < requests.size(); i++) {
             OccupancyRequest r = requests.get(i);
-            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.startUtc(), r.endUtc()));
+            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(),
+                    r.startUtc(), r.endUtc(), r.direction(), null));
         }
         return result;
     }
@@ -416,24 +451,76 @@ public class PlanService {
     }
 
     /**
-     * 与其他已发布计划在同日期、同区段上的重叠检测（左闭右开，相邻合法）。
+     * 加载候选占用涉及区段的单线换向配置（未配置的区段不在结果中）。
+     */
+    private Map<String, SectionConfig> loadConfigs(List<Occupancy> occupancies) {
+        List<String> sectionIds = occupancies.stream()
+                .map(Occupancy::sectionId)
+                .collect(java.util.stream.Collectors.toCollection(TreeSet::new))
+                .stream().toList();
+        return configRepo.findBySectionIds(sectionIds);
+    }
+
+    /**
+     * 发布/改签成功时，冻结候选计划在各配置区段上的配置版本。
+     */
+    private void freezeClearanceVersions(long planId, List<Occupancy> occupancies,
+                                         Map<String, SectionConfig> configs) {
+        occupancies.stream()
+                .map(Occupancy::sectionId)
+                .distinct()
+                .forEach(sectionId -> {
+                    SectionConfig config = configs.get(sectionId);
+                    if (config != null) {
+                        planRepo.freezeClearanceVersion(planId, sectionId, config.version());
+                    }
+                });
+    }
+
+    /**
+     * 与其他已发布计划在同日期、同区段上的冲突检测（左闭右开，相邻合法）。
+     * 未配置区段仅做候选与已发布的原互斥检测；已配置单线区段把已发布与候选占用
+     * 合并排序后逐相邻对裁决：任意方向重叠即互斥冲突，相邻反向对要求
+     * 后者开始减前者结束不小于配置的整秒清空间隔，候选内部同样检查。
      *
      * @param excludePlanIds 检测时排除的计划 id（发布为自身；改签为新旧两个计划）
      */
     private List<Map<String, Object>> findSectionConflicts(DayPlan plan, List<Occupancy> occupancies,
-                                                           List<Long> excludePlanIds) {
+                                                           List<Long> excludePlanIds,
+                                                           Map<String, SectionConfig> configs) {
         List<String> sectionIds = occupancies.stream()
                 .map(Occupancy::sectionId)
                 .collect(java.util.stream.Collectors.toCollection(TreeSet::new))
                 .stream().toList();
         List<PublishedSlot> published = planRepo.findPublishedSlots(plan.opDate(), sectionIds,
                 excludePlanIds);
+        Map<String, List<PublishedSlot>> publishedBySection = new LinkedHashMap<>();
+        for (PublishedSlot slot : published) {
+            publishedBySection.computeIfAbsent(slot.sectionId(), k -> new ArrayList<>()).add(slot);
+        }
         List<Map<String, Object>> conflicts = new ArrayList<>();
-        for (Occupancy o : occupancies) {
-            for (PublishedSlot slot : published) {
-                if (!o.sectionId().equals(slot.sectionId())) {
-                    continue;
-                }
+        for (String sectionId : sectionIds) {
+            List<Occupancy> candidate = occupancies.stream()
+                    .filter(o -> o.sectionId().equals(sectionId)).toList();
+            List<PublishedSlot> others = publishedBySection.getOrDefault(sectionId, List.of());
+            SectionConfig config = configs.get(sectionId);
+            if (config == null) {
+                conflicts.addAll(findMutualExclusions(plan, candidate, others));
+            } else {
+                conflicts.addAll(findClearanceConflicts(plan, candidate, others, config));
+            }
+        }
+        return conflicts;
+    }
+
+    /**
+     * 未配置区段的原互斥：候选与已发布占用重叠（左闭右开）即冲突。
+     */
+    private List<Map<String, Object>> findMutualExclusions(DayPlan plan, List<Occupancy> candidate,
+                                                           List<PublishedSlot> others) {
+        List<Map<String, Object>> conflicts = new ArrayList<>();
+        for (Occupancy o : candidate) {
+            for (PublishedSlot slot : others) {
                 boolean overlap = o.startUtc().isBefore(slot.endUtc())
                         && slot.startUtc().isBefore(o.endUtc());
                 if (overlap) {
@@ -450,6 +537,87 @@ public class PlanService {
             }
         }
         return conflicts;
+    }
+
+    /**
+     * 已配置单线区段的合并裁决：已发布与候选占用统一排序后逐相邻对检查。
+     * 任一占用缺方向先报 DIRECTION_MISSING；相邻对重叠报 SECTION_CONFLICT；
+     * 相邻反向对间隔不足报 CLEARANCE_INSUFFICIENT（携带实际秒数与要求值）。
+     */
+    private List<Map<String, Object>> findClearanceConflicts(DayPlan plan,
+                                                             List<Occupancy> candidate,
+                                                             List<PublishedSlot> others,
+                                                             SectionConfig config) {
+        List<Map<String, Object>> conflicts = new ArrayList<>();
+        List<SlotView> merged = new ArrayList<>(candidate.size() + others.size());
+        for (Occupancy o : candidate) {
+            merged.add(new SlotView(plan.scheduleKey(), o.trainNo(), o.direction(),
+                    o.startUtc(), o.endUtc()));
+        }
+        for (PublishedSlot s : others) {
+            merged.add(new SlotView(s.scheduleKey(), s.trainNo(), s.direction(),
+                    s.startUtc(), s.endUtc()));
+        }
+        // 旧无方向占用参与配置区段无法裁决，先报方向缺失，不再猜测方向
+        boolean directionMissing = false;
+        for (SlotView view : merged) {
+            if (view.direction() == null) {
+                directionMissing = true;
+                Map<String, Object> detail = new LinkedHashMap<>();
+                detail.put("type", "DIRECTION_MISSING");
+                detail.put("sectionId", config.sectionId());
+                detail.put("scheduleKey", view.scheduleKey());
+                detail.put("trainNo", view.trainNo());
+                conflicts.add(detail);
+            }
+        }
+        if (directionMissing) {
+            return conflicts;
+        }
+        merged.sort(Comparator.comparing(SlotView::startUtc).thenComparing(SlotView::endUtc));
+        SlotView predecessor = null;
+        for (SlotView current : merged) {
+            if (predecessor != null) {
+                if (current.startUtc().isBefore(predecessor.endUtc())) {
+                    Map<String, Object> detail = new LinkedHashMap<>();
+                    detail.put("type", "SECTION_CONFLICT");
+                    detail.put("sectionId", config.sectionId());
+                    detail.put("scheduleKey", current.scheduleKey());
+                    detail.put("conflictingScheduleKey", predecessor.scheduleKey());
+                    detail.put("trainNo", current.trainNo());
+                    detail.put("startUtc", current.startUtc().toString());
+                    detail.put("endUtc", current.endUtc().toString());
+                    conflicts.add(detail);
+                } else if (current.direction() != predecessor.direction()) {
+                    long actualSeconds = (current.startUtc().toEpochMilli()
+                            - predecessor.endUtc().toEpochMilli()) / 1000;
+                    if (actualSeconds < config.clearanceSeconds()) {
+                        Map<String, Object> detail = new LinkedHashMap<>();
+                        detail.put("type", "CLEARANCE_INSUFFICIENT");
+                        detail.put("sectionId", config.sectionId());
+                        detail.put("scheduleKey", current.scheduleKey());
+                        detail.put("conflictingScheduleKey", predecessor.scheduleKey());
+                        detail.put("trainNo", current.trainNo());
+                        detail.put("startUtc", current.startUtc().toString());
+                        detail.put("endUtc", current.endUtc().toString());
+                        detail.put("actualSeconds", actualSeconds);
+                        detail.put("requiredSeconds", config.clearanceSeconds());
+                        conflicts.add(detail);
+                    }
+                }
+            }
+            if (predecessor == null || current.endUtc().isAfter(predecessor.endUtc())) {
+                predecessor = current;
+            }
+        }
+        return conflicts;
+    }
+
+    /**
+     * 合并裁决用的统一占用视图（候选与已发布）。
+     */
+    private record SlotView(String scheduleKey, String trainNo, Direction direction,
+                            Instant startUtc, Instant endUtc) {
     }
 
     /**
@@ -482,48 +650,55 @@ public class PlanService {
     }
 
     private String hashCreate(CreatePlanRequest req) {
-        StringBuilder sb = new StringBuilder(OP_CREATE).append('\n')
-                .append(req.scheduleKey()).append('\n').append(req.opDate());
-        appendOccupancies(sb, req.occupancies());
-        return sha256(sb.toString());
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("op", OP_CREATE);
+        identity.put("scheduleKey", req.scheduleKey());
+        identity.put("opDate", req.opDate().toString());
+        identity.put("occupancies", occupancyIdentities(req.occupancies()));
+        return RequestIdentities.hash(objectMapper, identity);
     }
 
     private String hashUpdate(String scheduleKey, UpdateOccupanciesRequest req) {
-        StringBuilder sb = new StringBuilder(OP_UPDATE).append('\n')
-                .append(scheduleKey).append('\n').append(req.expectedVersion());
-        appendOccupancies(sb, req.occupancies());
-        return sha256(sb.toString());
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("op", OP_UPDATE);
+        identity.put("scheduleKey", scheduleKey);
+        identity.put("expectedVersion", req.expectedVersion());
+        identity.put("occupancies", occupancyIdentities(req.occupancies()));
+        return RequestIdentities.hash(objectMapper, identity);
     }
 
     private String hashAction(String opType, String scheduleKey) {
-        return sha256(opType + '\n' + scheduleKey);
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("op", opType);
+        identity.put("scheduleKey", scheduleKey);
+        return RequestIdentities.hash(objectMapper, identity);
     }
 
     private String hashReschedule(String oldScheduleKey, RescheduleRequest req) {
-        return sha256(OP_RESCHEDULE + '\n' + oldScheduleKey + '\n' + req.newScheduleKey()
-                + '\n' + req.expectedOldVersion() + '\n' + req.expectedNewVersion());
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("op", OP_RESCHEDULE);
+        identity.put("oldScheduleKey", oldScheduleKey);
+        identity.put("newScheduleKey", req.newScheduleKey());
+        identity.put("expectedOldVersion", req.expectedOldVersion());
+        identity.put("expectedNewVersion", req.expectedNewVersion());
+        return RequestIdentities.hash(objectMapper, identity);
     }
 
-    private void appendOccupancies(StringBuilder sb, List<OccupancyRequest> occupancies) {
+    /**
+     * 占用清单的结构化身份：逐条字段独立成键，避免分隔符拼接碰撞。
+     */
+    private List<Map<String, Object>> occupancyIdentities(List<OccupancyRequest> occupancies) {
+        List<Map<String, Object>> result = new ArrayList<>(occupancies.size());
         for (OccupancyRequest o : occupancies) {
-            sb.append('\n').append(o.trainNo()).append('|').append(o.sectionId()).append('|')
-                    .append(o.startUtc().toEpochMilli()).append('|').append(o.endUtc().toEpochMilli());
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("trainNo", o.trainNo());
+            item.put("sectionId", o.sectionId());
+            item.put("startUtc", o.startUtc().toEpochMilli());
+            item.put("endUtc", o.endUtc().toEpochMilli());
+            item.put("direction", o.direction() == null ? null : o.direction().name());
+            result.add(item);
         }
-    }
-
-    private String sha256(String text) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hashed = digest.digest(text.getBytes(StandardCharsets.UTF_8));
-            StringBuilder hex = new StringBuilder(hashed.length * 2);
-            for (byte b : hashed) {
-                hex.append(Character.forDigit((b >> 4) & 0xF, 16));
-                hex.append(Character.forDigit(b & 0xF, 16));
-            }
-            return hex.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
-        }
+        return result;
     }
 
     private String toJson(Object response) {

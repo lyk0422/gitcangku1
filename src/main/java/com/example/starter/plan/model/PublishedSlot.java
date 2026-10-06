@@ -10,7 +10,8 @@ import java.time.Instant;
  * @param sectionId   区段 ID
  * @param startUtc    占用开始（含），UTC
  * @param endUtc      占用结束（不含），UTC
+ * @param direction   行车方向；null 表示未指定（旧无方向占用）
  */
 public record PublishedSlot(String scheduleKey, String trainNo, String sectionId,
-                            Instant startUtc, Instant endUtc) {
+                            Instant startUtc, Instant endUtc, Direction direction) {
 }

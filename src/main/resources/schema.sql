@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS rail_plan_occupancy (
     section_id VARCHAR(64) NOT NULL,
     start_utc BIGINT NOT NULL,
     end_utc BIGINT NOT NULL,
+    direction VARCHAR(8) DEFAULT NULL,
+    clearance_version INT DEFAULT NULL,
     PRIMARY KEY (id)
 );
 COMMENT ON TABLE rail_plan_occupancy IS '计划区段占用明细，区间左闭右开；取消计划后历史占用保留不删除';
@@ -39,6 +41,8 @@ COMMENT ON COLUMN rail_plan_occupancy.train_no IS '列车编号';
 COMMENT ON COLUMN rail_plan_occupancy.section_id IS '区段 ID';
 COMMENT ON COLUMN rail_plan_occupancy.start_utc IS '占用开始时刻（含），UTC 毫秒';
 COMMENT ON COLUMN rail_plan_occupancy.end_utc IS '占用结束时刻（不含），UTC 毫秒，必须大于 start_utc';
+COMMENT ON COLUMN rail_plan_occupancy.direction IS '行车方向：FORWARD 正向 / REVERSE 反向；NULL 表示未指定（旧无方向占用），配置区段发布时必填';
+COMMENT ON COLUMN rail_plan_occupancy.clearance_version IS '发布成功时冻结的单线区段配置版本；NULL 表示该区段未配置或计划未发布';
 CREATE INDEX IF NOT EXISTS idx_rail_plan_occupancy_plan ON rail_plan_occupancy (plan_id);
 CREATE INDEX IF NOT EXISTS idx_rail_plan_occupancy_section ON rail_plan_occupancy (section_id, start_utc, end_utc);
 
@@ -74,6 +78,24 @@ COMMENT ON COLUMN rail_plan_reschedule_link.id IS '主键';
 COMMENT ON COLUMN rail_plan_reschedule_link.predecessor_plan_id IS '直接前驱（被改签取消的旧计划）id，关联 rail_day_plan.id，全表唯一';
 COMMENT ON COLUMN rail_plan_reschedule_link.successor_plan_id IS '直接后继（改签发布的新计划）id，关联 rail_day_plan.id，全表唯一';
 COMMENT ON COLUMN rail_plan_reschedule_link.created_at IS '关联创建时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_section_config (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    section_id VARCHAR(64) NOT NULL,
+    clearance_seconds INT NOT NULL,
+    version INT NOT NULL,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_rail_section_config_section UNIQUE (section_id)
+);
+COMMENT ON TABLE rail_section_config IS '单线区段换向配置：相邻反向占用要求整秒清空间隔，版本从 1 起';
+COMMENT ON COLUMN rail_section_config.id IS '主键';
+COMMENT ON COLUMN rail_section_config.section_id IS '单线区段 ID，全局唯一';
+COMMENT ON COLUMN rail_section_config.clearance_seconds IS '换向清空间隔，整秒，范围 1 至 600；相邻反向占用要求后者开始减前者结束不小于该值';
+COMMENT ON COLUMN rail_section_config.version IS '配置版本，从 1 起，每次更新加一；更新须携带 expectedVersion';
+COMMENT ON COLUMN rail_section_config.created_at IS '创建时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_section_config.updated_at IS '最近变更时刻，UTC 毫秒';
 
 CREATE TABLE IF NOT EXISTS publish_lock (
     id INT NOT NULL,

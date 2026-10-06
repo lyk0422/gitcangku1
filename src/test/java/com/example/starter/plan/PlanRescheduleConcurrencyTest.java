@@ -163,7 +163,7 @@ class PlanRescheduleConcurrencyTest {
     private void createDraft(String scheduleKey, String section, int startHour, int endHour) {
         service.createDraft(new CreatePlanRequest(key("REQ"), scheduleKey, DAY,
                 List.of(new OccupancyRequest("G-" + UUID.randomUUID(), section,
-                        at(startHour), at(endHour)))));
+                        at(startHour), at(endHour), null))));
     }
 
     private List<Outcome> runConcurrently(List<Callable<Outcome>> tasks) throws Exception {

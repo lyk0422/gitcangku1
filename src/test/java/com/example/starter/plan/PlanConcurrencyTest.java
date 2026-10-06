@@ -211,7 +211,7 @@ class PlanConcurrencyTest {
 
     private static OccupancyRequest occ(String section, int startHour, int endHour) {
         return new OccupancyRequest("G-" + UUID.randomUUID(), section,
-                at(startHour), at(endHour));
+                at(startHour), at(endHour), null);
     }
 
     private static Instant at(int hour) {

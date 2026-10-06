@@ -1,6 +1,8 @@
 package com.example.starter.plan.repo;
 
+import com.example.starter.plan.model.DatedSlot;
 import com.example.starter.plan.model.DayPlan;
+import com.example.starter.plan.model.Direction;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
@@ -41,7 +43,9 @@ public class PlanRepository {
             rs.getString("train_no"),
             rs.getString("section_id"),
             Instant.ofEpochMilli(rs.getLong("start_utc")),
-            Instant.ofEpochMilli(rs.getLong("end_utc")));
+            Instant.ofEpochMilli(rs.getLong("end_utc")),
+            rs.getString("direction") == null ? null : Direction.valueOf(rs.getString("direction")),
+            rs.getObject("clearance_version", Integer.class));
 
     private static final RowMapper<RescheduleLink> LINK_MAPPER = (rs, n) -> new RescheduleLink(
             rs.getLong("id"),
@@ -111,12 +115,12 @@ public class PlanRepository {
     }
 
     /**
-     * 批量插入占用。
+     * 批量插入占用。direction 可空（旧无方向占用）；clearance_version 发布时冻结，插入时为 null。
      */
     public void insertOccupancies(long planId, List<Occupancy> occupancies) {
         jdbc.batchUpdate(
-                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, start_utc, end_utc)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, start_utc,"
+                        + " end_utc, direction) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 occupancies, occupancies.size(),
                 (ps, o) -> {
                     ps.setLong(1, planId);
@@ -125,6 +129,7 @@ public class PlanRepository {
                     ps.setString(4, o.sectionId());
                     ps.setLong(5, o.startUtc().toEpochMilli());
                     ps.setLong(6, o.endUtc().toEpochMilli());
+                    ps.setString(7, o.direction() == null ? null : o.direction().name());
                 });
     }
 
@@ -132,9 +137,19 @@ public class PlanRepository {
      * 查询计划占用，按计划内序号升序。
      */
     public List<Occupancy> findOccupancies(long planId) {
-        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc"
+        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc,"
+                        + " direction, clearance_version"
                         + " FROM rail_plan_occupancy WHERE plan_id = ? ORDER BY seq",
                 OCCUPANCY_MAPPER, planId);
+    }
+
+    /**
+     * 发布成功时冻结指定计划、指定区段占用的配置版本（仅更新尚未冻结的行）。
+     */
+    public void freezeClearanceVersion(long planId, String sectionId, int clearanceVersion) {
+        jdbc.update("UPDATE rail_plan_occupancy SET clearance_version = ?"
+                        + " WHERE plan_id = ? AND section_id = ?",
+                clearanceVersion, planId, sectionId);
     }
 
     /**
@@ -164,7 +179,7 @@ public class PlanRepository {
         StringJoiner sectionPlaceholders = new StringJoiner(", ");
         sectionIds.forEach(s -> sectionPlaceholders.add("?"));
         StringBuilder sql = new StringBuilder(
-                "SELECT p.schedule_key, o.train_no, o.section_id, o.start_utc, o.end_utc"
+                "SELECT p.schedule_key, o.train_no, o.section_id, o.start_utc, o.end_utc, o.direction"
                         + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
                         + " WHERE p.status = 'PUBLISHED' AND p.op_date = ?");
         List<Object> args = new ArrayList<>();
@@ -183,7 +198,30 @@ public class PlanRepository {
                 rs.getString("train_no"),
                 rs.getString("section_id"),
                 Instant.ofEpochMilli(rs.getLong("start_utc")),
-                Instant.ofEpochMilli(rs.getLong("end_utc"))), args.toArray());
+                Instant.ofEpochMilli(rs.getLong("end_utc")),
+                rs.getString("direction") == null ? null : Direction.valueOf(rs.getString("direction"))),
+                args.toArray());
+    }
+
+    /**
+     * 查询某区段上全部已发布计划的生效占用（跨运营日），按运营日与开始时刻升序；
+     * 用于单线区段配置创建/更新时校验当前已发布集合。
+     */
+    public List<DatedSlot> findPublishedSlotsBySection(String sectionId) {
+        return jdbc.query(
+                "SELECT p.op_date, p.schedule_key, o.train_no, o.direction, o.start_utc, o.end_utc"
+                        + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND o.section_id = ?"
+                        + " ORDER BY p.op_date, o.start_utc",
+                (rs, n) -> new DatedSlot(
+                        rs.getObject("op_date", LocalDate.class),
+                        rs.getString("schedule_key"),
+                        rs.getString("train_no"),
+                        rs.getString("direction") == null ? null
+                                : Direction.valueOf(rs.getString("direction")),
+                        Instant.ofEpochMilli(rs.getLong("start_utc")),
+                        Instant.ofEpochMilli(rs.getLong("end_utc"))),
+                sectionId);
     }
 
     /**
