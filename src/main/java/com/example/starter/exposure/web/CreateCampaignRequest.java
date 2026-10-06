@@ -6,6 +6,8 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
 
+import java.util.List;
+
 /**
  * 创建公告请求。额度均为 1～100000 的整数，创建后固定。
  *
@@ -13,11 +15,18 @@ import jakarta.validation.constraints.Size;
  * @param campaignId          公告编号，全局唯一
  * @param dailyTotalCap       每 UTC 日总额度，单位次
  * @param perVisitorDailyCap  每访客每 UTC 日上限，单位次
+ * @param creativeIds         有序轮换创意编号（2~5 个）；缺省或空列表表示不支持轮换申请
  */
 public record CreateCampaignRequest(
         @NotBlank @Size(max = 64) String requestId,
         @NotBlank @Size(max = 64) String campaignId,
         @NotNull @Min(1) @Max(100_000) Integer dailyTotalCap,
-        @NotNull @Min(1) @Max(100_000) Integer perVisitorDailyCap
+        @NotNull @Min(1) @Max(100_000) Integer perVisitorDailyCap,
+        @Size(min = 2, max = 5) List<@NotBlank @Size(max = 64) String> creativeIds
 ) {
+    /** 兼容无轮换创意的创建请求。 */
+    public CreateCampaignRequest(String requestId, String campaignId,
+                                 Integer dailyTotalCap, Integer perVisitorDailyCap) {
+        this(requestId, campaignId, dailyTotalCap, perVisitorDailyCap, null);
+    }
 }
