@@ -79,6 +79,33 @@ public class RaceController {
         return toResponse(raceService.submitTiming(raceId, bib, request));
     }
 
+    /** 登记三源检查点传感器读数（修订号初始1）。 */
+    @PostMapping("/{raceId}/runners/{bib}/sensor-readings")
+    public ResponseEntity<Object> submitSensorReading(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody SubmitSensorReadingRequest request) {
+        return toResponse(raceService.submitSensorReading(raceId, bib, request));
+    }
+
+    /** 修订三源检查点传感器读数（携带赛事版本与读数修订号）。 */
+    @PostMapping("/{raceId}/runners/{bib}/sensor-revisions")
+    public ResponseEntity<Object> reviseSensorReading(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody ReviseSensorReadingRequest request) {
+        return toResponse(raceService.reviseSensorReading(raceId, bib, request));
+    }
+
+    /** 对三源检查点显式裁定：共识达成取中位值写入原分段计时。 */
+    @PostMapping("/{raceId}/runners/{bib}/adjudications")
+    public ResponseEntity<Object> adjudicate(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody AdjudicateRequest request) {
+        return toResponse(raceService.adjudicate(raceId, bib, request));
+    }
+
     /** 封榜。 */
     @PostMapping("/{raceId}/seal")
     public ResponseEntity<Object> sealRace(

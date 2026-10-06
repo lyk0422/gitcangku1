@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS checkpoint (
     race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID；未配置检查点的赛事无任何行',
     checkpoint_code VARCHAR(64) NOT NULL COMMENT '检查点代码，同一赛事内唯一',
     position INT NOT NULL COMMENT '检查点顺序，从1连续递增，配置后不可修改',
+    three_source BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否启用三源计时共识：FALSE-单条计时入口，TRUE-须登记三个不同传感器读数并显式裁定',
     created_at BIGINT NOT NULL COMMENT '配置时间，Unix毫秒时间戳',
     CONSTRAINT pk_checkpoint PRIMARY KEY (race_id, checkpoint_code),
     CONSTRAINT uk_checkpoint_position UNIQUE (race_id, position),
@@ -91,13 +92,57 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     position INT NOT NULL COMMENT '检查点顺序，从1递增',
     elapsed_millis BIGINT COMMENT '封榜时该选手通过该检查点的累计耗时（毫秒）；缺失检查点为NULL',
     timing_id VARCHAR(128) COMMENT '分段记录ID；缺失检查点为NULL',
+    adjudication_id VARCHAR(128) COMMENT '三源检查点封榜时冻结的有效裁定ID；非三源点或缺失为NULL',
     CONSTRAINT pk_snapshot_checkpoint PRIMARY KEY (race_id, bib, checkpoint_code),
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS sensor_reading (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    checkpoint_code VARCHAR(64) NOT NULL COMMENT '启用三源模式的检查点代码',
+    sensor_id VARCHAR(64) NOT NULL COMMENT '传感器ID；同一选手同一检查点下唯一，最多三个不同传感器',
+    elapsed_millis BIGINT NOT NULL COMMENT '该传感器上报的累计耗时（毫秒，1~86400000）',
+    revision INT NOT NULL COMMENT '读数修订号，初始1，每次修订加一',
+    created_at BIGINT NOT NULL COMMENT '首次登记时间，Unix毫秒时间戳',
+    updated_at BIGINT NOT NULL COMMENT '最近一次修订时间，Unix毫秒时间戳',
+    CONSTRAINT pk_sensor_reading PRIMARY KEY (race_id, bib, checkpoint_code, sensor_id),
+    CONSTRAINT fk_reading_checkpoint FOREIGN KEY (race_id, checkpoint_code) REFERENCES checkpoint (race_id, checkpoint_code),
+    CONSTRAINT fk_reading_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_reading_point (race_id, bib, checkpoint_code)
+);
+
+CREATE TABLE IF NOT EXISTS adjudication (
+    adjudication_id VARCHAR(128) NOT NULL COMMENT '裁定ID，全局唯一（第二层幂等键）',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    checkpoint_code VARCHAR(64) NOT NULL COMMENT '裁定的三源检查点代码',
+    median_millis BIGINT NOT NULL COMMENT '裁定中位值（毫秒），同时写入原分段计时',
+    basis VARCHAR(1024) NOT NULL COMMENT '裁定时三条当前读数依据的结构化JSON：sensorId/revision/elapsedMillis，历史裁定不覆写',
+    valid BOOLEAN NOT NULL COMMENT '是否当前有效：TRUE-有效，FALSE-读数修订后失效',
+    created_at BIGINT NOT NULL COMMENT '裁定时间，Unix毫秒时间戳',
+    invalidated_at BIGINT COMMENT '失效时间，Unix毫秒时间戳；仍有效为NULL',
+    CONSTRAINT pk_adjudication PRIMARY KEY (adjudication_id),
+    CONSTRAINT fk_adjudication_checkpoint FOREIGN KEY (race_id, checkpoint_code) REFERENCES checkpoint (race_id, checkpoint_code),
+    CONSTRAINT fk_adjudication_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_adjudication_point (race_id, bib, checkpoint_code)
+);
+
+CREATE TABLE IF NOT EXISTS result_snapshot_sensor_reading (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '参赛号',
+    checkpoint_code VARCHAR(64) NOT NULL COMMENT '三源检查点代码',
+    sensor_id VARCHAR(64) NOT NULL COMMENT '传感器ID',
+    revision INT NOT NULL COMMENT '封榜时冻结的读数修订号',
+    elapsed_millis BIGINT NOT NULL COMMENT '封榜时冻结的该传感器累计耗时（毫秒）',
+    adjudication_id VARCHAR(128) NOT NULL COMMENT '冻结依据的有效裁定ID',
+    CONSTRAINT pk_snapshot_sensor_reading PRIMARY KEY (race_id, bib, checkpoint_code, sensor_id),
+    CONSTRAINT fk_snapshot_reading_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/SUBMIT_SENSOR_READING/REVISE_SENSOR_READING/ADJUDICATE',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',

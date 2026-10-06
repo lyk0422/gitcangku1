@@ -99,13 +99,14 @@ final class ResponseMapper {
 
     /**
      * 组装单个选手的分段明细：按检查点顺序，把已有通过记录映射到对应检查点，
-     * 未通过的检查点 elapsedMillis/timingId 为 null。
+     * 未通过的检查点 elapsedMillis/timingId 为 null；三源点附带当前有效裁定ID。
      */
     static RunnerTimingResponse runnerTiming(
             RaceRow race,
             RunnerRow runner,
             List<CheckpointRow> checkpoints,
-            List<CheckpointTimingRow> timings) {
+            List<CheckpointTimingRow> timings,
+            Map<String, String> validAdjudicationIdByCode) {
         Map<String, CheckpointTimingRow> byCode = new LinkedHashMap<>();
         for (CheckpointTimingRow timing : timings) {
             byCode.put(timing.checkpointCode(), timing);
@@ -117,7 +118,8 @@ final class ResponseMapper {
                             checkpoint.checkpointCode(),
                             checkpoint.position(),
                             timing == null ? null : timing.elapsedMillis(),
-                            timing == null ? null : timing.timingId());
+                            timing == null ? null : timing.timingId(),
+                            validAdjudicationIdByCode.get(checkpoint.checkpointCode()));
                 })
                 .toList();
         return new RunnerTimingResponse(
@@ -145,7 +147,7 @@ final class ResponseMapper {
                     }
                     return new CheckpointPassResponse(
                             detail.checkpointCode(), detail.position(),
-                            detail.elapsedMillis(), detail.timingId());
+                            detail.elapsedMillis(), detail.timingId(), detail.adjudicationId());
                 })
                 .toList();
         return new RunnerTimingResponse(

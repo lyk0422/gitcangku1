@@ -27,10 +27,22 @@ public record ConfigureCheckpointsRequest(
      *
      * @param checkpointCode 检查点代码，赛事内唯一
      * @param position       检查点顺序，从1连续递增
+     * @param threeSource    是否启用三源计时共识模式；缺省/false 为单条计时入口
      */
     public record CheckpointDefinition(
             @NotBlank String checkpointCode,
-            @NotNull @Positive Integer position
+            @NotNull @Positive Integer position,
+            Boolean threeSource
     ) {
+
+        /** 兼容旧调用：缺省不启用三源模式。 */
+        public CheckpointDefinition(String checkpointCode, Integer position) {
+            this(checkpointCode, position, null);
+        }
+
+        /** 规范化取值：null 视为 false。 */
+        public boolean threeSourceEnabled() {
+            return Boolean.TRUE.equals(threeSource);
+        }
     }
 }

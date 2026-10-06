@@ -1,15 +1,18 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.AdjudicateRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.ReviseSensorReadingRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.SubmitSensorReadingRequest;
 import com.example.starter.race.api.SubmitTimingRequest;
 
 /**
@@ -42,8 +45,29 @@ public interface RaceService {
     /**
      * 提交选手检查点通过记录；乱序允许，但相邻检查点耗时须严格递增，
      * 且 elapsedMillis 必须小于该选手原始完赛耗时；违反返回422且不写入。
+     * 启用三源模式的检查点不能经此入口写入，须走传感器采样与显式裁定。
      */
     ServiceResult submitTiming(String raceId, String bib, SubmitTimingRequest request);
+
+    /**
+     * 登记三源检查点传感器读数：每选手每点最多三个不同 sensorId，修订号初始1；
+     * 目标检查点必须启用三源模式，否则422。
+     */
+    ServiceResult submitSensorReading(String raceId, String bib, SubmitSensorReadingRequest request);
+
+    /**
+     * 修订传感器读数：仅 OPEN 赛事，须同时匹配 expectedRaceVersion 与
+     * expectedSensorRevision；成功后赛事版本与读数修订号都推进，
+     * 该点旧裁定立即失效并从即时排名视图排除。
+     */
+    ServiceResult reviseSensorReading(String raceId, String bib, ReviseSensorReadingRequest request);
+
+    /**
+     * 显式裁定三源检查点：三条当前修订读数齐全且最大减最小不超过20毫秒时，
+     * 取中位值写入原分段计时（严格递增与完赛边界仍须满足，否则422整次不写）；
+     * 裁定引用三条当前修订号，历史裁定不覆写。
+     */
+    ServiceResult adjudicate(String raceId, String bib, AdjudicateRequest request);
 
     /** 封榜：校验版本并原子保存只读成绩快照（含每名选手分段明细与缺失检查点）。 */
     ServiceResult sealRace(String raceId, SealRaceRequest request);
