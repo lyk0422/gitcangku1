@@ -24,7 +24,9 @@ public class ConsentRepository {
             Purpose.valueOf(rs.getString("purpose")),
             rs.getInt("epoch"),
             rs.getString("record_key"),
-            rs.getString("payload"));
+            rs.getString("payload"),
+            RecordType.valueOf(rs.getString("record_type")),
+            rs.getObject("numeric_value", Integer.class));
 
     private final JdbcTemplate jdbc;
 
@@ -46,13 +48,16 @@ public class ConsentRepository {
     /**
      * 记录行。
      *
-     * @param subjectKey 主体标识
-     * @param purpose    用途
-     * @param epoch      所属代次
-     * @param recordKey  记录键
-     * @param payload    记录内容
+     * @param subjectKey   主体标识
+     * @param purpose      用途
+     * @param epoch        所属代次
+     * @param recordKey    记录键
+     * @param payload      记录内容；数值记录存十进制字符串形式
+     * @param recordType   记录类型：STRING 字符串 / NUMERIC 数值
+     * @param numericValue 数值载荷（0-1000 非负整数），仅 NUMERIC 类型有值，否则为 null
      */
-    public record RecordRow(String subjectKey, Purpose purpose, int epoch, String recordKey, String payload) {
+    public record RecordRow(String subjectKey, Purpose purpose, int epoch, String recordKey,
+                            String payload, RecordType recordType, Integer numericValue) {
     }
 
     Optional<GrantRow> findGrant(String subjectKey, Purpose purpose, int epoch) {
@@ -91,7 +96,8 @@ public class ConsentRepository {
 
     Optional<RecordRow> findRecord(String subjectKey, Purpose purpose, int epoch, String recordKey) {
         List<RecordRow> rows = jdbc.query(
-                "SELECT subject_key, purpose, epoch, record_key, payload FROM consent_record"
+                "SELECT subject_key, purpose, epoch, record_key, payload, record_type, numeric_value"
+                        + " FROM consent_record"
                         + " WHERE subject_key = ? AND purpose = ? AND epoch = ? AND record_key = ?",
                 RECORD_MAPPER, subjectKey, purpose.name(), epoch, recordKey);
         return rows.stream().findFirst();
@@ -99,8 +105,18 @@ public class ConsentRepository {
 
     void insertRecord(String subjectKey, Purpose purpose, int epoch, String recordKey, String payload, String requestId) {
         jdbc.update(
-                "INSERT INTO consent_record (subject_key, purpose, epoch, record_key, payload, request_id)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO consent_record (subject_key, purpose, epoch, record_key, payload, request_id, record_type)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, 'STRING')",
                 subjectKey, purpose.name(), epoch, recordKey, payload, requestId);
+    }
+
+    /**
+     * 写入数值记录：payload 存十进制字符串形式，numeric_value 存数值本身。
+     */
+    void insertNumericRecord(String subjectKey, Purpose purpose, int epoch, String recordKey, int value, String requestId) {
+        jdbc.update(
+                "INSERT INTO consent_record (subject_key, purpose, epoch, record_key, payload, request_id,"
+                        + " record_type, numeric_value) VALUES (?, ?, ?, ?, ?, ?, 'NUMERIC', ?)",
+                subjectKey, purpose.name(), epoch, recordKey, String.valueOf(value), requestId, value);
     }
 }

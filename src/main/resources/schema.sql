@@ -16,7 +16,9 @@ CREATE TABLE IF NOT EXISTS consent_record (
     purpose VARCHAR(32) NOT NULL COMMENT '用途：RESEARCH 研究 / PERSONALIZATION 个性化',
     epoch INT NOT NULL COMMENT '记录所属授权代次',
     record_key VARCHAR(128) NOT NULL COMMENT '记录键，同一代内唯一',
-    payload TEXT NOT NULL COMMENT '记录内容（合成字符串）',
+    payload TEXT NOT NULL COMMENT '记录内容（合成字符串）；数值记录存十进制字符串形式',
+    record_type VARCHAR(16) NOT NULL DEFAULT 'STRING' COMMENT '记录类型：STRING 字符串 / NUMERIC 数值，旧字符串记录不自动转数',
+    numeric_value INT NULL DEFAULT NULL COMMENT '数值载荷：0-1000 非负整数，仅 NUMERIC 类型有值，否则为 NULL',
     request_id VARCHAR(128) NOT NULL COMMENT '写入本记录的幂等请求标识',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间（服务器时区 Asia/Shanghai）',
     PRIMARY KEY (subject_key, purpose, epoch, record_key)
@@ -25,8 +27,8 @@ CREATE TABLE IF NOT EXISTS consent_record (
 -- 幂等请求表：成功结果与业务变更同事务保存，失败请求不占用 requestId
 CREATE TABLE IF NOT EXISTS idempotency_request (
     request_id VARCHAR(128) NOT NULL COMMENT '幂等请求标识',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：GRANT 授权 / WRITE 写入 / REVOKE 撤回',
-    params_fingerprint VARCHAR(512) NOT NULL COMMENT '规范化参数指纹，用于检测同 requestId 参数变更',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：GRANT 授权 / WRITE 写入 / REVOKE 撤回 / NUMERIC_WRITE 数值写入 / COHORT_AGGREGATE 群体汇总',
+    params_fingerprint VARCHAR(2048) NOT NULL COMMENT '结构化参数指纹（JSON：操作＋资源＋全部参数＋期望版本），用于检测同 requestId 参数变更',
     response_body TEXT NOT NULL COMMENT '成功响应快照（JSON）',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间（服务器时区 Asia/Shanghai）',
     PRIMARY KEY (request_id)

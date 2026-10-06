@@ -8,8 +8,13 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.example.starter.consent.dto.CohortAggregateRequest;
+import com.example.starter.consent.dto.CohortAggregateResponse;
 import com.example.starter.consent.dto.GrantRequest;
 import com.example.starter.consent.dto.GrantResponse;
+import com.example.starter.consent.dto.NumericRecordReadResponse;
+import com.example.starter.consent.dto.NumericRecordResponse;
+import com.example.starter.consent.dto.NumericRecordWriteRequest;
 import com.example.starter.consent.dto.RecordResponse;
 import com.example.starter.consent.dto.RecordWriteRequest;
 import com.example.starter.consent.dto.RevokeRequest;
@@ -51,5 +56,22 @@ public class ConsentController {
                                @RequestParam Purpose purpose,
                                @RequestParam @NotBlank String recordKey) {
         return consentService.read(subjectKey, purpose, recordKey);
+    }
+
+    @PostMapping("/numeric-records")
+    public NumericRecordResponse writeNumeric(@Valid @RequestBody NumericRecordWriteRequest request) {
+        return consentService.writeNumeric(request);
+    }
+
+    @GetMapping("/numeric-records")
+    public NumericRecordReadResponse readNumeric(@RequestParam @NotBlank String subjectKey,
+                                                 @RequestParam Purpose purpose,
+                                                 @RequestParam @NotBlank String recordKey) {
+        return consentService.readNumeric(subjectKey, purpose, recordKey);
+    }
+
+    @PostMapping("/cohort-aggregates")
+    public CohortAggregateResponse aggregate(@Valid @RequestBody CohortAggregateRequest request) {
+        return consentService.aggregate(request);
     }
 }

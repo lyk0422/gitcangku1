@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS consent_record (
     epoch INT NOT NULL,
     record_key VARCHAR(128) NOT NULL,
     payload TEXT NOT NULL,
+    record_type VARCHAR(16) NOT NULL DEFAULT 'STRING',
+    numeric_value INT NULL DEFAULT NULL,
     request_id VARCHAR(128) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (subject_key, purpose, epoch, record_key)
@@ -24,7 +26,7 @@ CREATE TABLE IF NOT EXISTS consent_record (
 CREATE TABLE IF NOT EXISTS idempotency_request (
     request_id VARCHAR(128) NOT NULL,
     operation VARCHAR(32) NOT NULL,
-    params_fingerprint VARCHAR(512) NOT NULL,
+    params_fingerprint VARCHAR(2048) NOT NULL,
     response_body TEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (request_id)
