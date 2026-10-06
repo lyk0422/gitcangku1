@@ -24,8 +24,43 @@ CREATE TABLE IF NOT EXISTS consent_record (
 CREATE TABLE IF NOT EXISTS idempotency_request (
     request_id VARCHAR(128) NOT NULL,
     operation VARCHAR(32) NOT NULL,
-    params_fingerprint VARCHAR(512) NOT NULL,
+    params_fingerprint VARCHAR(4096) NOT NULL,
     response_body TEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (request_id)
+);
+
+CREATE TABLE IF NOT EXISTS numeric_record (
+    subject_key VARCHAR(128) NOT NULL,
+    epoch INT NOT NULL,
+    record_key VARCHAR(128) NOT NULL,
+    record_kind VARCHAR(8) NOT NULL,
+    numeric_value BIGINT NOT NULL,
+    depth INT NOT NULL,
+    operator VARCHAR(128) NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (subject_key, epoch, record_key)
+);
+
+CREATE TABLE IF NOT EXISTS numeric_record_source (
+    target_subject_key VARCHAR(128) NOT NULL,
+    target_epoch INT NOT NULL,
+    target_record_key VARCHAR(128) NOT NULL,
+    source_ordinal INT NOT NULL,
+    source_subject_key VARCHAR(128) NOT NULL,
+    source_epoch INT NOT NULL,
+    source_record_key VARCHAR(128) NOT NULL,
+    PRIMARY KEY (target_subject_key, target_epoch, target_record_key,
+        source_subject_key, source_epoch, source_record_key)
+);
+
+CREATE TABLE IF NOT EXISTS numeric_record_ancestor (
+    target_subject_key VARCHAR(128) NOT NULL,
+    target_epoch INT NOT NULL,
+    target_record_key VARCHAR(128) NOT NULL,
+    ancestor_subject_key VARCHAR(128) NOT NULL,
+    ancestor_epoch INT NOT NULL,
+    PRIMARY KEY (target_subject_key, target_epoch, target_record_key,
+        ancestor_subject_key, ancestor_epoch)
 );
