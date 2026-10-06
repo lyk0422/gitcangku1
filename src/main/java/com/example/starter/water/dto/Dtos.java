@@ -77,4 +77,35 @@ public final class Dtos {
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }
+
+    /**
+     * 田块绑定配水申请命令（新增写入，幂等键为 requestId）。
+     * capacity/recoveryPerHour 为田块不可变配置（单位立方米，正整数），首次关联时生效，
+     * 后续关联必须与原配置一致否则 409；enabledUtc 为 UTC 启用时刻，irrigationUtc 必须是不早于
+     * 启用时刻的 UTC 整小时；expectedFieldVersion 为期望田块版本，null 表示不校验。
+     */
+    public record FieldAllocationRequest(String requestId, String allocationKey, Long windowId, String userId,
+                                         String amount, String fieldKey, String irrigationUtc, Long capacity,
+                                         Long recoveryPerHour, String enabledUtc, Long expectedFieldVersion) {
+    }
+
+    /** 田块绑定申请视图；fieldVersion 为提交时田块已批准序列版本。 */
+    public record FieldAllocationResponse(String allocationKey, long windowId, String userId, String amount,
+                                          String fieldKey, String irrigationUtc, long fieldVersion,
+                                          String status, String createdUtc, String updatedUtc) {
+    }
+
+    /** 入渗序列事件：按灌溉时刻、申请键字典序排列，balanceAfter 为该申请扣减后的入渗余额。 */
+    public record FieldBalanceEvent(String allocationKey, String irrigationUtc, String amount,
+                                    String balanceAfter) {
+    }
+
+    /**
+     * 田块入渗现况视图。current 为按最新已批准序列实时计算的轨迹（只读，不改写历史）；
+     * frozen 为最近一次批准时冻结的序列与余额快照，从未批准过为 null。
+     */
+    public record FieldBalanceResponse(String fieldKey, String ownerUserId, String capacity,
+                                       String recoveryPerHour, String enabledUtc, long version,
+                                       List<FieldBalanceEvent> current, List<FieldBalanceEvent> frozen) {
+    }
 }

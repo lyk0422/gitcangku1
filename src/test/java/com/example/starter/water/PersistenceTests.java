@@ -116,4 +116,58 @@ class PersistenceTests {
         assertEquals(0, cancelled.heldAmount().compareTo(BigDecimal.ZERO));
         assertEquals(0, repo.sumApprovedAmount(windowId).compareTo(BigDecimal.ZERO));
     }
+
+    @Test
+    void fieldSnapshotAndRequestLogAreReadableFromNewConnection() throws Exception {
+        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
+        SimpleDriverDataSource first = new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "");
+        try (Connection connection = first.getConnection()) {
+            ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
+        }
+        WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
+        long windowId = repo1.insertWindow("wk-field", "ch-field", 1L, 2L, new BigDecimal("100"), 1L);
+        // 首次关联合成田块：C=10、R=2、启用时刻 0，初始版本 0
+        long fieldId = repo1.insertField("fld-persist", "alice", 10L, 2L, 0L, 2L);
+        // 田块绑定申请：10 点灌溉 8，批准后持有 8
+        repo1.insertFieldAllocation("ak-field", windowId, "u1", new BigDecimal("8.000"), "alice",
+                fieldId, 36_000_000_000_000L, 3L);
+        AllocationRow allocation = repo1.findAllocationByKey("ak-field");
+        repo1.updateAllocationStatus(allocation.id(), "APPROVED", 4L);
+        repo1.incrementFieldVersion(fieldId);
+        // 批准时冻结快照：扣 8 后余额 2
+        repo1.deleteSnapshots(fieldId);
+        repo1.insertSnapshot(fieldId, 1L, "ak-field", 36_000_000_000_000L, new BigDecimal("8.000"),
+                new BigDecimal("2.000"), 5L);
+        repo1.insertRequest("req-persist", "{\"operation\":\"FIELD_ALLOCATION_SUBMIT\"}", 6L);
+        repo1.updateRequestResponse("req-persist", "{\"allocationKey\":\"ak-field\"}");
+
+        // 全新连接与仓储实例重读
+        WaterRepository repo2 = new WaterRepository(
+                new JdbcTemplate(new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "")));
+        var field = repo2.findFieldByKey("fld-persist");
+        assertNotNull(field);
+        assertEquals("alice", field.ownerUserId());
+        assertEquals(10L, field.capacity());
+        assertEquals(2L, field.recoveryPerHour());
+        assertEquals(0L, field.enabledNanos());
+        assertEquals(1L, field.version());
+
+        AllocationRow reloaded = repo2.findAllocationByKey("ak-field");
+        assertEquals(fieldId, reloaded.fieldId());
+        assertEquals(36_000_000_000_000L, reloaded.irrigationNanos());
+        assertEquals(new BigDecimal("8.000"), reloaded.heldAmount());
+        // 已批准序列按灌溉时刻、申请键字典序可读
+        assertEquals(1, repo2.listApprovedFieldAllocations(fieldId).size());
+
+        var snapshots = repo2.listSnapshots(fieldId);
+        assertEquals(1, snapshots.size());
+        assertEquals(1L, snapshots.get(0).fieldVersion());
+        assertEquals("ak-field", snapshots.get(0).allocationKey());
+        assertEquals(new BigDecimal("2.000"), snapshots.get(0).balanceAfter());
+
+        var request = repo2.findRequest("req-persist");
+        assertNotNull(request);
+        assertEquals("{\"operation\":\"FIELD_ALLOCATION_SUBMIT\"}", request.identityJson());
+        assertEquals("{\"allocationKey\":\"ak-field\"}", request.response());
+    }
 }

@@ -6,6 +6,9 @@ import com.example.starter.water.dto.Dtos.CommandRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.FieldAllocationRequest;
+import com.example.starter.water.dto.Dtos.FieldAllocationResponse;
+import com.example.starter.water.dto.Dtos.FieldBalanceResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
@@ -102,5 +105,21 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 提交田块绑定配水申请（新增写入，幂等键 requestId；首次关联合成田块归属与不可变配置）。 */
+    @PostMapping("/field-allocations")
+    public FieldAllocationResponse submitFieldAllocation(@RequestBody FieldAllocationRequest request,
+                                                         @RequestHeader("X-Actor-Id") String actor) {
+        return service.submitFieldAllocation(request.requestId(), request.allocationKey(), request.windowId(),
+                request.userId(), request.amount(), request.fieldKey(), request.irrigationUtc(),
+                request.capacity(), request.recoveryPerHour(), request.enabledUtc(),
+                request.expectedFieldVersion(), actor);
+    }
+
+    /** 查询田块入渗现况：实时计算最新序列（只读），并返回批准时冻结的历史快照。 */
+    @GetMapping("/fields/{fieldKey}/balance")
+    public FieldBalanceResponse getFieldBalance(@PathVariable String fieldKey) {
+        return service.getFieldBalance(fieldKey);
     }
 }
