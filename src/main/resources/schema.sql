@@ -45,6 +45,26 @@ CREATE INDEX IF NOT EXISTS idx_reservation_campaign_day
 CREATE INDEX IF NOT EXISTS idx_reservation_expiry
     ON exposure_reservation (campaign_id, status, expires_at_utc);
 
+-- 身份归并组：version 为乐观锁版本（每次成员变更 +1，初始 1）；
+-- member_count 为冗余成员数（上限 10）；last_operator 为最近一次归并操作者
+CREATE TABLE IF NOT EXISTS identity_group (
+    group_id       VARCHAR(64) NOT NULL,
+    version        INT         NOT NULL,
+    member_count   INT         NOT NULL,
+    last_operator  VARCHAR(64) NOT NULL,
+    updated_at_utc BIGINT      NOT NULL,
+    PRIMARY KEY (group_id)
+);
+
+-- 访客编号所属归并组：visitor_id 全局唯一；未归并访客无记录，视为仅含自身的单成员组
+CREATE TABLE IF NOT EXISTS visitor_identity (
+    visitor_id  VARCHAR(64) NOT NULL,
+    group_id    VARCHAR(64) NOT NULL,
+    PRIMARY KEY (visitor_id)
+);
+CREATE INDEX IF NOT EXISTS idx_visitor_identity_group
+    ON visitor_identity (group_id);
+
 -- 写操作幂等记录：request_id 全局唯一，异参重放返回 409，失败不占键
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id          VARCHAR(64)  NOT NULL,

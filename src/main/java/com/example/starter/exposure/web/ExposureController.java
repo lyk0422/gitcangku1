@@ -71,4 +71,23 @@ public class ExposureController {
                                     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate utcDate) {
         return exposureService.queryQuota(campaignId, visitorId, utcDate);
     }
+
+    /** 显式身份归并：将两个合成访客编号所在的组合并为一组，组关系全局共享。 */
+    @PostMapping("/identity/merges")
+    public IdentityGroupResponse mergeIdentities(@Valid @RequestBody MergeIdentityRequest request) {
+        return exposureService.mergeIdentities(request);
+    }
+
+    /**
+     * 归并组额度视图：组成员、组内合计及原编号分账。
+     * utcDate 缺省使用服务端当前 UTC 日。
+     */
+    @GetMapping("/identity/groups/{visitorId}/quota")
+    public GroupQuotaResponse queryGroupQuota(@PathVariable String visitorId,
+                                              @RequestParam String campaignId,
+                                              @RequestParam(required = false)
+                                              @DateTimeFormat(iso = DateTimeFormat.ISO.DATE)
+                                              LocalDate utcDate) {
+        return exposureService.queryGroupQuota(visitorId, campaignId, utcDate);
+    }
 }
