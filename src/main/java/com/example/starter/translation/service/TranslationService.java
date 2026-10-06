@@ -4,9 +4,11 @@ import com.example.starter.translation.api.ApiDtos;
 import com.example.starter.translation.api.ApiException;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.NumericTokenRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
+import com.example.starter.translation.domain.Rows.TranslationTokenRow;
 import com.example.starter.translation.repo.TranslationRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
@@ -50,6 +52,7 @@ public class TranslationService {
         long documentId = repository.insertDocument(languages);
         for (ApiDtos.SegmentInput segment : segments) {
             repository.insertSegment(documentId, segment.segmentId(), segment.sourceText());
+            insertSourceTokens(documentId, segment.segmentId(), segment.numericTokens());
         }
         return new ApiDtos.DocumentResponse(documentId, 1, 0, languages);
     }
@@ -62,11 +65,12 @@ public class TranslationService {
             throw ApiException.conflict("段落已存在: " + request.segmentId());
         }
         repository.insertSegment(documentId, request.segmentId(), request.sourceText());
+        insertSourceTokens(documentId, request.segmentId(), request.numericTokens());
         int draftVersion = bumpDraftVersion(document);
         return new ApiDtos.SegmentResponse(documentId, request.segmentId(), 1, draftVersion);
     }
 
-    /** 源文修订：源文版本加一、草稿版本加一；相关译文因源文版本落后而待更新。 */
+    /** 源文修订：源文版本加一、草稿版本加一、数值词元整体替换；相关译文因源文版本落后而待更新。 */
     @Transactional
     public ApiDtos.SegmentResponse reviseSource(long documentId, String segmentId,
                                               ApiDtos.ReviseSourceRequest request) {
@@ -74,6 +78,8 @@ public class TranslationService {
         SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
         int sourceVersion = segment.sourceVersion() + 1;
         repository.updateSegmentSource(documentId, segmentId, request.sourceText(), sourceVersion);
+        repository.deleteNumericTokens(documentId, segmentId);
+        insertSourceTokens(documentId, segmentId, request.numericTokens());
         int draftVersion = bumpDraftVersion(document);
         return new ApiDtos.SegmentResponse(documentId, segmentId, sourceVersion, draftVersion);
     }
@@ -87,6 +93,7 @@ public class TranslationService {
     public ApiDtos.TranslationResponse submitTranslation(long documentId, String segmentId, String language,
                                                          String actorId, ApiDtos.SubmitTranslationRequest request) {
         DocumentRow document = lockDocument(documentId);
+        requireActor(actorId);
         String normalizedLanguage = normalizeLanguage(language);
         if (!document.targetLanguages().contains(normalizedLanguage)) {
             throw ApiException.unprocessable("语言不在文档目标语言中: " + normalizedLanguage);
@@ -102,20 +109,25 @@ public class TranslationService {
         if (!violations.isEmpty()) {
             throw ApiException.termViolation("译文违反 " + violations.size() + " 条术语规则", violations);
         }
+        List<TranslationTokenRow> targetTokens = NumericTokens.validateTargetTokens(
+                segmentId, normalizedLanguage, repository.listNumericTokens(documentId, segmentId),
+                request.numericTokens(), request.content());
         int translationVersion = repository.findTranslation(documentId, segmentId, normalizedLanguage)
                 .map(TranslationRow::translationVersion).orElse(0) + 1;
         repository.upsertTranslation(documentId, new TranslationRow(segmentId, normalizedLanguage,
                 request.content(), actorId, segment.sourceVersion(), translationVersion, document.termVersion()));
+        repository.replaceTranslationTokens(documentId, segmentId, normalizedLanguage, targetTokens);
         int draftVersion = bumpDraftVersion(document);
         return new ApiDtos.TranslationResponse(documentId, segmentId, normalizedLanguage,
                 translationVersion, segment.sourceVersion(), document.termVersion(), draftVersion);
     }
 
-    /** 译文批准：审核人不得是作者，且必须同时匹配当前源文与译文版本。 */
+    /** 译文批准：审核人不得是作者，必须同时匹配当前源文与译文版本，并复核当前完整数值词元。 */
     @Transactional
     public ApiDtos.ApprovalResponse approveTranslation(long documentId, String segmentId, String language,
                                                        String actorId, ApiDtos.ApproveTranslationRequest request) {
         lockDocument(documentId);
+        requireActor(actorId);
         String normalizedLanguage = normalizeLanguage(language);
         SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
         TranslationRow translation = repository.findTranslation(documentId, segmentId, normalizedLanguage)
@@ -132,6 +144,10 @@ public class TranslationService {
             throw ApiException.unprocessable("译文基于源文版本 " + translation.sourceVersion()
                     + "，当前源文版本 " + segment.sourceVersion() + "，译文待更新，不能批准");
         }
+        NumericTokens.validateStoredTokens(segmentId, normalizedLanguage,
+                repository.listNumericTokens(documentId, segmentId),
+                repository.listTranslationTokens(documentId, segmentId, normalizedLanguage),
+                translation.content());
         repository.upsertApproval(documentId, new ApprovalRow(segmentId, normalizedLanguage, actorId,
                 segment.sourceVersion(), translation.translationVersion()));
         return new ApiDtos.ApprovalResponse(documentId, segmentId, normalizedLanguage, actorId,
@@ -193,6 +209,11 @@ public class TranslationService {
                 .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
         Map<String, ApprovalRow> approvals = repository.listApprovals(documentId).stream()
                 .collect(Collectors.toMap(a -> key(a.segmentId(), a.language()), Function.identity()));
+        Map<String, List<NumericTokenRow>> sourceTokensBySegment = repository.listNumericTokens(documentId)
+                .stream().collect(Collectors.groupingBy(NumericTokenRow::segmentId));
+        Map<String, List<TranslationTokenRow>> translationTokensByKey =
+                repository.listTranslationTokens(documentId).stream()
+                        .collect(Collectors.groupingBy(t -> key(t.segmentId(), t.language())));
         List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
         List<ApiDtos.TermRuleView> termViolations = new ArrayList<>();
         for (SegmentRow segment : segments) {
@@ -222,6 +243,10 @@ public class TranslationService {
                     throw ApiException.unprocessable("批准已失效: " + segment.segmentId() + "/" + language
                             + "，源文或译文版本已改变");
                 }
+                NumericTokens.validateStoredTokens(segment.segmentId(), language,
+                        sourceTokensBySegment.getOrDefault(segment.segmentId(), List.of()),
+                        translationTokensByKey.getOrDefault(key(segment.segmentId(), language), List.of()),
+                        translation.content());
                 termViolations.addAll(findViolations(
                         segment.sourceText(), language, translation.content(), termRules));
             }
@@ -231,7 +256,8 @@ public class TranslationService {
         }
         int publishedVersion = document.publishedVersion() + 1;
         repository.insertSnapshot(documentId, publishedVersion,
-                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules));
+                buildSnapshotJson(document, publishedVersion, segments, translations, approvals, termRules,
+                        sourceTokensBySegment, translationTokensByKey));
         repository.updatePublishedVersion(documentId, publishedVersion);
         return new ApiDtos.PublishResponse(documentId, publishedVersion);
     }
@@ -347,10 +373,27 @@ public class TranslationService {
         return new ApiDtos.TermRuleView(rule.sourceTerm(), rule.language(), rule.requiredTranslation());
     }
 
-    /** 生成完整只读快照 JSON：全部段落源文及各语言译文、作者、审核人、版本号与固化的术语版本及规则集。 */
+    /** 操作者身份须非空，否则 400；写操作幂等身份包含该操作者。 */
+    private static void requireActor(String actorId) {
+        if (actorId == null || actorId.isBlank()) {
+            throw ApiException.badRequest("操作者不能为空");
+        }
+    }
+
+    /** 校验并落库源段数值词元（最多 5 个、tokenKey 唯一）。 */
+    private void insertSourceTokens(long documentId, String segmentId,
+                                    List<ApiDtos.NumericTokenInput> tokens) {
+        for (NumericTokenRow token : NumericTokens.validateSourceTokens(segmentId, tokens)) {
+            repository.insertNumericToken(documentId, segmentId, token);
+        }
+    }
+
+    /** 生成完整只读快照 JSON：全部段落源文、数值词元及各语言译文、作者、审核人、版本号与固化的术语版本及规则集。 */
     private String buildSnapshotJson(DocumentRow document, int publishedVersion, List<SegmentRow> segments,
                                      Map<String, TranslationRow> translations,
-                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules) {
+                                     Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules,
+                                     Map<String, List<NumericTokenRow>> sourceTokensBySegment,
+                                     Map<String, List<TranslationTokenRow>> translationTokensByKey) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("documentId", document.documentId());
         snapshot.put("publishedVersion", publishedVersion);
@@ -372,6 +415,16 @@ public class TranslationService {
             segmentJson.put("segmentId", segment.segmentId());
             segmentJson.put("sourceText", segment.sourceText());
             segmentJson.put("sourceVersion", segment.sourceVersion());
+            List<Map<String, Object>> sourceTokenList = new ArrayList<>();
+            for (NumericTokenRow token : sourceTokensBySegment.getOrDefault(
+                    segment.segmentId(), List.of())) {
+                Map<String, Object> tokenJson = new LinkedHashMap<>();
+                tokenJson.put("tokenKey", token.tokenKey());
+                tokenJson.put("value", token.sourceValue());
+                tokenJson.put("unit", token.unit());
+                sourceTokenList.add(tokenJson);
+            }
+            segmentJson.put("numericTokens", sourceTokenList);
             List<Map<String, Object>> translationList = new ArrayList<>();
             for (String language : document.targetLanguages()) {
                 TranslationRow translation = translations.get(key(segment.segmentId(), language));
@@ -384,6 +437,18 @@ public class TranslationService {
                 translationJson.put("sourceVersion", translation.sourceVersion());
                 translationJson.put("termVersion", translation.termVersion());
                 translationJson.put("reviewer", approval.reviewer());
+                List<Map<String, Object>> targetTokenList = new ArrayList<>();
+                for (TranslationTokenRow token : translationTokensByKey.getOrDefault(
+                        key(segment.segmentId(), language), List.of())) {
+                    Map<String, Object> tokenJson = new LinkedHashMap<>();
+                    tokenJson.put("tokenKey", token.tokenKey());
+                    tokenJson.put("target", token.targetText());
+                    tokenJson.put("unit", token.unit());
+                    tokenJson.put("start", token.startOffset());
+                    tokenJson.put("end", token.endOffset());
+                    targetTokenList.add(tokenJson);
+                }
+                translationJson.put("numericTokens", targetTokenList);
                 translationList.add(translationJson);
             }
             segmentJson.put("translations", translationList);

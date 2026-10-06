@@ -82,4 +82,30 @@ public final class Rows {
     public record RequestLogRow(String requestId, String requestHash,
                                 int responseStatus, String responseBody) {
     }
+
+    /**
+     * 数值词元（源）：源段登记的本地化数字，每段最多 5 个，按 tokenKey 唯一；随源文修订整体替换。
+     *
+     * @param segmentId   所属段落 ID
+     * @param tokenKey    段内唯一词元键
+     * @param sourceValue 精确十进制原值字面量，按 BigDecimal 值比较，非浮点
+     * @param unit        单位原文，如 米；目标词元单位须与此完全一致
+     */
+    public record NumericTokenRow(String segmentId, String tokenKey, String sourceValue, String unit) {
+    }
+
+    /**
+     * 译文数值词元：与源词元同键，冻结目标数值字符串及正文码点区间；重新提交译文时整体替换。
+     *
+     * @param segmentId   所属段落 ID
+     * @param language    目标语言码，小写
+     * @param tokenKey    与源词元一致的词元键
+     * @param targetText  目标数值字符串，固定格式：逗号小数点、点三位分组，如 1.234,50
+     * @param unit        目标词元单位，须等于源词元单位
+     * @param startOffset 正文区间起点，Unicode 码点、从 0 起、左闭；补充字符按 1 个码点计，不偏移
+     * @param endOffset   正文区间终点，Unicode 码点、右开；须大于 startOffset
+     */
+    public record TranslationTokenRow(String segmentId, String language, String tokenKey,
+                                      String targetText, String unit, int startOffset, int endOffset) {
+    }
 }

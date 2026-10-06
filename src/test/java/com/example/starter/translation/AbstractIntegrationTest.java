@@ -36,7 +36,9 @@ public abstract class AbstractIntegrationTest {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM approval");
+        jdbc.update("DELETE FROM translation_token");
         jdbc.update("DELETE FROM translation");
+        jdbc.update("DELETE FROM numeric_token");
         jdbc.update("DELETE FROM segment");
         jdbc.update("DELETE FROM release_snapshot");
         jdbc.update("DELETE FROM term_rule");

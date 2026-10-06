@@ -1,6 +1,7 @@
 package com.example.starter.translation.api;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.databind.annotation.JsonSerialize;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -8,6 +9,7 @@ import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
+import java.math.BigDecimal;
 import java.util.List;
 
 /**
@@ -18,10 +20,11 @@ public final class ApiDtos {
     private ApiDtos() {
     }
 
-    /** 初始段落输入。 */
+    /** 初始段落输入；numericTokens 可空，空表示无数值词元的普通源段。 */
     public record SegmentInput(
             @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
-            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            @Size(max = 5, message = "数值词元最多 5 个") List<@Valid NumericTokenInput> numericTokens) {
     }
 
     /** 建文档请求：1~5 种目标语言，可携带初始段落。 */
@@ -32,24 +35,27 @@ public final class ApiDtos {
             @NotNull(message = "segments 不能为空") List<@Valid SegmentInput> segments) {
     }
 
-    /** 增加段落请求。 */
+    /** 增加段落请求；numericTokens 可空，空表示普通源段。 */
     public record AddSegmentRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
-            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            @Size(max = 5, message = "数值词元最多 5 个") List<@Valid NumericTokenInput> numericTokens) {
     }
 
-    /** 源文修订请求。 */
+    /** 源文修订请求；numericTokens 为修订后的完整词元集合（可空表示无词元），随版本整体替换。 */
     public record ReviseSourceRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
-            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            @Size(max = 5, message = "数值词元最多 5 个") List<@Valid NumericTokenInput> numericTokens) {
     }
 
-    /** 译文提交请求；作者取 X-Actor-Id 请求头。 */
+    /** 译文提交请求；作者取 X-Actor-Id 请求头；numericTokens 为同键目标词元集合（可空）。 */
     public record SubmitTranslationRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @NotBlank(message = "content 不能为空") String content,
-            @Positive(message = "sourceVersion 必须为正数") int sourceVersion) {
+            @Positive(message = "sourceVersion 必须为正数") int sourceVersion,
+            @Size(max = 5, message = "数值词元最多 5 个") List<@Valid TargetNumericTokenInput> numericTokens) {
     }
 
     /** 译文批准请求；审核人取 X-Actor-Id 请求头。 */
@@ -131,5 +137,22 @@ public final class ApiDtos {
         public ErrorResponse(String error, String message) {
             this(error, message, null);
         }
+    }
+
+    /** 源段数值词元登记：唯一 tokenKey、精确十进制原值与单位；value 按值参与幂等摘要。 */
+    public record NumericTokenInput(
+            @NotBlank(message = "tokenKey 不能为空") @Size(max = 64) String tokenKey,
+            @NotNull(message = "value 不能为空")
+            @JsonSerialize(using = CanonicalDecimalSerializer.class) BigDecimal value,
+            @NotBlank(message = "unit 不能为空") @Size(max = 32) String unit) {
+    }
+
+    /** 译文目标数值词元：同键目标数值字符串及正文码点区间（从 0 起左闭右开，补充字符按 1 码点计）。 */
+    public record TargetNumericTokenInput(
+            @NotBlank(message = "tokenKey 不能为空") @Size(max = 64) String tokenKey,
+            @NotBlank(message = "target 不能为空") @Size(max = 128) String target,
+            @NotBlank(message = "unit 不能为空") @Size(max = 32) String unit,
+            @PositiveOrZero(message = "start 不能为负数") int start,
+            @PositiveOrZero(message = "end 不能为负数") int end) {
     }
 }

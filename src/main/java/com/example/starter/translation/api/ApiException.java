@@ -43,6 +43,11 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", message);
     }
 
+    /** 400：请求格式非法（如目标数值格式错误、操作者为空），不自动修复。 */
+    public static ApiException badRequest(String message) {
+        return new ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST", message);
+    }
+
     /** 409：版本冲突、段落冲突或 requestId 同键异参。 */
     public static ApiException conflict(String message) {
         return new ApiException(HttpStatus.CONFLICT, "CONFLICT", message);

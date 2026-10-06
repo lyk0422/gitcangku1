@@ -111,6 +111,42 @@ COMMENT ON COLUMN term_rule.source_term IS '源文术语，Unicode 原文、区�
 COMMENT ON COLUMN term_rule.language IS '目标语言码，小写';
 COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
 
+CREATE TABLE IF NOT EXISTS numeric_token (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    token_key VARCHAR(64) NOT NULL,
+    source_value VARCHAR(128) NOT NULL,
+    unit VARCHAR(32) NOT NULL,
+    PRIMARY KEY (document_id, segment_id, token_key)
+);
+COMMENT ON TABLE numeric_token IS '数值词元（源）：源段登记的本地化数字，每段最多 5 个，按 tokenKey 唯一；随源文修订整体替换';
+COMMENT ON COLUMN numeric_token.document_id IS '所属文档 ID';
+COMMENT ON COLUMN numeric_token.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN numeric_token.token_key IS '段内唯一词元键';
+COMMENT ON COLUMN numeric_token.source_value IS '精确十进制原值字面量，按 BigDecimal 值比较，非浮点';
+COMMENT ON COLUMN numeric_token.unit IS '单位原文，如 米；目标词元单位须与此完全一致';
+
+CREATE TABLE IF NOT EXISTS translation_token (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    token_key VARCHAR(64) NOT NULL,
+    target_text VARCHAR(128) NOT NULL,
+    unit VARCHAR(32) NOT NULL,
+    start_offset INT NOT NULL,
+    end_offset INT NOT NULL,
+    PRIMARY KEY (document_id, segment_id, language, token_key)
+);
+COMMENT ON TABLE translation_token IS '译文数值词元：与源词元同键，冻结目标数值字符串及正文码点区间；重新提交译文时整体替换';
+COMMENT ON COLUMN translation_token.document_id IS '所属文档 ID';
+COMMENT ON COLUMN translation_token.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN translation_token.language IS '目标语言码，小写';
+COMMENT ON COLUMN translation_token.token_key IS '与源词元一致的词元键';
+COMMENT ON COLUMN translation_token.target_text IS '目标数值字符串，固定格式：逗号小数点、点三位分组，如 1.234,50；正文区间文字须与此一致';
+COMMENT ON COLUMN translation_token.unit IS '目标词元单位，须等于源词元单位';
+COMMENT ON COLUMN translation_token.start_offset IS '正文区间起点，Unicode 码点、从 0 起、左闭；补充字符按 1 个码点计，不偏移';
+COMMENT ON COLUMN translation_token.end_offset IS '正文区间终点，Unicode 码点、右开；须大于 start_offset';
+
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,
