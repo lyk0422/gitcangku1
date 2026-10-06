@@ -7,6 +7,7 @@ import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
 import com.example.starter.evidence.dto.LoanReturnRequest;
 import com.example.starter.evidence.dto.LoanView;
+import com.example.starter.evidence.dto.MergeRequest;
 import com.example.starter.evidence.dto.SealInspectionRequest;
 import com.example.starter.evidence.dto.TransferInitiateRequest;
 import jakarta.validation.Valid;
@@ -138,6 +139,20 @@ public class EvidenceController {
                 evidenceKey, request);
         StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
                 () -> evidenceService.returnLoan(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 身份合并：当前保管人将 aliasKey 合并到 primaryKey，被合并号转为 ALIAS。
+     * 保管人不同 403；旧版本 409；其余前置条件不满足 422。
+     */
+    @PostMapping("/merges")
+    public ResponseEntity<String> merge(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                        @Valid @RequestBody MergeRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_MERGE, actorId,
+                request.primaryKey(), request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.merge(actorId, request, hash));
         return toEntity(response);
     }
 

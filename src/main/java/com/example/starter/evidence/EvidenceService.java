@@ -9,6 +9,8 @@ import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
 import com.example.starter.evidence.dto.LoanReturnRequest;
 import com.example.starter.evidence.dto.LoanView;
+import com.example.starter.evidence.dto.MergeEventView;
+import com.example.starter.evidence.dto.MergeRequest;
 import com.example.starter.evidence.dto.SealInspectionRequest;
 import com.example.starter.evidence.dto.TransferInitiateRequest;
 import com.example.starter.evidence.dto.TransferView;
@@ -35,6 +37,7 @@ public class EvidenceService {
     static final String OP_SEAL_INSPECTION = "SEAL_INSPECTION";
     static final String OP_LOAN_BORROW = "LOAN_BORROW";
     static final String OP_LOAN_RETURN = "LOAN_RETURN";
+    static final String OP_MERGE = "MERGE";
 
     /**
      * 借出最长期限：72 小时。
@@ -45,6 +48,7 @@ public class EvidenceService {
     private final TransferRecordRepository transferRepository;
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
+    private final MergeRecordRepository mergeRepository;
     private final CommandLogRepository commandLogRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
@@ -53,6 +57,7 @@ public class EvidenceService {
                            TransferRecordRepository transferRepository,
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
+                           MergeRecordRepository mergeRepository,
                            CommandLogRepository commandLogRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
@@ -60,6 +65,7 @@ public class EvidenceService {
         this.transferRepository = transferRepository;
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
+        this.mergeRepository = mergeRepository;
         this.commandLogRepository = commandLogRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -100,6 +106,7 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotAlias(evidence);
         if (request.toCustodian().equals(actorId)) {
             throw ApiException.badRequest("接收人不能与发起保管人相同");
         }
@@ -135,6 +142,7 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotAlias(evidence);
         requireSealIntact(evidence);
         TransferRecord pending = requirePending(evidence, evidenceKey);
         if (!pending.toCustodian().equals(actorId)) {
@@ -166,6 +174,7 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotAlias(evidence);
         requireSealIntact(evidence);
         TransferRecord pending = requirePending(evidence, evidenceKey);
         if (!pending.fromCustodian().equals(actorId)) {
@@ -198,6 +207,7 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotAlias(evidence);
         requireCustodian(evidence, actorId);
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("待接收期间禁止封条核验: " + evidenceKey);
@@ -234,6 +244,7 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotAlias(evidence);
         if (request.borrowerId().equals(actorId)) {
             throw ApiException.badRequest("借用人不能与当前保管人相同");
         }
@@ -283,6 +294,7 @@ public class EvidenceService {
         if (replay.isPresent()) {
             return replay.get();
         }
+        requireNotAlias(evidence);
         LoanRecord loan = loanRepository.findByLoanKey(request.loanKey())
                 .orElseThrow(() -> ApiException.notFound("借出记录不存在: " + request.loanKey()));
         if (!loan.evidenceKey().equals(evidenceKey)) {
@@ -317,6 +329,73 @@ public class EvidenceService {
     }
 
     /**
+     * 身份合并：同一实物误建两个证物号时，由当前保管人将 aliasKey 合并到 primaryKey。
+     * 仅两证物均 SEALED、封条相同、保管人相同、无借出或待交接时允许；
+     * 两证物版本均推进 1，被合并号转为 ALIAS（可查询指向主号，一切写入 409，不重定向）。
+     * 权限（403）先于成功重放；旧版本 409；其余前置条件不满足 422；失败整体回滚不改变任一证物。
+     */
+    @Transactional
+    public StoredResponse merge(String actorId, MergeRequest request, String requestHash) {
+        if (request.primaryKey().equals(request.aliasKey())) {
+            throw ApiException.badRequest("主号与被合并号必须不同: " + request.primaryKey());
+        }
+        // 固定顺序锁定两证物行：与借出/交接/封条检查共用同一原子边界，避免并发合并死锁。
+        String firstKey = request.primaryKey().compareTo(request.aliasKey()) < 0
+                ? request.primaryKey() : request.aliasKey();
+        String secondKey = firstKey.equals(request.primaryKey())
+                ? request.aliasKey() : request.primaryKey();
+        Evidence first = lockEvidence(firstKey);
+        Evidence second = lockEvidence(secondKey);
+        Evidence primary = firstKey.equals(request.primaryKey()) ? first : second;
+        Evidence alias = firstKey.equals(request.aliasKey()) ? first : second;
+        // 当前权限先于成功重放：操作人须仍为两证物的当前保管人（保管人不同 403）。
+        if (!primary.custodianId().equals(actorId) || !alias.custodianId().equals(actorId)) {
+            throw ApiException.forbidden("操作人不是两证物当前保管人: " + actorId);
+        }
+        Optional<StoredResponse> replay = checkReplay(request.commandKey(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        if (primary.version() != request.primaryExpectedVersion()
+                || alias.version() != request.aliasExpectedVersion()) {
+            throw ApiException.conflict("证物版本已变化，期望版本过期: "
+                    + request.primaryKey() + "/" + request.aliasKey());
+        }
+        // 不能合并已是 ALIAS 的对象，避免环或多层隐式追随。
+        requireNotAlias(primary);
+        requireNotAlias(alias);
+        if (primary.status() != EvidenceStatus.SEALED || alias.status() != EvidenceStatus.SEALED) {
+            throw ApiException.unprocessable("仅两证物均为 SEALED 时允许合并: "
+                    + primary.status() + "/" + alias.status());
+        }
+        if (!primary.sealNo().equals(alias.sealNo())) {
+            throw ApiException.unprocessable("两证物封条编号不同，禁止合并");
+        }
+        if (loanRepository.findActiveByEvidenceKey(primary.evidenceKey()).isPresent()
+                || loanRepository.findActiveByEvidenceKey(alias.evidenceKey()).isPresent()) {
+            throw ApiException.unprocessable("存在未归还借出，禁止合并");
+        }
+        if (transferRepository.findPendingByEvidenceKey(primary.evidenceKey()).isPresent()
+                || transferRepository.findPendingByEvidenceKey(alias.evidenceKey()).isPresent()) {
+            throw ApiException.unprocessable("存在待接收交接，禁止合并");
+        }
+        LocalDateTime now = LocalDateTime.now();
+        evidenceRepository.markAlias(alias.evidenceKey(), primary.evidenceKey(), now);
+        evidenceRepository.advanceVersion(primary.evidenceKey(), now);
+        Evidence mergedPrimary = evidenceRepository.findByKey(primary.evidenceKey()).orElseThrow();
+        Evidence mergedAlias = evidenceRepository.findByKey(alias.evidenceKey()).orElseThrow();
+        // 冻结合并时两证物完整保管链与身份、版本；后续主号交接不回写副号历史。
+        String primarySnapshot = toJson(buildChain(mergedPrimary));
+        String aliasSnapshot = toJson(buildChain(mergedAlias));
+        mergeRepository.insert(primary.evidenceKey(), alias.evidenceKey(), actorId,
+                mergedPrimary.version(), mergedAlias.version(),
+                primarySnapshot, aliasSnapshot, now);
+        MergeEventView event = new MergeEventView(primary.evidenceKey(), alias.evidenceKey(),
+                actorId, mergedPrimary.version(), mergedAlias.version(), now);
+        return record(request.commandKey(), OP_MERGE, actorId, requestHash, 200, event);
+    }
+
+    /**
      * 按借用人查询未归还借出及逾期记录（逾期仅为查询时刻标识，不改变任何状态）。
      */
     @Transactional(readOnly = true)
@@ -336,19 +415,27 @@ public class EvidenceService {
     }
 
     /**
-     * 查询完整保管链：证物当前状态 + 全部交接记录 + 全部借出记录 + 全部核验记录。
+     * 查询完整保管链：证物当前状态 + 全部交接记录 + 全部借出记录 + 全部核验记录 + 合并事件。
+     * 别名仍按原号读取，其历史在合并时冻结，不随主号后续交接变化。
      */
     @Transactional(readOnly = true)
     public CustodyChainView custodyChain(String evidenceKey) {
         Evidence evidence = evidenceRepository.findByKey(evidenceKey)
                 .orElseThrow(() -> ApiException.notFound("证物不存在: " + evidenceKey));
+        return buildChain(evidence);
+    }
+
+    private CustodyChainView buildChain(Evidence evidence) {
+        String evidenceKey = evidence.evidenceKey();
         List<TransferView> transfers = transferRepository.findByEvidenceKey(evidenceKey)
                 .stream().map(this::toView).toList();
         List<LoanView> loans = loanRepository.findByEvidenceKey(evidenceKey)
                 .stream().map(this::toView).toList();
         List<InspectionView> inspections = inspectionRepository.findByEvidenceKey(evidenceKey)
                 .stream().map(this::toView).toList();
-        return new CustodyChainView(toView(evidence), transfers, loans, inspections);
+        List<MergeEventView> mergeEvents = mergeRepository.findInvolving(evidenceKey)
+                .stream().map(this::toView).toList();
+        return new CustodyChainView(toView(evidence), transfers, loans, inspections, mergeEvents);
     }
 
     private Evidence lockEvidence(String evidenceKey) {
@@ -365,6 +452,12 @@ public class EvidenceService {
     private void requireCustodian(Evidence evidence, String actorId) {
         if (!evidence.custodianId().equals(actorId)) {
             throw ApiException.conflict("操作人不是当前保管人: " + actorId);
+        }
+    }
+
+    private void requireNotAlias(Evidence evidence) {
+        if (evidence.status() == EvidenceStatus.ALIAS) {
+            throw ApiException.conflict("证物已合并为别名，禁止写入: " + evidence.evidenceKey());
         }
     }
 
@@ -404,6 +497,7 @@ public class EvidenceService {
     private EvidenceView toView(Evidence evidence) {
         return new EvidenceView(evidence.evidenceKey(), evidence.caseKey(), evidence.category(),
                 evidence.sealNo(), evidence.custodianId(), evidence.status(),
+                evidence.version(), evidence.aliasOf(),
                 evidence.createdAt(), evidence.updatedAt());
     }
 
@@ -424,5 +518,10 @@ public class EvidenceService {
         return new LoanView(loan.loanKey(), loan.evidenceKey(), loan.custodianId(),
                 loan.borrowerId(), loan.purpose(), loan.loanAt(), loan.dueAt(), loan.status(),
                 overdue, loan.sealPassed(), loan.returnNote(), loan.returnedAt());
+    }
+
+    private MergeEventView toView(MergeRecordRepository.MergeRecord record) {
+        return new MergeEventView(record.primaryKey(), record.aliasKey(), record.actorId(),
+                record.primaryVersion(), record.aliasVersion(), record.createdAt());
     }
 }

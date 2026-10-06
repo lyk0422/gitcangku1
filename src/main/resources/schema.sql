@@ -8,8 +8,10 @@ CREATE TABLE IF NOT EXISTS evidence (
     case_key VARCHAR(64) NOT NULL COMMENT '所属案件键，入库后不可修改',
     category VARCHAR(64) NOT NULL COMMENT '证物类别，入库后不可修改',
     seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，入库后不可修改',
-    custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变',
-    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）',
+    custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人（操作人标识），交接接受后原子切换；借出期间不变；合并不改变保管人',
+    status VARCHAR(20) NOT NULL COMMENT '证物状态：SEALED 已封存 / TRANSFER_PENDING 待接收 / BORROWED 借出未归还 / SEAL_BROKEN 封条异常（终态）/ ALIAS 已合并为别名（终态，只读）',
+    version BIGINT NOT NULL DEFAULT 1 COMMENT '证物版本：初始 1，状态写入与合并均推进 1；合并按期望版本乐观校验，旧版本拒绝',
+    alias_of VARCHAR(64) NULL COMMENT '合并后指向的最终主号证物业务键；NULL 表示非别名。别名可查询但一切写入拒绝',
     created_at DATETIME(6) NOT NULL COMMENT '入库时间，Asia/Shanghai',
     updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态或保管人变更时间，Asia/Shanghai',
     CONSTRAINT uk_evidence_key UNIQUE (evidence_key)
@@ -65,10 +67,26 @@ CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/MERGE',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
     created_at DATETIME(6) NOT NULL COMMENT '首次执行时间，Asia/Shanghai',
     CONSTRAINT uk_command_key UNIQUE (command_key)
+);
+
+-- 合并事件：只追加；记录主号轨迹上的合并事件，并冻结合并时两证物的完整保管链与身份、版本。
+-- 冻结快照为合并完成时刻的只读视图 JSON，后续主号交接不回写副号历史。
+CREATE TABLE IF NOT EXISTS merge_record (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    primary_key VARCHAR(64) NOT NULL COMMENT '合并后保留的主号证物业务键',
+    alias_key VARCHAR(64) NOT NULL COMMENT '被合并转为 ALIAS 的证物业务键，合并后一切写入拒绝',
+    actor_id VARCHAR(64) NOT NULL COMMENT '执行合并的操作人，须为两证物当前保管人',
+    primary_version BIGINT NOT NULL COMMENT '合并完成时主号版本（合并推进一次）',
+    alias_version BIGINT NOT NULL COMMENT '合并完成时别名版本（合并推进一次）',
+    primary_snapshot TEXT NOT NULL COMMENT '合并时主号完整保管链与身份、版本的冻结快照 JSON',
+    alias_snapshot TEXT NOT NULL COMMENT '合并时别名完整保管链与身份、版本的冻结快照 JSON',
+    created_at DATETIME(6) NOT NULL COMMENT '合并时间，Asia/Shanghai',
+    KEY idx_merge_primary (primary_key),
+    KEY idx_merge_alias (alias_key)
 );

@@ -58,22 +58,42 @@ public class EvidenceRepository {
     }
 
     /**
-     * 更新证物状态与保管人（交接接受时原子切换保管人）。
+     * 更新证物状态与保管人（交接接受时原子切换保管人）；状态写入推进版本。
      */
     public void updateCustody(String evidenceKey, String custodianId, EvidenceStatus status,
                               LocalDateTime now) {
         jdbc.update(
-                "UPDATE evidence SET custodian_id = ?, status = ?, updated_at = ? WHERE evidence_key = ?",
+                "UPDATE evidence SET custodian_id = ?, status = ?, version = version + 1, updated_at = ?"
+                        + " WHERE evidence_key = ?",
                 custodianId, status.name(), now, evidenceKey);
     }
 
     /**
-     * 仅更新证物状态（交接发起/取消、核验失败）。
+     * 仅更新证物状态（交接发起/取消、核验失败）；状态写入推进版本。
      */
     public void updateStatus(String evidenceKey, EvidenceStatus status, LocalDateTime now) {
         jdbc.update(
-                "UPDATE evidence SET status = ?, updated_at = ? WHERE evidence_key = ?",
+                "UPDATE evidence SET status = ?, version = version + 1, updated_at = ? WHERE evidence_key = ?",
                 status.name(), now, evidenceKey);
+    }
+
+    /**
+     * 合并推进主号版本（状态与保管人不变）。
+     */
+    public void advanceVersion(String evidenceKey, LocalDateTime now) {
+        jdbc.update(
+                "UPDATE evidence SET version = version + 1, updated_at = ? WHERE evidence_key = ?",
+                now, evidenceKey);
+    }
+
+    /**
+     * 将被合并证物转为别名：状态 ALIAS、指向最终主号、推进版本；保管人不变。
+     */
+    public void markAlias(String evidenceKey, String primaryKey, LocalDateTime now) {
+        jdbc.update(
+                "UPDATE evidence SET status = ?, alias_of = ?, version = version + 1, updated_at = ?"
+                        + " WHERE evidence_key = ?",
+                EvidenceStatus.ALIAS.name(), primaryKey, now, evidenceKey);
     }
 
     /**
@@ -96,6 +116,8 @@ public class EvidenceRepository {
                     rs.getString("seal_no"),
                     rs.getString("custodian_id"),
                     EvidenceStatus.valueOf(rs.getString("status")),
+                    rs.getLong("version"),
+                    rs.getString("alias_of"),
                     rs.getObject("created_at", LocalDateTime.class),
                     rs.getObject("updated_at", LocalDateTime.class));
         }
