@@ -2,6 +2,7 @@ package com.example.starter.baggage;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
@@ -19,6 +20,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
+import com.example.starter.baggage.BaggageDtos.ManifestItem;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
@@ -46,6 +48,7 @@ class BaggageConcurrencyTest {
         jdbcTemplate.update("DELETE FROM bag_event");
         jdbcTemplate.update("DELETE FROM load_record");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
+        jdbcTemplate.update("DELETE FROM bag_tag_alias");
         jdbcTemplate.update("DELETE FROM bag");
         jdbcTemplate.update("DELETE FROM leg");
         jdbcTemplate.update("DELETE FROM request_log");
@@ -66,7 +69,8 @@ class BaggageConcurrencyTest {
         List<Callable<Object>> tasks = new ArrayList<>();
         for (int i = 0; i < 4; i++) {
             tasks.add(() -> baggageService.load("LEG1",
-                    new LoadRequest(UUID.randomUUID().toString(), 1, List.of("BAG1"))));
+                    new LoadRequest(UUID.randomUUID().toString(), "op-1", 1,
+                            List.of("BAG1"), Map.of("BAG1", 1))));
         }
         List<Object> results = runConcurrently(tasks);
 
@@ -80,7 +84,7 @@ class BaggageConcurrencyTest {
         assertThat(conflicts).isEqualTo(3);
 
         Integer records = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM load_record WHERE bag_tag = 'BAG1'", Integer.class);
+                "SELECT COUNT(*) FROM load_record WHERE bag_id = 'ID-BAG1'", Integer.class);
         assertThat(records).isEqualTo(1);
         Integer version = jdbcTemplate.queryForObject(
                 "SELECT version FROM leg WHERE leg_id = 'LEG1'", Integer.class);
@@ -92,13 +96,15 @@ class BaggageConcurrencyTest {
         registerLeg("LEG1", "PEK", "SHA");
         registerBag("BAG1", List.of("LEG1"));
         registerBag("BAG2", List.of("LEG1"));
-        baggageService.load("LEG1", new LoadRequest(UUID.randomUUID().toString(), 1, List.of("BAG1")));
+        baggageService.load("LEG1", new LoadRequest(UUID.randomUUID().toString(), "op-1",
+                1, List.of("BAG1"), Map.of("BAG1", 1)));
 
         List<Callable<Object>> tasks = List.of(
                 () -> baggageService.load("LEG1",
-                        new LoadRequest(UUID.randomUUID().toString(), 2, List.of("BAG2"))),
+                        new LoadRequest(UUID.randomUUID().toString(), "op-1", 2,
+                                List.of("BAG2"), Map.of("BAG2", 1))),
                 () -> baggageService.seal("LEG1",
-                        new SealRequest(UUID.randomUUID().toString(), 2)));
+                        new SealRequest(UUID.randomUUID().toString(), "op-1", 2)));
         List<Object> results = runConcurrently(tasks);
 
         long successes = results.stream()
@@ -120,12 +126,14 @@ class BaggageConcurrencyTest {
         if ("OPEN".equals(status)) {
             // 装载先成功：封舱可随后以新版本完成，清单包含两件行李
             SealResponse sealed = baggageService.seal("LEG1",
-                    new SealRequest(UUID.randomUUID().toString(), 3));
-            assertThat(sealed.manifest()).containsExactly("BAG1", "BAG2");
+                    new SealRequest(UUID.randomUUID().toString(), "op-1", 3));
+            assertThat(sealed.manifest().stream().map(ManifestItem::bagTag))
+                    .containsExactly("BAG1", "BAG2");
         } else {
             // 封舱先成功：清单只有 BAG1，封舱后不得加装
             assertThat(status).isEqualTo("SEALED");
-            assertThat(baggageService.getManifest("LEG1").manifest()).containsExactly("BAG1");
+            assertThat(baggageService.getManifest("LEG1").manifest().stream()
+                    .map(ManifestItem::bagTag)).containsExactly("BAG1");
         }
     }
 
@@ -138,7 +146,8 @@ class BaggageConcurrencyTest {
         List<Callable<Object>> tasks = new ArrayList<>();
         for (int i = 0; i < 6; i++) {
             tasks.add(() -> baggageService.load("LEG1",
-                    new LoadRequest(requestId, 1, List.of("BAG1"))));
+                    new LoadRequest(requestId, "op-1", 1,
+                            List.of("BAG1"), Map.of("BAG1", 1))));
         }
         List<Object> results = runConcurrently(tasks);
 
@@ -150,7 +159,7 @@ class BaggageConcurrencyTest {
                 "SELECT version FROM leg WHERE leg_id = 'LEG1'", Integer.class);
         assertThat(version).isEqualTo(2);
         Integer records = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM load_record WHERE bag_tag = 'BAG1'", Integer.class);
+                "SELECT COUNT(*) FROM load_record WHERE bag_id = 'ID-BAG1'", Integer.class);
         assertThat(records).isEqualTo(1);
         Integer logs = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM request_log WHERE request_id = ?", Integer.class, requestId);
@@ -159,11 +168,13 @@ class BaggageConcurrencyTest {
 
     private void registerLeg(String legId, String origin, String destination) {
         baggageService.registerLeg(
-                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination));
+                new RegisterLegRequest(UUID.randomUUID().toString(), "op-1",
+                        legId, origin, destination));
     }
 
     private void registerBag(String bagTag, List<String> legIds) {
-        baggageService.registerBag(new RegisterBagRequest(UUID.randomUUID().toString(), bagTag, legIds));
+        baggageService.registerBag(new RegisterBagRequest(UUID.randomUUID().toString(),
+                "op-1", "ID-" + bagTag, bagTag, legIds));
     }
 
     /** 同步起跑并发执行任务，结果按提交顺序返回（异常包装为返回值）。 */

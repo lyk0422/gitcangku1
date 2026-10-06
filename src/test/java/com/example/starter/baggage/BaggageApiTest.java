@@ -1,5 +1,6 @@
 package com.example.starter.baggage;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -44,6 +45,7 @@ class BaggageApiTest {
         jdbcTemplate.update("DELETE FROM bag_event");
         jdbcTemplate.update("DELETE FROM load_record");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
+        jdbcTemplate.update("DELETE FROM bag_tag_alias");
         jdbcTemplate.update("DELETE FROM bag");
         jdbcTemplate.update("DELETE FROM leg");
         jdbcTemplate.update("DELETE FROM request_log");
@@ -57,6 +59,9 @@ class BaggageApiTest {
         registerLeg("LEG2", "SHA", "CAN").andExpect(status().isCreated());
 
         registerBag("BAG1", List.of("LEG1")).andExpect(status().isCreated())
+                .andExpect(jsonPath("$.bagId").value("ID-BAG1"))
+                .andExpect(jsonPath("$.bagTag").value("BAG1"))
+                .andExpect(jsonPath("$.tagGeneration").value(1))
                 .andExpect(jsonPath("$.currentLocation").value("PEK"))
                 .andExpect(jsonPath("$.status").value("IN_TRANSIT"))
                 .andExpect(jsonPath("$.itinerary", hasSize(1)));
@@ -74,11 +79,13 @@ class BaggageApiTest {
         seal("LEG1", 2).andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("SEALED"))
                 .andExpect(jsonPath("$.version").value(3))
-                .andExpect(jsonPath("$.manifest", contains("BAG1", "BAG2")));
+                .andExpect(jsonPath("$.manifest[*].bagTag", contains("BAG1", "BAG2")))
+                .andExpect(jsonPath("$.manifest[0].bagId").value("ID-BAG1"))
+                .andExpect(jsonPath("$.manifest[0].tagGeneration").value(1));
 
         mockMvc.perform(get("/api/legs/LEG1/manifest"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.manifest", contains("BAG1", "BAG2")));
+                .andExpect(jsonPath("$.manifest[*].bagTag", contains("BAG1", "BAG2")));
 
         arrive("LEG1", List.of("BAG2", "BAG1")).andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("ARRIVED"))
@@ -113,8 +120,13 @@ class BaggageApiTest {
         // 引用不存在的航段
         registerBag("BAG_X", List.of("LEG_A", "LEG_MISSING")).andExpect(status().isUnprocessableEntity());
         // 航段数超出 1~5（参数校验 400）
-        registerBag("BAG_X", List.of()).andExpect(status().isBadRequest());
-        registerBag("BAG_X", List.of("LEG_A", "LEG_A", "LEG_A", "LEG_A", "LEG_A", "LEG_A"))
+        postJson("/api/bags", registerBagBody("BAG_X", List.of())).andExpect(status().isBadRequest());
+        postJson("/api/bags", registerBagBody("BAG_X",
+                List.of("LEG_A", "LEG_A", "LEG_A", "LEG_A", "LEG_A", "LEG_A")))
+                .andExpect(status().isBadRequest());
+        // operator 缺失 -> 400
+        postJson("/api/bags", Map.of("requestId", UUID.randomUUID().toString(),
+                "bagId", "ID-NOOP", "bagTag", "BAG_NOOP", "legIds", List.of("LEG_A")))
                 .andExpect(status().isBadRequest());
     }
 
@@ -125,6 +137,10 @@ class BaggageApiTest {
 
         registerBag("BAG1", List.of("LEG1")).andExpect(status().isCreated());
         registerBag("BAG1", List.of("LEG1")).andExpect(status().isConflict());
+        // 同一标签不得再登记给另一实物（即便 bagId 不同）
+        postJson("/api/bags", Map.of("requestId", UUID.randomUUID().toString(),
+                "operator", "op-1", "bagId", "ID-OTHER", "bagTag", "BAG1",
+                "legIds", List.of("LEG1"))).andExpect(status().isConflict());
     }
 
     @Test
@@ -158,10 +174,10 @@ class BaggageApiTest {
         load("LEG1", 99, List.of("BAG1")).andExpect(status().isConflict());
         // 请求内 bagTag 重复 -> 422
         load("LEG1", 1, List.of("BAG1", "BAG1")).andExpect(status().isUnprocessableEntity());
-        // 行李不存在 -> 422
-        load("LEG1", 1, List.of("BAG_MISSING")).andExpect(status().isUnprocessableEntity());
+        // 行李不存在 -> 404（完全未知标签）
+        load("LEG1", 1, List.of("BAG_MISSING")).andExpect(status().isNotFound());
         // 批量大小越界 -> 400
-        load("LEG1", 1, List.of()).andExpect(status().isBadRequest());
+        postJson("/api/legs/LEG1/load", loadBody(1, List.of())).andExpect(status().isBadRequest());
         // 航段不存在 -> 404
         load("LEG_MISSING", 1, List.of("BAG1")).andExpect(status().isNotFound());
 
@@ -171,6 +187,36 @@ class BaggageApiTest {
         // 封舱后不得加装
         seal("LEG1", 2).andExpect(status().isOk());
         load("LEG1", 3, List.of("BAG1")).andExpect(status().isUnprocessableEntity());
+    }
+
+    @Test
+    void load_rejectsWrongTagGeneration() throws Exception {
+        registerLeg("LEG1", "PEK", "SHA").andExpect(status().isCreated());
+        registerBag("BAG1", List.of("LEG1")).andExpect(status().isCreated());
+
+        // 标签正确但期望代次错误 -> 409
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("requestId", UUID.randomUUID().toString());
+        body.put("operator", "op-1");
+        body.put("expectedVersion", 1);
+        body.put("bagTags", List.of("BAG1"));
+        body.put("expectedTagGenerations", Map.of("BAG1", 7));
+        postJson("/api/legs/LEG1/load", body).andExpect(status().isConflict());
+
+        // 缺少该行李的期望代次条目（给了别的键）-> 409
+        Map<String, Object> missing = new LinkedHashMap<>();
+        missing.put("requestId", UUID.randomUUID().toString());
+        missing.put("operator", "op-1");
+        missing.put("expectedVersion", 1);
+        missing.put("bagTags", List.of("BAG1"));
+        missing.put("expectedTagGenerations", Map.of("BAG_OTHER", 1));
+        postJson("/api/legs/LEG1/load", missing).andExpect(status().isConflict());
+
+        // 航段版本不变、行李未移动
+        mockMvc.perform(get("/api/legs/LEG1/manifest"))
+                .andExpect(jsonPath("$.version").value(1));
+        mockMvc.perform(get("/api/bags/BAG1/trace"))
+                .andExpect(jsonPath("$.loadedLegId").doesNotExist());
     }
 
     @Test
@@ -223,7 +269,8 @@ class BaggageApiTest {
     void idempotency_replaysSameKeySameParams() throws Exception {
         String requestId = UUID.randomUUID().toString();
         Map<String, Object> body = Map.of(
-                "requestId", requestId, "legId", "LEG1", "origin", "PEK", "destination", "SHA");
+                "requestId", requestId, "operator", "op-1", "legId", "LEG1",
+                "origin", "PEK", "destination", "SHA");
         postJson("/api/legs", body).andExpect(status().isCreated())
                 .andExpect(jsonPath("$.version").value(1));
         // 同键同参重放：返回原成功结果，不产生第二条航段
@@ -236,8 +283,12 @@ class BaggageApiTest {
         // 装载重放：版本只推进一次
         registerBag("BAG1", List.of("LEG1")).andExpect(status().isCreated());
         String loadRequestId = UUID.randomUUID().toString();
-        Map<String, Object> loadBody = Map.of(
-                "requestId", loadRequestId, "expectedVersion", 1, "bagTags", List.of("BAG1"));
+        Map<String, Object> loadBody = new LinkedHashMap<>();
+        loadBody.put("requestId", loadRequestId);
+        loadBody.put("operator", "op-1");
+        loadBody.put("expectedVersion", 1);
+        loadBody.put("bagTags", List.of("BAG1"));
+        loadBody.put("expectedTagGenerations", Map.of("BAG1", 1));
         postJson("/api/legs/LEG1/load", loadBody).andExpect(status().isOk())
                 .andExpect(jsonPath("$.version").value(2));
         postJson("/api/legs/LEG1/load", loadBody).andExpect(status().isOk())
@@ -249,10 +300,16 @@ class BaggageApiTest {
     @Test
     void idempotency_sameKeyDifferentParamsReturns409() throws Exception {
         String requestId = UUID.randomUUID().toString();
-        postJson("/api/legs", Map.of("requestId", requestId, "legId", "LEG1",
-                "origin", "PEK", "destination", "SHA")).andExpect(status().isCreated());
-        postJson("/api/legs", Map.of("requestId", requestId, "legId", "LEG2",
-                "origin", "PEK", "destination", "SHA")).andExpect(status().isConflict());
+        postJson("/api/legs", Map.of("requestId", requestId, "operator", "op-1",
+                "legId", "LEG1", "origin", "PEK", "destination", "SHA"))
+                .andExpect(status().isCreated());
+        postJson("/api/legs", Map.of("requestId", requestId, "operator", "op-1",
+                "legId", "LEG2", "origin", "PEK", "destination", "SHA"))
+                .andExpect(status().isConflict());
+        // 仅操作者不同也视为异参 -> 409
+        postJson("/api/legs", Map.of("requestId", requestId, "operator", "op-2",
+                "legId", "LEG1", "origin", "PEK", "destination", "SHA"))
+                .andExpect(status().isConflict());
     }
 
     @Test
@@ -262,15 +319,14 @@ class BaggageApiTest {
 
         String requestId = UUID.randomUUID().toString();
         // 先以错误版本失败（409），不占键
-        postJson("/api/legs/LEG1/load", Map.of("requestId", requestId,
-                "expectedVersion", 99, "bagTags", List.of("BAG1"))).andExpect(status().isConflict());
-        // 再以业务失败（422），同样不占键
-        postJson("/api/legs/LEG1/load", Map.of("requestId", requestId,
-                "expectedVersion", 1, "bagTags", List.of("BAG_MISSING")))
-                .andExpect(status().isUnprocessableEntity());
+        postJson("/api/legs/LEG1/load", bodyWithVersion(requestId, 99, "BAG1", 1))
+                .andExpect(status().isConflict());
+        // 再以业务失败（404），同样不占键
+        postJson("/api/legs/LEG1/load", bodyWithVersion(requestId, 1, "BAG_MISSING", 1))
+                .andExpect(status().isNotFound());
         // 修正参数后同键成功
-        postJson("/api/legs/LEG1/load", Map.of("requestId", requestId,
-                "expectedVersion", 1, "bagTags", List.of("BAG1"))).andExpect(status().isOk())
+        postJson("/api/legs/LEG1/load", bodyWithVersion(requestId, 1, "BAG1", 1))
+                .andExpect(status().isOk())
                 .andExpect(jsonPath("$.version").value(2));
     }
 
@@ -280,30 +336,63 @@ class BaggageApiTest {
         mockMvc.perform(get("/api/legs/NOPE/manifest")).andExpect(status().isNotFound());
     }
 
+    private Map<String, Object> bodyWithVersion(String requestId, int version,
+                                                String bagTag, int generation) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("requestId", requestId);
+        body.put("operator", "op-1");
+        body.put("expectedVersion", version);
+        body.put("bagTags", List.of(bagTag));
+        body.put("expectedTagGenerations", Map.of(bagTag, generation));
+        return body;
+    }
+
     private ResultActions registerLeg(String legId, String origin, String destination) throws Exception {
         return postJson("/api/legs", Map.of("requestId", UUID.randomUUID().toString(),
-                "legId", legId, "origin", origin, "destination", destination));
+                "operator", "op-1", "legId", legId, "origin", origin, "destination", destination));
+    }
+
+    private Map<String, Object> registerBagBody(String bagTag, List<String> legIds) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("requestId", UUID.randomUUID().toString());
+        body.put("operator", "op-1");
+        body.put("bagId", "ID-" + bagTag);
+        body.put("bagTag", bagTag);
+        body.put("legIds", legIds);
+        return body;
     }
 
     private ResultActions registerBag(String bagTag, List<String> legIds) throws Exception {
-        return postJson("/api/bags", Map.of("requestId", UUID.randomUUID().toString(),
-                "bagTag", bagTag, "legIds", legIds));
+        return postJson("/api/bags", registerBagBody(bagTag, legIds));
+    }
+
+    private Map<String, Object> loadBody(int expectedVersion, List<String> bagTags) {
+        Map<String, Integer> generations = new LinkedHashMap<>();
+        for (String bagTag : bagTags) {
+            generations.put(bagTag, 1);
+        }
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("requestId", UUID.randomUUID().toString());
+        body.put("operator", "op-1");
+        body.put("expectedVersion", expectedVersion);
+        body.put("bagTags", bagTags);
+        body.put("expectedTagGenerations", generations);
+        return body;
     }
 
     private ResultActions load(String legId, int expectedVersion, List<String> bagTags) throws Exception {
-        return postJson("/api/legs/" + legId + "/load", Map.of(
-                "requestId", UUID.randomUUID().toString(),
-                "expectedVersion", expectedVersion, "bagTags", bagTags));
+        return postJson("/api/legs/" + legId + "/load", loadBody(expectedVersion, bagTags));
     }
 
     private ResultActions seal(String legId, int expectedVersion) throws Exception {
         return postJson("/api/legs/" + legId + "/seal", Map.of(
-                "requestId", UUID.randomUUID().toString(), "expectedVersion", expectedVersion));
+                "requestId", UUID.randomUUID().toString(), "operator", "op-1",
+                "expectedVersion", expectedVersion));
     }
 
     private ResultActions arrive(String legId, List<String> bagTags) throws Exception {
         return postJson("/api/legs/" + legId + "/arrive", Map.of(
-                "requestId", UUID.randomUUID().toString(), "bagTags", bagTags));
+                "requestId", UUID.randomUUID().toString(), "operator", "op-1", "bagTags", bagTags));
     }
 
     private ResultActions postJson(String url, Object body) throws Exception {

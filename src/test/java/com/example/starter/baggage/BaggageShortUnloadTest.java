@@ -2,6 +2,7 @@ package com.example.starter.baggage;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -25,6 +26,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
+import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
@@ -67,6 +69,7 @@ class BaggageShortUnloadTest {
         jdbcTemplate.update("DELETE FROM bag_event");
         jdbcTemplate.update("DELETE FROM load_record");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
+        jdbcTemplate.update("DELETE FROM bag_tag_alias");
         jdbcTemplate.update("DELETE FROM bag");
         jdbcTemplate.update("DELETE FROM leg");
         jdbcTemplate.update("DELETE FROM request_log");
@@ -94,11 +97,12 @@ class BaggageShortUnloadTest {
         diffArrive("LEG1", 3, List.of("BAG1")).andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("ARRIVED"))
                 .andExpect(jsonPath("$.version").value(4))
-                .andExpect(jsonPath("$.arrived", contains("BAG1")))
-                .andExpect(jsonPath("$.shortUnloaded", contains("BAG2")));
+                .andExpect(jsonPath("$.arrived[*].bagTag", contains("BAG1")))
+                .andExpect(jsonPath("$.shortUnloaded[*].bagTag", contains("BAG2")));
 
         // 实际到达行李推进并交付
         mockMvc.perform(get("/api/bags/BAG1/trace"))
+                .andExpect(jsonPath("$.bagId").value("ID-BAG1"))
                 .andExpect(jsonPath("$.currentLocation").value("SHA"))
                 .andExpect(jsonPath("$.nextLegIndex").value(1))
                 .andExpect(jsonPath("$.status").value("DELIVERED"))
@@ -121,8 +125,8 @@ class BaggageShortUnloadTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("ARRIVED"))
                 .andExpect(jsonPath("$.arrivalType").value("DIFF"))
-                .andExpect(jsonPath("$.manifest", contains("BAG1", "BAG2")))
-                .andExpect(jsonPath("$.actual", contains("BAG1")));
+                .andExpect(jsonPath("$.manifest[*].bagTag", contains("BAG1", "BAG2")))
+                .andExpect(jsonPath("$.actual[*].bagTag", contains("BAG1")));
 
         // 未补到清单
         mockMvc.perform(get("/api/bags/short-unloaded"))
@@ -142,8 +146,10 @@ class BaggageShortUnloadTest {
         load("LEG2", 1, List.of("BAG2")).andExpect(status().isUnprocessableEntity());
 
         // 补到后恢复行程
-        recover("BAG2", "LEG1", "SHA").andExpect(status().isOk())
+        recover("BAG2", 1, "LEG1", "SHA").andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("RECOVERED"))
+                .andExpect(jsonPath("$.bagTag").value("BAG2"))
+                .andExpect(jsonPath("$.tagGeneration").value(1))
                 .andExpect(jsonPath("$.currentLocation").value("SHA"))
                 .andExpect(jsonPath("$.nextLegIndex").value(1))
                 .andExpect(jsonPath("$.recoveredLegId").value("LEG1"));
@@ -178,7 +184,7 @@ class BaggageShortUnloadTest {
 
         diffArrive("LEG1", 3, List.of()).andExpect(status().isOk())
                 .andExpect(jsonPath("$.arrived", hasSize(0)))
-                .andExpect(jsonPath("$.shortUnloaded", contains("BAG1", "BAG2")));
+                .andExpect(jsonPath("$.shortUnloaded[*].bagTag", contains("BAG1", "BAG2")));
 
         mockMvc.perform(get("/api/legs/LEG1/difference"))
                 .andExpect(jsonPath("$.arrivalType").value("DIFF"))
@@ -265,7 +271,7 @@ class BaggageShortUnloadTest {
         // 精确到达快照：actual 等于完整清单
         mockMvc.perform(get("/api/legs/LEG2/difference"))
                 .andExpect(jsonPath("$.arrivalType").value("EXACT"))
-                .andExpect(jsonPath("$.actual", contains("BAG3")));
+                .andExpect(jsonPath("$.actual[*].bagTag", contains("BAG3")));
     }
 
     @Test
@@ -276,7 +282,7 @@ class BaggageShortUnloadTest {
         seal("LEG1", 2);
         diffArrive("LEG1", 3, List.of()).andExpect(status().isOk());
 
-        recover("BAG1", "LEG1", "SHA").andExpect(status().isOk())
+        recover("BAG1", 1, "LEG1", "SHA").andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("DELIVERED"))
                 .andExpect(jsonPath("$.nextLegIndex").value(1));
         mockMvc.perform(get("/api/bags/BAG1/trace"))
@@ -286,7 +292,7 @@ class BaggageShortUnloadTest {
     }
 
     @Test
-    void recover_rejectsWrongStationWrongLegUnknownAndDoubleRecover() throws Exception {
+    void recover_rejectsWrongStationWrongLegUnknownStaleTagAndDoubleRecover() throws Exception {
         registerLeg("LEG1", "PEK", "SHA");
         registerLeg("LEG2", "SHA", "CAN");
         registerBag("BAG1", List.of("LEG1", "LEG2"));
@@ -295,20 +301,22 @@ class BaggageShortUnloadTest {
         diffArrive("LEG1", 3, List.of()).andExpect(status().isOk());
 
         // 实际站与缺失航段到达站不一致 -> 422
-        recover("BAG1", "LEG1", "CAN").andExpect(status().isUnprocessableEntity());
+        recover("BAG1", 1, "LEG1", "CAN").andExpect(status().isUnprocessableEntity());
         // 缺失航段不匹配 -> 409（改航段）
-        recover("BAG1", "LEG2", "SHA").andExpect(status().isConflict());
+        recover("BAG1", 1, "LEG2", "SHA").andExpect(status().isConflict());
+        // 期望代次不匹配 -> 409
+        recover("BAG1", 9, "LEG1", "SHA").andExpect(status().isConflict());
         // 行李不存在 -> 404
-        recover("BAG_MISSING", "LEG1", "SHA").andExpect(status().isNotFound());
+        recover("BAG_MISSING", 1, "LEG1", "SHA").andExpect(status().isNotFound());
 
         // 非短卸行李不可补到
         registerBag("BAG2", List.of("LEG1"));
-        recover("BAG2", "LEG1", "SHA").andExpect(status().isUnprocessableEntity());
+        recover("BAG2", 1, "LEG1", "SHA").andExpect(status().isUnprocessableEntity());
 
         // 合法补到成功
-        recover("BAG1", "LEG1", "SHA").andExpect(status().isOk());
+        recover("BAG1", 1, "LEG1", "SHA").andExpect(status().isOk());
         // 已补到不得再次推进 -> 409
-        recover("BAG1", "LEG1", "SHA").andExpect(status().isConflict());
+        recover("BAG1", 1, "LEG1", "SHA").andExpect(status().isConflict());
     }
 
     @Test
@@ -338,7 +346,7 @@ class BaggageShortUnloadTest {
         assertThat(records).isZero();
 
         // 补到后整批可成功
-        recover("BAG_SHORT", "LEG1", "SHA").andExpect(status().isOk());
+        recover("BAG_SHORT", 1, "LEG1", "SHA").andExpect(status().isOk());
         load("LEG2", 1, List.of("BAG_OK", "BAG_SHORT")).andExpect(status().isOk())
                 .andExpect(jsonPath("$.loaded", contains("BAG_OK", "BAG_SHORT")));
     }
@@ -353,17 +361,15 @@ class BaggageShortUnloadTest {
 
         // 同参重放原结果
         String requestId = UUID.randomUUID().toString();
-        postJson("/api/bags/recover", Map.of("requestId", requestId,
-                "bagTag", "BAG1", "missingLegId", "LEG1", "actualStation", "SHA"))
+        recoverBody(requestId, "BAG1", 1, "LEG1", "SHA", "op-1")
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("DELIVERED"));
-        postJson("/api/bags/recover", Map.of("requestId", requestId,
-                "bagTag", "BAG1", "missingLegId", "LEG1", "actualStation", "SHA"))
+        recoverBody(requestId, "BAG1", 1, "LEG1", "SHA", "op-1")
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("DELIVERED"));
         // 事件只追加一次
         Integer eventCount = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM bag_event WHERE bag_tag = 'BAG1' AND event_type = 'RECOVERED'",
+                "SELECT COUNT(*) FROM bag_event WHERE bag_id = 'ID-BAG1' AND event_type = 'RECOVERED'",
                 Integer.class);
         assertThat(eventCount).isEqualTo(1);
         Integer logs = jdbcTemplate.queryForObject(
@@ -371,8 +377,10 @@ class BaggageShortUnloadTest {
         assertThat(logs).isEqualTo(1);
 
         // 同 requestId 改站 -> 409
-        postJson("/api/bags/recover", Map.of("requestId", requestId,
-                "bagTag", "BAG1", "missingLegId", "LEG1", "actualStation", "CAN"))
+        recoverBody(requestId, "BAG1", 1, "LEG1", "CAN", "op-1")
+                .andExpect(status().isConflict());
+        // 同 requestId 改操作者 -> 409
+        recoverBody(requestId, "BAG1", 1, "LEG1", "SHA", "op-2")
                 .andExpect(status().isConflict());
 
         // 失败不占键：短卸行李先以错误站失败（422），再用同键正确参数成功
@@ -383,11 +391,9 @@ class BaggageShortUnloadTest {
         diffArrive("LEG3", 3, List.of()).andExpect(status().isOk());
 
         String retryKey = UUID.randomUUID().toString();
-        postJson("/api/bags/recover", Map.of("requestId", retryKey,
-                "bagTag", "BAG3", "missingLegId", "LEG3", "actualStation", "CAN"))
+        recoverBody(retryKey, "BAG3", 1, "LEG3", "CAN", "op-1")
                 .andExpect(status().isUnprocessableEntity());
-        postJson("/api/bags/recover", Map.of("requestId", retryKey,
-                "bagTag", "BAG3", "missingLegId", "LEG3", "actualStation", "SHA"))
+        recoverBody(retryKey, "BAG3", 1, "LEG3", "SHA", "op-1")
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("DELIVERED"));
     }
@@ -405,14 +411,14 @@ class BaggageShortUnloadTest {
         // 补到与后续航段批量装载真实并发：顺序只能是“装载失败整批不移动”或“补到先提交后装载成功”
         List<Callable<Object>> tasks = List.of(
                 () -> baggageService.recover(new RecoverRequest(
-                        UUID.randomUUID().toString(), "BAG_SHORT", "LEG1", "SHA")),
+                        UUID.randomUUID().toString(), "op-1", "BAG_SHORT", 1, "LEG1", "SHA")),
                 () -> baggageService.load("LEG2",
-                        new LoadRequest(UUID.randomUUID().toString(), 1,
-                                List.of("BAG_OK", "BAG_SHORT"))));
+                        new LoadRequest(UUID.randomUUID().toString(), "op-1", 1,
+                                List.of("BAG_OK", "BAG_SHORT"),
+                                new LinkedHashMap<>(Map.of("BAG_OK", 1, "BAG_SHORT", 1)))));
         List<Object> results = runConcurrently(tasks);
 
-        boolean loadSucceeded = results.stream()
-                .anyMatch(r -> r instanceof com.example.starter.baggage.BaggageDtos.LoadResponse);
+        boolean loadSucceeded = results.stream().anyMatch(LoadResponse.class::isInstance);
         boolean loadFailed = results.stream()
                 .filter(ApiException.class::isInstance)
                 .map(ApiException.class::cast)
@@ -420,59 +426,76 @@ class BaggageShortUnloadTest {
         assertThat(loadSucceeded).isNotEqualTo(loadFailed);
 
         Integer okLoaded = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM load_record WHERE bag_tag = 'BAG_OK'", Integer.class);
+                "SELECT COUNT(*) FROM load_record WHERE bag_id = 'ID-BAG_OK'", Integer.class);
         if (loadSucceeded) {
             // 补到先提交：整批两件都进入清单
             assertThat(okLoaded).isEqualTo(1);
             Integer shortLoaded = jdbcTemplate.queryForObject(
-                    "SELECT COUNT(*) FROM load_record WHERE bag_tag = 'BAG_SHORT'", Integer.class);
+                    "SELECT COUNT(*) FROM load_record WHERE bag_id = 'ID-BAG_SHORT'", Integer.class);
             assertThat(shortLoaded).isEqualTo(1);
             String shortStatus = jdbcTemplate.queryForObject(
-                    "SELECT status FROM bag WHERE bag_tag = 'BAG_SHORT'", String.class);
+                    "SELECT status FROM bag WHERE bag_id = 'ID-BAG_SHORT'", String.class);
             assertThat(shortStatus).isEqualTo("RECOVERED");
         } else {
             // 装载先尝试且失败：整批不移动，补到完成后再装载必然成功
             assertThat(okLoaded).isZero();
-            recover("BAG_SHORT", "LEG1", "SHA").andExpect(status().isOk());
+            recover("BAG_SHORT", 1, "LEG1", "SHA").andExpect(status().isOk());
             load("LEG2", 1, List.of("BAG_OK", "BAG_SHORT")).andExpect(status().isOk());
         }
     }
 
     private void registerLeg(String legId, String origin, String destination) {
         baggageService.registerLeg(
-                new RegisterLegRequest(UUID.randomUUID().toString(), legId, origin, destination));
+                new RegisterLegRequest(UUID.randomUUID().toString(), "op-1",
+                        legId, origin, destination));
     }
 
     private void registerBag(String bagTag, List<String> legIds) {
-        baggageService.registerBag(new RegisterBagRequest(UUID.randomUUID().toString(), bagTag, legIds));
+        baggageService.registerBag(new RegisterBagRequest(UUID.randomUUID().toString(),
+                "op-1", "ID-" + bagTag, bagTag, legIds));
     }
 
     private ResultActions load(String legId, int expectedVersion, List<String> bagTags) throws Exception {
+        Map<String, Integer> generations = new LinkedHashMap<>();
+        for (String bagTag : bagTags) {
+            generations.put(bagTag, 1);
+        }
         return postJson("/api/legs/" + legId + "/load", Map.of(
-                "requestId", UUID.randomUUID().toString(),
-                "expectedVersion", expectedVersion, "bagTags", bagTags));
+                "requestId", UUID.randomUUID().toString(), "operator", "op-1",
+                "expectedVersion", expectedVersion, "bagTags", bagTags,
+                "expectedTagGenerations", generations));
     }
 
     private ResultActions seal(String legId, int expectedVersion) throws Exception {
         return postJson("/api/legs/" + legId + "/seal", Map.of(
-                "requestId", UUID.randomUUID().toString(), "expectedVersion", expectedVersion));
+                "requestId", UUID.randomUUID().toString(), "operator", "op-1",
+                "expectedVersion", expectedVersion));
     }
 
     private ResultActions arriveExact(String legId, List<String> bagTags) throws Exception {
         return postJson("/api/legs/" + legId + "/arrive", Map.of(
-                "requestId", UUID.randomUUID().toString(), "bagTags", bagTags));
+                "requestId", UUID.randomUUID().toString(), "operator", "op-1", "bagTags", bagTags));
     }
 
     private ResultActions diffArrive(String legId, int expectedVersion, List<String> bagTags) throws Exception {
         return postJson("/api/legs/" + legId + "/arrive-difference", Map.of(
-                "requestId", UUID.randomUUID().toString(),
+                "requestId", UUID.randomUUID().toString(), "operator", "op-1",
                 "expectedVersion", expectedVersion, "bagTags", bagTags));
     }
 
-    private ResultActions recover(String bagTag, String missingLegId, String actualStation) throws Exception {
+    private ResultActions recover(String bagTag, int expectedGeneration,
+                                  String missingLegId, String actualStation) throws Exception {
+        return recoverBody(UUID.randomUUID().toString(), bagTag, expectedGeneration,
+                missingLegId, actualStation, "op-1");
+    }
+
+    private ResultActions recoverBody(String requestId, String bagTag, int expectedGeneration,
+                                      String missingLegId, String actualStation, String operator)
+            throws Exception {
         return postJson("/api/bags/recover", Map.of(
-                "requestId", UUID.randomUUID().toString(),
-                "bagTag", bagTag, "missingLegId", missingLegId, "actualStation", actualStation));
+                "requestId", requestId, "operator", operator, "bagTag", bagTag,
+                "expectedTagGeneration", expectedGeneration,
+                "missingLegId", missingLegId, "actualStation", actualStation));
     }
 
     private ResultActions postJson(String url, Object body) throws Exception {
