@@ -2,6 +2,7 @@ package com.example.starter.plan.web;
 
 import com.example.starter.plan.service.PlanService;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
+import com.example.starter.plan.web.dto.EnvelopeSnapshotView;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
 import com.example.starter.plan.web.dto.PublishedSlotView;
@@ -102,6 +103,14 @@ public class PlanController {
     @GetMapping("/plans/{scheduleKey}")
     public PlanResponse getPlan(@PathVariable String scheduleKey) {
         return service.getPlan(scheduleKey);
+    }
+
+    /**
+     * 查询计划发布/改签成功时冻结的制动包络判定快照（速度、参数与精确判定依据）。
+     */
+    @GetMapping("/plans/{scheduleKey}/envelope-snapshots")
+    public List<EnvelopeSnapshotView> getEnvelopeSnapshots(@PathVariable String scheduleKey) {
+        return service.getEnvelopeSnapshots(scheduleKey);
     }
 
     /**

@@ -1,14 +1,19 @@
 package com.example.starter.plan.service;
 
 import com.example.starter.plan.model.DayPlan;
+import com.example.starter.plan.model.EnvelopeSnapshot;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.model.SectionProfile;
+import com.example.starter.plan.model.TrainProfile;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
+import com.example.starter.plan.repo.ProfileRepository;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
+import com.example.starter.plan.web.dto.EnvelopeSnapshotView;
 import com.example.starter.plan.web.dto.OccupancyRequest;
 import com.example.starter.plan.web.dto.OccupancyView;
 import com.example.starter.plan.web.dto.PlanResponse;
@@ -19,6 +24,7 @@ import com.example.starter.plan.web.dto.RescheduleRequest;
 import com.example.starter.plan.web.dto.RescheduleResponse;
 import com.example.starter.plan.web.dto.UpdateOccupanciesRequest;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -59,13 +65,16 @@ public class PlanService {
     private static final String OP_RESCHEDULE = "RESCHEDULE";
 
     private final PlanRepository planRepo;
+    private final ProfileRepository profileRepo;
     private final IdempotencyRepository idemRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
-    public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+    public PlanService(PlanRepository planRepo, ProfileRepository profileRepo,
+                       IdempotencyRepository idemRepo,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
+        this.profileRepo = profileRepo;
         this.idemRepo = idemRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
@@ -162,7 +171,9 @@ public class PlanService {
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
                 long now = System.currentTimeMillis();
+                List<EnvelopeSnapshot> snapshots = checkEnvelope(plan, occupancies, now);
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                planRepo.insertEnvelopeSnapshots(snapshots);
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
                 return response;
@@ -261,9 +272,11 @@ public class PlanService {
                             "新草稿存在时隙冲突，改签未生效", conflicts);
                 }
                 long now = System.currentTimeMillis();
+                List<EnvelopeSnapshot> snapshots = checkEnvelope(newPlan, occupancies, now);
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+                planRepo.insertEnvelopeSnapshots(snapshots);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
                 idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
@@ -339,7 +352,8 @@ public class PlanService {
         DayPlan plan = planRepo.findByKey(scheduleKey)
                 .orElseThrow(() -> notFound(scheduleKey));
         List<OccupancyView> views = planRepo.findOccupancies(plan.id()).stream()
-                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
+                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc(),
+                        o.speedV()))
                 .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
                 plan.status().name(), views);
@@ -349,7 +363,8 @@ public class PlanService {
         List<Occupancy> result = new ArrayList<>(requests.size());
         for (int i = 0; i < requests.size(); i++) {
             OccupancyRequest r = requests.get(i);
-            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.startUtc(), r.endUtc()));
+            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.startUtc(),
+                    r.endUtc(), r.speedV()));
         }
         return result;
     }
@@ -453,6 +468,67 @@ public class PlanService {
     }
 
     /**
+     * 候选占用集合逐项做制动包络检查（无速度占用不适用，跳过且保持原接口）。
+     * 缺列车或区段档案抛 404；任一占用所需制动距离超过防护距离则汇总抛 422
+     * （携带列车、区段与精确判定依据），整次发布/改签不写占用。
+     * 全部通过时返回待冻结的判定快照（速度、参数与左右值）。
+     */
+    private List<EnvelopeSnapshot> checkEnvelope(DayPlan plan, List<Occupancy> occupancies,
+                                                 long now) {
+        List<EnvelopeSnapshot> snapshots = new ArrayList<>();
+        List<Map<String, Object>> violations = new ArrayList<>();
+        for (Occupancy o : occupancies) {
+            if (o.speedV() == null) {
+                continue;
+            }
+            TrainProfile train = profileRepo.findTrainProfile(o.trainNo())
+                    .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                            "TRAIN_PROFILE_NOT_FOUND", "列车档案不存在: " + o.trainNo()));
+            SectionProfile section = profileRepo.findSectionProfile(o.sectionId())
+                    .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                            "SECTION_PROFILE_NOT_FOUND", "区段档案不存在: " + o.sectionId()));
+            BigDecimal lhs = EnvelopeMath.leftValue(o.speedV(), train.reactionT(),
+                    train.baseDecelA());
+            BigDecimal rhs = EnvelopeMath.rightValue(train.baseDecelA(), section.protectD());
+            if (lhs.compareTo(rhs) > 0) {
+                Map<String, Object> detail = new LinkedHashMap<>();
+                detail.put("type", "ENVELOPE_EXCEEDED");
+                detail.put("scheduleKey", plan.scheduleKey());
+                detail.put("trainNo", o.trainNo());
+                detail.put("sectionId", o.sectionId());
+                detail.put("speedV", o.speedV());
+                detail.put("reactionTimeT", train.reactionT());
+                detail.put("baseDecelA", train.baseDecelA());
+                detail.put("protectDistanceD", section.protectD());
+                detail.put("leftValue", lhs);
+                detail.put("rightValue", rhs);
+                violations.add(detail);
+            } else {
+                snapshots.add(new EnvelopeSnapshot(0L, plan.id(), o.id(), o.trainNo(),
+                        o.sectionId(), o.speedV(), train.reactionT(), train.baseDecelA(),
+                        section.protectD(), lhs, rhs, now));
+            }
+        }
+        if (!violations.isEmpty()) {
+            throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ENVELOPE_EXCEEDED",
+                    "所需制动距离超过区段防护距离，计划保持草稿", violations);
+        }
+        return snapshots;
+    }
+
+    /**
+     * 查询计划已冻结的制动包络判定快照；计划不存在返回 404。
+     */
+    public List<EnvelopeSnapshotView> getEnvelopeSnapshots(String scheduleKey) {
+        DayPlan plan = planRepo.findByKey(scheduleKey)
+                .orElseThrow(() -> notFound(scheduleKey));
+        return planRepo.findEnvelopeSnapshots(plan.id()).stream()
+                .map(s -> new EnvelopeSnapshotView(s.trainNo(), s.sectionId(), s.speedV(),
+                        s.reactionT(), s.baseDecelA(), s.protectD(), s.lhsValue(), s.rhsValue()))
+                .toList();
+    }
+
+    /**
      * 幂等重放：存在记录且参数一致返回首次结果；参数不一致抛 409。
      */
     private Optional<PlanResponse> replayIfPresent(String opType, String requestKey, String hash) {
@@ -507,7 +583,9 @@ public class PlanService {
     private void appendOccupancies(StringBuilder sb, List<OccupancyRequest> occupancies) {
         for (OccupancyRequest o : occupancies) {
             sb.append('\n').append(o.trainNo()).append('|').append(o.sectionId()).append('|')
-                    .append(o.startUtc().toEpochMilli()).append('|').append(o.endUtc().toEpochMilli());
+                    .append(o.startUtc().toEpochMilli()).append('|').append(o.endUtc().toEpochMilli())
+                    .append('|').append(o.speedV() == null ? "null"
+                            : o.speedV().stripTrailingZeros().toPlainString());
         }
     }
 

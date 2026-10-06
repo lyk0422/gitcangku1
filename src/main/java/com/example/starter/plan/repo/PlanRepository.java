@@ -1,6 +1,7 @@
 package com.example.starter.plan.repo;
 
 import com.example.starter.plan.model.DayPlan;
+import com.example.starter.plan.model.EnvelopeSnapshot;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
@@ -41,7 +42,22 @@ public class PlanRepository {
             rs.getString("train_no"),
             rs.getString("section_id"),
             Instant.ofEpochMilli(rs.getLong("start_utc")),
-            Instant.ofEpochMilli(rs.getLong("end_utc")));
+            Instant.ofEpochMilli(rs.getLong("end_utc")),
+            rs.getBigDecimal("speed_v"));
+
+    private static final RowMapper<EnvelopeSnapshot> SNAPSHOT_MAPPER = (rs, n) -> new EnvelopeSnapshot(
+            rs.getLong("id"),
+            rs.getLong("plan_id"),
+            rs.getLong("occupancy_id"),
+            rs.getString("train_no"),
+            rs.getString("section_id"),
+            rs.getBigDecimal("speed_v"),
+            rs.getBigDecimal("reaction_t"),
+            rs.getBigDecimal("base_decel_a"),
+            rs.getBigDecimal("protect_d"),
+            rs.getBigDecimal("lhs_value"),
+            rs.getBigDecimal("rhs_value"),
+            rs.getLong("created_at"));
 
     private static final RowMapper<RescheduleLink> LINK_MAPPER = (rs, n) -> new RescheduleLink(
             rs.getLong("id"),
@@ -115,8 +131,9 @@ public class PlanRepository {
      */
     public void insertOccupancies(long planId, List<Occupancy> occupancies) {
         jdbc.batchUpdate(
-                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, start_utc, end_utc)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO rail_plan_occupancy"
+                        + " (plan_id, seq, train_no, section_id, start_utc, end_utc, speed_v)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 occupancies, occupancies.size(),
                 (ps, o) -> {
                     ps.setLong(1, planId);
@@ -125,6 +142,7 @@ public class PlanRepository {
                     ps.setString(4, o.sectionId());
                     ps.setLong(5, o.startUtc().toEpochMilli());
                     ps.setLong(6, o.endUtc().toEpochMilli());
+                    ps.setBigDecimal(7, o.speedV());
                 });
     }
 
@@ -132,9 +150,67 @@ public class PlanRepository {
      * 查询计划占用，按计划内序号升序。
      */
     public List<Occupancy> findOccupancies(long planId) {
-        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc"
+        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc, speed_v"
                         + " FROM rail_plan_occupancy WHERE plan_id = ? ORDER BY seq",
                 OCCUPANCY_MAPPER, planId);
+    }
+
+    /**
+     * 查询指定列车的全部已发布带速占用（speed_v 非空），用于档案变更的后态包络检查。
+     */
+    public List<Occupancy> findPublishedSpeedOccupanciesByTrain(String trainNo) {
+        return jdbc.query("SELECT o.id, o.plan_id, o.seq, o.train_no, o.section_id,"
+                        + " o.start_utc, o.end_utc, o.speed_v"
+                        + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND o.speed_v IS NOT NULL"
+                        + " AND o.train_no = ? ORDER BY o.id",
+                OCCUPANCY_MAPPER, trainNo);
+    }
+
+    /**
+     * 查询指定区段的全部已发布带速占用（speed_v 非空），用于档案变更的后态包络检查。
+     */
+    public List<Occupancy> findPublishedSpeedOccupanciesBySection(String sectionId) {
+        return jdbc.query("SELECT o.id, o.plan_id, o.seq, o.train_no, o.section_id,"
+                        + " o.start_utc, o.end_utc, o.speed_v"
+                        + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND o.speed_v IS NOT NULL"
+                        + " AND o.section_id = ? ORDER BY o.id",
+                OCCUPANCY_MAPPER, sectionId);
+    }
+
+    /**
+     * 批量冻结制动包络判定快照（发布/改签成功同事务写入）。
+     */
+    public void insertEnvelopeSnapshots(List<EnvelopeSnapshot> snapshots) {
+        jdbc.batchUpdate(
+                "INSERT INTO rail_envelope_snapshot (plan_id, occupancy_id, train_no, section_id,"
+                        + " speed_v, reaction_t, base_decel_a, protect_d, lhs_value, rhs_value,"
+                        + " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                snapshots, snapshots.size(),
+                (ps, s) -> {
+                    ps.setLong(1, s.planId());
+                    ps.setLong(2, s.occupancyId());
+                    ps.setString(3, s.trainNo());
+                    ps.setString(4, s.sectionId());
+                    ps.setBigDecimal(5, s.speedV());
+                    ps.setBigDecimal(6, s.reactionT());
+                    ps.setBigDecimal(7, s.baseDecelA());
+                    ps.setBigDecimal(8, s.protectD());
+                    ps.setBigDecimal(9, s.lhsValue());
+                    ps.setBigDecimal(10, s.rhsValue());
+                    ps.setLong(11, s.createdAt());
+                });
+    }
+
+    /**
+     * 查询计划的全部包络判定快照，按主键升序。
+     */
+    public List<EnvelopeSnapshot> findEnvelopeSnapshots(long planId) {
+        return jdbc.query("SELECT id, plan_id, occupancy_id, train_no, section_id, speed_v,"
+                        + " reaction_t, base_decel_a, protect_d, lhs_value, rhs_value, created_at"
+                        + " FROM rail_envelope_snapshot WHERE plan_id = ? ORDER BY id",
+                SNAPSHOT_MAPPER, planId);
     }
 
     /**
