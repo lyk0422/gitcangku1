@@ -2,6 +2,8 @@ package com.example.starter.baggage;
 
 import java.util.List;
 
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
@@ -22,12 +24,18 @@ public final class BaggageDtos {
             @NotBlank(message = "destination 不能为空") String destination) {
     }
 
-    /** 登记行李请求：legIds 为 1~5 个有序航段。 */
+    /** 登记行李请求：legIds 为 1~5 个有序航段；重量档案可选，须成对提供。 */
     public record RegisterBagRequest(
             @NotBlank(message = "requestId 不能为空") String requestId,
             @NotBlank(message = "bagTag 不能为空") String bagTag,
             @NotNull(message = "legIds 不能为空")
-            @Size(min = 1, max = 5, message = "行程航段数必须为 1~5") List<@NotBlank(message = "航段不能为空") String> legIds) {
+            @Size(min = 1, max = 5, message = "行程航段数必须为 1~5") List<@NotBlank(message = "航段不能为空") String> legIds,
+            @Min(value = 1, message = "自重必须为正整数克") Integer selfWeightGrams,
+            @Min(value = 0, message = "可承上方重量必须为非负整数克") Integer maxLoadAboveGrams) {
+        /** 不带重量档案的登记（档案可稍后通过重量修改建立）。 */
+        public RegisterBagRequest(String requestId, String bagTag, List<String> legIds) {
+            this(requestId, bagTag, legIds, null, null);
+        }
     }
 
     /** 批量装载请求：1~20 个不重复 bagTag。 */
@@ -65,6 +73,39 @@ public final class BaggageDtos {
             @NotBlank(message = "actualStation 不能为空") String actualStation) {
     }
 
+    /** 堆栈声明条目：一件行李在舱内的垂直堆叠位置。 */
+    public record StackEntryInput(
+            @NotBlank(message = "bagTag 不能为空") String bagTag,
+            @NotNull(message = "stackNo 不能为空")
+            @Min(value = 1, message = "堆栈号必须为正整数") Integer stackNo,
+            @NotNull(message = "layer 不能为空")
+            @Min(value = 1, message = "层号必须为从 1 起的正整数") Integer layer) {
+    }
+
+    /**
+     * 堆栈声明请求：以完整后态声明舱内全部装载行李的堆叠布局，
+     * 相对当前清单的新增即装载、缺失即卸载、位置变化即换层，整次原子生效。
+     */
+    public record DeclareStackRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operator 不能为空") String operator,
+            @NotNull(message = "expectedVersion 不能为空") Integer expectedVersion,
+            @NotNull(message = "entries 不能为空")
+            @Size(max = 100, message = "单次堆栈声明条目数不能超过 100") List<@Valid StackEntryInput> entries) {
+    }
+
+    /** 重量档案修改请求：expectedVersion 对无档案行李为 0，否则为当前档案版本。 */
+    public record UpdateWeightRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operator 不能为空") String operator,
+            @NotNull(message = "expectedVersion 不能为空")
+            @Min(value = 0, message = "expectedVersion 不能为负") Integer expectedVersion,
+            @NotNull(message = "selfWeightGrams 不能为空")
+            @Min(value = 1, message = "自重必须为正整数克") Integer selfWeightGrams,
+            @NotNull(message = "maxLoadAboveGrams 不能为空")
+            @Min(value = 0, message = "可承上方重量必须为非负整数克") Integer maxLoadAboveGrams) {
+    }
+
     /** 航段响应。 */
     public record LegResponse(String legId, String origin, String destination,
                               String status, int version) {
@@ -79,10 +120,11 @@ public final class BaggageDtos {
                              String location, String eventTime) {
     }
 
-    /** 行李响应：含完整事件轨迹。 */
+    /** 行李响应：含完整事件轨迹与重量档案（无档案时重量字段为 null）。 */
     public record BagResponse(String bagTag, String currentLocation, int nextLegIndex,
                               String status, String loadedLegId, List<ItineraryItem> itinerary,
                               String shortLegId, String shortDestination, String shortRegisteredAt,
+                              Integer selfWeightGrams, Integer maxLoadAboveGrams, Integer weightVersion,
                               List<TraceEvent> events) {
     }
 
@@ -124,5 +166,25 @@ public final class BaggageDtos {
 
     /** 未补到清单响应。 */
     public record ShortListResponse(List<ShortItem> shortUnloaded) {
+    }
+
+    /** 堆栈布局条目视图：含封舱冻结时点的自重与上方载荷（克）。 */
+    public record StackEntryView(String bagTag, int stackNo, int layer,
+                                 int selfWeightGrams, int loadAboveGrams) {
+    }
+
+    /** 堆栈声明响应：entries 按堆栈号、层号升序，为生效后的完整布局。 */
+    public record DeclareStackResponse(String legId, String status, int version,
+                                       List<StackEntryView> entries) {
+    }
+
+    /** 堆栈布局查询响应：OPEN 航段为当前布局，SEALED/ARRIVED 为封舱冻结快照。 */
+    public record StackLayoutResponse(String legId, String status, int version,
+                                      List<StackEntryView> entries) {
+    }
+
+    /** 重量档案响应。 */
+    public record WeightResponse(String bagTag, int selfWeightGrams,
+                                 int maxLoadAboveGrams, int weightVersion) {
     }
 }

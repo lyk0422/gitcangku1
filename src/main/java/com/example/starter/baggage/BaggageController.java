@@ -14,6 +14,8 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.DeclareStackRequest;
+import com.example.starter.baggage.BaggageDtos.DeclareStackResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
@@ -28,6 +30,9 @@ import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
+import com.example.starter.baggage.BaggageDtos.StackLayoutResponse;
+import com.example.starter.baggage.BaggageDtos.UpdateWeightRequest;
+import com.example.starter.baggage.BaggageDtos.WeightResponse;
 
 /**
  * 联程行李装载交接 REST 入口。
@@ -107,5 +112,25 @@ public class BaggageController {
     @GetMapping("/bags/short-unloaded")
     public ShortListResponse listShortUnloaded() {
         return baggageService.listShortUnloaded();
+    }
+
+    /** 堆栈声明：以完整后态声明舱内堆叠布局，装载/卸载/换层整次原子生效。 */
+    @PostMapping("/legs/{legId}/stacks/declare")
+    public DeclareStackResponse declareStacks(@PathVariable String legId,
+                                              @Valid @RequestBody DeclareStackRequest request) {
+        return baggageService.declareStacks(legId, request);
+    }
+
+    /** 堆栈布局查询：OPEN 为当前布局，SEALED/ARRIVED 为封舱冻结快照。 */
+    @GetMapping("/legs/{legId}/stacks")
+    public StackLayoutResponse getStackLayout(@PathVariable String legId) {
+        return baggageService.getStackLayout(legId);
+    }
+
+    /** 修改行李重量档案：带 expectedVersion 乐观锁，已装载行李受封舱冻结与超压约束。 */
+    @PostMapping("/bags/{bagTag}/weight")
+    public WeightResponse updateWeight(@PathVariable String bagTag,
+                                       @Valid @RequestBody UpdateWeightRequest request) {
+        return baggageService.updateWeight(bagTag, request);
     }
 }
