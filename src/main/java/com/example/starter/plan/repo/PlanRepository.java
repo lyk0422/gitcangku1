@@ -5,6 +5,7 @@ import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.model.RouteLeg;
 import java.sql.Date;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
@@ -27,12 +28,15 @@ import org.springframework.stereotype.Repository;
 @Repository
 public class PlanRepository {
 
+    private static final String PLAN_COLUMNS = "id, schedule_key, op_date, version, status, graph_version";
+
     private static final RowMapper<DayPlan> PLAN_MAPPER = (rs, n) -> new DayPlan(
             rs.getLong("id"),
             rs.getString("schedule_key"),
             rs.getObject("op_date", LocalDate.class),
             rs.getInt("version"),
-            PlanStatus.valueOf(rs.getString("status")));
+            PlanStatus.valueOf(rs.getString("status")),
+            rs.getObject("graph_version", Integer.class));
 
     private static final RowMapper<Occupancy> OCCUPANCY_MAPPER = (rs, n) -> new Occupancy(
             rs.getLong("id"),
@@ -40,6 +44,16 @@ public class PlanRepository {
             rs.getInt("seq"),
             rs.getString("train_no"),
             rs.getString("section_id"),
+            Instant.ofEpochMilli(rs.getLong("start_utc")),
+            Instant.ofEpochMilli(rs.getLong("end_utc")));
+
+    private static final RowMapper<RouteLeg> ROUTE_LEG_MAPPER = (rs, n) -> new RouteLeg(
+            rs.getLong("id"),
+            rs.getLong("plan_id"),
+            rs.getInt("seq"),
+            rs.getString("segment_id"),
+            rs.getString("from_station"),
+            rs.getString("to_station"),
             Instant.ofEpochMilli(rs.getLong("start_utc")),
             Instant.ofEpochMilli(rs.getLong("end_utc")));
 
@@ -59,17 +73,31 @@ public class PlanRepository {
      * 插入新计划，返回自增主键。
      */
     public long insertPlan(String scheduleKey, LocalDate opDate, PlanStatus status, long nowMillis) {
+        return insertPlan(scheduleKey, opDate, status, null, nowMillis);
+    }
+
+    /**
+     * 插入新计划（可携带冻结的线路图版本），返回自增主键。
+     */
+    public long insertPlan(String scheduleKey, LocalDate opDate, PlanStatus status,
+                           Integer graphVersion, long nowMillis) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rail_day_plan (schedule_key, op_date, version, status, created_at, updated_at)"
-                            + " VALUES (?, ?, 1, ?, ?, ?)",
+                    "INSERT INTO rail_day_plan"
+                            + " (schedule_key, op_date, version, status, graph_version, created_at, updated_at)"
+                            + " VALUES (?, ?, 1, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, scheduleKey);
             ps.setDate(2, Date.valueOf(opDate));
             ps.setString(3, status.name());
-            ps.setLong(4, nowMillis);
+            if (graphVersion == null) {
+                ps.setNull(4, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(4, graphVersion);
+            }
             ps.setLong(5, nowMillis);
+            ps.setLong(6, nowMillis);
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -79,7 +107,7 @@ public class PlanRepository {
      * 按业务键查询计划（不加锁）。
      */
     public Optional<DayPlan> findByKey(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT " + PLAN_COLUMNS + " FROM rail_day_plan"
                         + " WHERE schedule_key = ?",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
     }
@@ -88,7 +116,7 @@ public class PlanRepository {
      * 按主键查询计划（不加锁），用于改签链遍历。
      */
     public Optional<DayPlan> findById(long planId) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT " + PLAN_COLUMNS + " FROM rail_day_plan"
                         + " WHERE id = ?",
                 PLAN_MAPPER, planId).stream().findFirst();
     }
@@ -97,7 +125,7 @@ public class PlanRepository {
      * 按业务键查询计划并加行级写锁，须在事务内调用，用于串行化同一计划的更新/发布/取消。
      */
     public Optional<DayPlan> findByKeyForUpdate(String scheduleKey) {
-        return jdbc.query("SELECT id, schedule_key, op_date, version, status FROM rail_day_plan"
+        return jdbc.query("SELECT " + PLAN_COLUMNS + " FROM rail_day_plan"
                         + " WHERE schedule_key = ? FOR UPDATE",
                 PLAN_MAPPER, scheduleKey).stream().findFirst();
     }
@@ -218,5 +246,35 @@ public class PlanRepository {
      */
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
+    }
+
+    /**
+     * 批量插入寻径发布计划冻结的路径分段。
+     */
+    public void insertRouteLegs(long planId, List<RouteLeg> legs) {
+        jdbc.batchUpdate(
+                "INSERT INTO rail_plan_route_leg"
+                        + " (plan_id, seq, segment_id, from_station, to_station, start_utc, end_utc)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                legs, legs.size(),
+                (ps, leg) -> {
+                    ps.setLong(1, planId);
+                    ps.setInt(2, leg.seq());
+                    ps.setString(3, leg.segmentId());
+                    ps.setString(4, leg.fromStation());
+                    ps.setString(5, leg.toStation());
+                    ps.setLong(6, leg.startUtc().toEpochMilli());
+                    ps.setLong(7, leg.endUtc().toEpochMilli());
+                });
+    }
+
+    /**
+     * 查询计划冻结的路径分段，按路径内序号升序。
+     */
+    public List<RouteLeg> findRouteLegs(long planId) {
+        return jdbc.query("SELECT id, plan_id, seq, segment_id, from_station, to_station,"
+                        + " start_utc, end_utc FROM rail_plan_route_leg"
+                        + " WHERE plan_id = ? ORDER BY seq",
+                ROUTE_LEG_MAPPER, planId);
     }
 }

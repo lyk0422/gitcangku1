@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS rail_day_plan (
     op_date DATE NOT NULL,
     version INT NOT NULL,
     status VARCHAR(16) NOT NULL,
+    graph_version INT NULL,
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL,
     PRIMARY KEY (id),
@@ -18,6 +19,7 @@ COMMENT ON COLUMN rail_day_plan.schedule_key IS '计划业务键，全局唯一�
 COMMENT ON COLUMN rail_day_plan.op_date IS '运营日期（Asia/Shanghai 日历日）';
 COMMENT ON COLUMN rail_day_plan.version IS '计划版本，草稿占用整体替换成功一次加一';
 COMMENT ON COLUMN rail_day_plan.status IS '计划状态：DRAFT 草稿 / PUBLISHED 已发布 / CANCELLED 已取消';
+COMMENT ON COLUMN rail_day_plan.graph_version IS '寻径发布时冻结的线路图版本；手工草稿计划为 NULL';
 COMMENT ON COLUMN rail_day_plan.created_at IS '创建时刻，UTC 毫秒';
 COMMENT ON COLUMN rail_day_plan.updated_at IS '最近变更时刻，UTC 毫秒';
 
@@ -74,6 +76,67 @@ COMMENT ON COLUMN rail_plan_reschedule_link.id IS '主键';
 COMMENT ON COLUMN rail_plan_reschedule_link.predecessor_plan_id IS '直接前驱（被改签取消的旧计划）id，关联 rail_day_plan.id，全表唯一';
 COMMENT ON COLUMN rail_plan_reschedule_link.successor_plan_id IS '直接后继（改签发布的新计划）id，关联 rail_day_plan.id，全表唯一';
 COMMENT ON COLUMN rail_plan_reschedule_link.created_at IS '关联创建时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_route_graph (
+    version INT NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (version)
+);
+COMMENT ON TABLE rail_route_graph IS '线路图版本主表，版本从 1 起，替换成功一次加一，历史版本保留不改写';
+COMMENT ON COLUMN rail_route_graph.version IS '线路图版本号，当前版本为全表最大值';
+COMMENT ON COLUMN rail_route_graph.created_at IS '版本创建时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_route_station (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    graph_version INT NOT NULL,
+    station VARCHAR(64) NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_route_station_version_station UNIQUE (graph_version, station)
+);
+COMMENT ON TABLE rail_route_station IS '线路图站点，按图版本整体冻结；站点在版本内唯一';
+COMMENT ON COLUMN rail_route_station.id IS '主键';
+COMMENT ON COLUMN rail_route_station.graph_version IS '所属线路图版本，关联 rail_route_graph.version';
+COMMENT ON COLUMN rail_route_station.station IS '站点名，版本内唯一';
+
+CREATE TABLE IF NOT EXISTS rail_route_segment (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    graph_version INT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    from_station VARCHAR(64) NOT NULL,
+    to_station VARCHAR(64) NOT NULL,
+    minutes INT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_route_segment_version_segment UNIQUE (graph_version, segment_id)
+);
+COMMENT ON TABLE rail_route_segment IS '线路图有向区段，按图版本整体冻结；区段编号在版本内唯一';
+COMMENT ON COLUMN rail_route_segment.id IS '主键';
+COMMENT ON COLUMN rail_route_segment.graph_version IS '所属线路图版本，关联 rail_route_graph.version';
+COMMENT ON COLUMN rail_route_segment.segment_id IS '区段编号，版本内唯一，同时作为占用区段 ID';
+COMMENT ON COLUMN rail_route_segment.from_station IS '起点站';
+COMMENT ON COLUMN rail_route_segment.to_station IS '终点站';
+COMMENT ON COLUMN rail_route_segment.minutes IS '行驶分钟，正整数';
+
+CREATE TABLE IF NOT EXISTS rail_plan_route_leg (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    plan_id BIGINT NOT NULL,
+    seq INT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    from_station VARCHAR(64) NOT NULL,
+    to_station VARCHAR(64) NOT NULL,
+    start_utc BIGINT NOT NULL,
+    end_utc BIGINT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_plan_route_leg IS '寻径发布计划冻结的路径分段，含站点与时刻；换图后不回改';
+COMMENT ON COLUMN rail_plan_route_leg.id IS '主键';
+COMMENT ON COLUMN rail_plan_route_leg.plan_id IS '所属计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_plan_route_leg.seq IS '分段在路径内的序号，从 0 开始';
+COMMENT ON COLUMN rail_plan_route_leg.segment_id IS '区段编号（发布时图版本内）';
+COMMENT ON COLUMN rail_plan_route_leg.from_station IS '分段起点站';
+COMMENT ON COLUMN rail_plan_route_leg.to_station IS '分段终点站';
+COMMENT ON COLUMN rail_plan_route_leg.start_utc IS '分段开始时刻（含），UTC 毫秒';
+COMMENT ON COLUMN rail_plan_route_leg.end_utc IS '分段结束时刻（不含），UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_rail_plan_route_leg_plan ON rail_plan_route_leg (plan_id);
 
 CREATE TABLE IF NOT EXISTS publish_lock (
     id INT NOT NULL,
