@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS artifact_dependency (
     name            VARCHAR(128) NOT NULL,
     minimum_version INT          NOT NULL,
     maximum_version INT          NOT NULL,
+    scope           VARCHAR(8)   NOT NULL DEFAULT 'PUBLIC',
     CONSTRAINT fk_dep_artifact FOREIGN KEY (artifact_id) REFERENCES artifact (id)
 );
 COMMENT ON TABLE artifact_dependency IS '制品声明的依赖区间（闭区间），登记后不可改';
@@ -36,6 +37,7 @@ COMMENT ON COLUMN artifact_dependency.artifact_id IS '所属制品版本 ID';
 COMMENT ON COLUMN artifact_dependency.name IS '依赖制品名称，同一制品内唯一';
 COMMENT ON COLUMN artifact_dependency.minimum_version IS '依赖最低版本（含），正整数';
 COMMENT ON COLUMN artifact_dependency.maximum_version IS '依赖最高版本（含），正整数';
+COMMENT ON COLUMN artifact_dependency.scope IS '依赖作用域：PUBLIC=当前作用域共享唯一版本，PRIVATE=目标进入子作用域；旧数据缺省 PUBLIC';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_dep_artifact_name ON artifact_dependency (artifact_id, name);
 
@@ -45,6 +47,7 @@ CREATE TABLE IF NOT EXISTS lock_file (
     root_version       INT          NOT NULL,
     repository_version BIGINT       NOT NULL,
     request_id         VARCHAR(64)  NOT NULL,
+    lock_mode          VARCHAR(8)   NOT NULL DEFAULT 'FLAT',
     created_at         TIMESTAMP(6) NOT NULL
 );
 COMMENT ON TABLE lock_file IS '锁定文件：一次成功锁定的根、精确依赖集合及读取时的仓库版本';
@@ -52,6 +55,7 @@ COMMENT ON COLUMN lock_file.root_name IS '根制品名称（精确版本，锁�
 COMMENT ON COLUMN lock_file.root_version IS '根制品版本号，正整数';
 COMMENT ON COLUMN lock_file.repository_version IS '锁定时读取的仓库版本号';
 COMMENT ON COLUMN lock_file.request_id IS '触发锁定的全局唯一请求 ID';
+COMMENT ON COLUMN lock_file.lock_mode IS '锁定模式：FLAT=旧单根扁平锁定，SCOPED=带私有作用域锁定';
 COMMENT ON COLUMN lock_file.created_at IS '锁定生成时间，UTC 时间戳';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_lock_request ON lock_file (request_id);
@@ -60,16 +64,40 @@ CREATE INDEX IF NOT EXISTS idx_lock_root ON lock_file (root_name, root_version);
 CREATE TABLE IF NOT EXISTS lock_file_entry (
     id           BIGINT AUTO_INCREMENT PRIMARY KEY,
     lock_file_id BIGINT       NOT NULL,
+    scope_path   VARCHAR(600) NOT NULL DEFAULT '[]',
     name         VARCHAR(128) NOT NULL,
     version      INT          NOT NULL,
     CONSTRAINT fk_entry_lock FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
 );
-COMMENT ON TABLE lock_file_entry IS '锁文件中的精确制品版本，每个名称仅一个版本';
+COMMENT ON TABLE lock_file_entry IS '锁文件中的精确制品版本，同一作用域内每个名称仅一个版本';
 COMMENT ON COLUMN lock_file_entry.lock_file_id IS '所属锁文件 ID';
+COMMENT ON COLUMN lock_file_entry.scope_path IS '条目所在作用域路径：父制品名称链的 JSON 数组（结构化转义，根作用域为 []）';
 COMMENT ON COLUMN lock_file_entry.name IS '被锁定制品名称';
 COMMENT ON COLUMN lock_file_entry.version IS '被锁定的精确版本号，正整数';
 
-CREATE UNIQUE INDEX IF NOT EXISTS uk_entry_lock_name ON lock_file_entry (lock_file_id, name);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_entry_lock_scope_name ON lock_file_entry (lock_file_id, scope_path, name);
+
+CREATE TABLE IF NOT EXISTS lock_file_edge (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_file_id    BIGINT       NOT NULL,
+    scope_path      VARCHAR(600) NOT NULL DEFAULT '[]',
+    from_name       VARCHAR(128) NOT NULL,
+    name            VARCHAR(128) NOT NULL,
+    scope           VARCHAR(8)   NOT NULL,
+    minimum_version INT          NOT NULL,
+    maximum_version INT          NOT NULL,
+    CONSTRAINT fk_edge_lock FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
+);
+COMMENT ON TABLE lock_file_edge IS '锁文件冻结的依赖边：按登记声明原样保存作用域与区间';
+COMMENT ON COLUMN lock_file_edge.lock_file_id IS '所属锁文件 ID';
+COMMENT ON COLUMN lock_file_edge.scope_path IS '声明该依赖的制品所在作用域路径（JSON 数组，根作用域为 []）';
+COMMENT ON COLUMN lock_file_edge.from_name IS '声明依赖的制品名称';
+COMMENT ON COLUMN lock_file_edge.name IS '依赖目标制品名称';
+COMMENT ON COLUMN lock_file_edge.scope IS '依赖作用域：PUBLIC 或 PRIVATE';
+COMMENT ON COLUMN lock_file_edge.minimum_version IS '依赖最低版本（含），正整数';
+COMMENT ON COLUMN lock_file_edge.maximum_version IS '依赖最高版本（含），正整数';
+
+CREATE INDEX IF NOT EXISTS idx_edge_lock ON lock_file_edge (lock_file_id);
 
 CREATE TABLE IF NOT EXISTS idempotent_request (
     request_id     VARCHAR(64)  NOT NULL PRIMARY KEY,

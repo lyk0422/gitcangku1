@@ -2,9 +2,12 @@ package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
 import com.example.starter.api.dto.DependencySpec;
+import com.example.starter.api.dto.LockEdgeResponse;
+import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.domain.DependencyScope;
 import com.example.starter.support.ApiException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -41,6 +44,7 @@ class ArtifactServiceH2Test {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_file_edge");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
@@ -451,5 +455,257 @@ class ArtifactServiceH2Test {
         assertThat(replay.id()).isEqualTo(first.id());
         assertThat(replay.repositoryVersion()).isEqualTo(2L);
         assertThat(replay.entries()).isEqualTo(first.entries());
+    }
+
+    // ------------------------------------------------------------------
+    // 私有作用域（新锁入口）
+    // ------------------------------------------------------------------
+
+    private static DependencySpec pri(String name, int min, int max) {
+        return new DependencySpec(name, min, max, DependencyScope.PRIVATE);
+    }
+
+    /** 登记合成场景：根公开依赖 X1、私有依赖 P，P 公开依赖 X2；仓库版本推进到 4。 */
+    private void registerSyntheticScopedGraph() {
+        service.registerArtifact(requestId(),
+                artifact("root", 1, dep("x", 1, 1), pri("p", 1, 1)));
+        service.registerArtifact(requestId(), artifact("p", 1, dep("x", 2, 2)));
+        service.registerArtifact(requestId(), artifact("x", 1));
+        service.registerArtifact(requestId(), artifact("x", 2));
+    }
+
+    @Test
+    void scopedLockResolvesParentAndChildScopesIndependently() {
+        registerSyntheticScopedGraph();
+
+        LockFileResponse lock = service.createScopedLock(requestId(), new LockRequest("root", 1, 4L));
+
+        assertThat(lock.mode()).isEqualTo("SCOPED");
+        assertThat(lock.repositoryVersion()).isEqualTo(4L);
+        // 父域 X1、子域 X2 同时成立；同名不同域不合并为最高版本。
+        assertThat(lock.entries()).containsExactly(
+                new LockEntryResponse("root", 1, List.of()),
+                new LockEntryResponse("x", 1, List.of()),
+                new LockEntryResponse("p", 1, List.of("root")),
+                new LockEntryResponse("x", 2, List.of("root")));
+        // 边按登记声明冻结（含作用域与区间）。
+        assertThat(lock.edges()).containsExactly(
+                new LockEdgeResponse(List.of(), "root", "p", DependencyScope.PRIVATE, 1, 1),
+                new LockEdgeResponse(List.of(), "root", "x", DependencyScope.PUBLIC, 1, 1),
+                new LockEdgeResponse(List.of("root"), "p", "x", DependencyScope.PUBLIC, 2, 2));
+        // 历史查询与创建响应一致（createdAt 经数据库微秒精度回读，单独比对）。
+        LockFileResponse queried = service.getLock(lock.id());
+        assertThat(queried.id()).isEqualTo(lock.id());
+        assertThat(queried.mode()).isEqualTo("SCOPED");
+        assertThat(queried.repositoryVersion()).isEqualTo(4L);
+        assertThat(queried.entries()).isEqualTo(lock.entries());
+        assertThat(queried.edges()).isEqualTo(lock.edges());
+        assertThat(service.listLocks()).hasSize(1);
+        assertThat(service.listLocks().get(0).entries()).isEqualTo(lock.entries());
+    }
+
+    @Test
+    void scopedLockAllPublicVariantReturns422AndPersistsNothing() {
+        service.registerArtifact(requestId(),
+                artifact("root", 1, dep("x", 1, 1), dep("p", 1, 1)));
+        service.registerArtifact(requestId(), artifact("p", 1, dep("x", 2, 2)));
+        service.registerArtifact(requestId(), artifact("x", 1));
+        service.registerArtifact(requestId(), artifact("x", 2));
+
+        assertThatThrownBy(() -> service.createScopedLock(requestId(), new LockRequest("root", 1, 4L)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(422));
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(1) FROM lock_file", Integer.class)).isZero();
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(1) FROM lock_file_entry", Integer.class)).isZero();
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(1) FROM lock_file_edge", Integer.class)).isZero();
+    }
+
+    @Test
+    void scopedLockPrivateCycleReturns422() {
+        // 根私有依赖 P，P 私有依赖同版本 P：不能靠创建子域逃避环。
+        service.registerArtifact(requestId(), artifact("root", 1, pri("p", 1, 1)));
+        service.registerArtifact(requestId(), artifact("p", 1, pri("p", 1, 1)));
+
+        assertThatThrownBy(() -> service.createScopedLock(requestId(), new LockRequest("root", 1, 2L)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(422));
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(1) FROM lock_file", Integer.class)).isZero();
+    }
+
+    @Test
+    void scopedLockNestingBeyondFourLevelsReturns422() {
+        service.registerArtifact(requestId(), artifact("root", 1, pri("n1", 1, 1)));
+        service.registerArtifact(requestId(), artifact("n1", 1, pri("n2", 1, 1)));
+        service.registerArtifact(requestId(), artifact("n2", 1, pri("n3", 1, 1)));
+        service.registerArtifact(requestId(), artifact("n3", 1, pri("n4", 1, 1)));
+        service.registerArtifact(requestId(), artifact("n4", 1, pri("n5", 1, 1)));
+        service.registerArtifact(requestId(), artifact("n5", 1));
+
+        assertThatThrownBy(() -> service.createScopedLock(requestId(), new LockRequest("root", 1, 6L)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(422));
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(1) FROM lock_file", Integer.class)).isZero();
+    }
+
+    @Test
+    void scopedLockNestingUpToFourLevelsResolves() {
+        service.registerArtifact(requestId(), artifact("root", 1, pri("n1", 1, 1)));
+        service.registerArtifact(requestId(), artifact("n1", 1, pri("n2", 1, 1)));
+        service.registerArtifact(requestId(), artifact("n2", 1, pri("n3", 1, 1)));
+        service.registerArtifact(requestId(), artifact("n3", 1, pri("n4", 1, 1)));
+        service.registerArtifact(requestId(), artifact("n4", 1));
+
+        LockFileResponse lock = service.createScopedLock(requestId(), new LockRequest("root", 1, 5L));
+
+        assertThat(lock.entries()).contains(
+                new LockEntryResponse("n4", 1, List.of("root", "n1", "n2", "n3")));
+    }
+
+    @Test
+    void scopedLockIdempotentReplayAndCrossOperationConflict() {
+        service.registerArtifact(requestId(), artifact("root", 1));
+        String rid = requestId();
+
+        LockFileResponse first = service.createScopedLock(rid, new LockRequest("root", 1, 1L));
+        LockFileResponse replay = service.createScopedLock(rid, new LockRequest("root", 1, 1L));
+        assertThat(replay).isEqualTo(first);
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(1) FROM lock_file", Integer.class))
+                .isEqualTo(1);
+
+        // 同键异参（期望版本不同）→ 409。
+        assertThatThrownBy(() -> service.createScopedLock(rid, new LockRequest("root", 1, 0L)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(409));
+        // 同键跨操作（旧扁平锁入口）→ 409。
+        assertThatThrownBy(() -> service.createLock(rid, new LockRequest("root", 1, 1L)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(409));
+    }
+
+    @Test
+    void scopedLockStaleRepositoryVersionReturns409WithoutSaving() {
+        service.registerArtifact(requestId(), artifact("root", 1));
+        assertThatThrownBy(() -> service.createScopedLock(requestId(), new LockRequest("root", 1, 0L)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(409));
+        assertThat(service.listLocks()).isEmpty();
+    }
+
+    @Test
+    void flatLockKeepsOriginalRulesAndTreatsPrivateDepsAsPublic() {
+        // 旧入口保持原规则：PRIVATE 依赖按 PUBLIC 并入单一作用域。
+        service.registerArtifact(requestId(), artifact("root", 1, pri("p", 1, 1)));
+        service.registerArtifact(requestId(), artifact("p", 1, dep("y", 1, 1)));
+        service.registerArtifact(requestId(), artifact("y", 1));
+
+        LockFileResponse lock = service.createLock(requestId(), new LockRequest("root", 1, 3L));
+
+        assertThat(lock.mode()).isEqualTo("FLAT");
+        assertThat(lock.entries()).containsExactly(
+                new LockEntryResponse("p", 1, List.of()),
+                new LockEntryResponse("root", 1, List.of()),
+                new LockEntryResponse("y", 1, List.of()));
+    }
+
+    @Test
+    void flatLockOnScopeDependentGraphReturns422() {
+        // 合成场景改为旧扁平入口：x 区间冲突，无解。
+        registerSyntheticScopedGraph();
+        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("root", 1, 4L)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(422));
+    }
+
+    @Test
+    void registerPersistsScopeAndDefaultsToPublic() {
+        ArtifactResponse response = service.registerArtifact(requestId(),
+                artifact("root", 1, dep("x", 1, 2), pri("p", 1, 1)));
+        assertThat(response.dependencies())
+                .extracting("name", "scope")
+                .containsExactly(tuple("p", DependencyScope.PRIVATE),
+                        tuple("x", DependencyScope.PUBLIC));
+
+        // 撤回响应同样携带作用域。
+        ArtifactResponse withdrawn = service.withdrawArtifact(requestId(), "root", 1);
+        assertThat(withdrawn.dependencies())
+                .extracting("name", "scope")
+                .containsExactly(tuple("p", DependencyScope.PRIVATE),
+                        tuple("x", DependencyScope.PUBLIC));
+    }
+
+    @Test
+    void registerAndWithdrawWithExpectedRepositoryVersion() {
+        service.registerArtifact(requestId(), artifact("app", 1));
+
+        // 期望版本不一致 → 409，且不产生任何写入。
+        assertThatThrownBy(() -> service.registerArtifact(requestId(),
+                new RegisterArtifactRequest("lib", 1, List.of(), 0L)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(409));
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM artifact WHERE name = 'lib'", Integer.class)).isZero();
+
+        // 期望版本一致 → 成功。
+        ArtifactResponse registered = service.registerArtifact(requestId(),
+                new RegisterArtifactRequest("lib", 1, List.of(), 1L));
+        assertThat(registered.repositoryVersion()).isEqualTo(2L);
+
+        // 撤回携带过期期望版本 → 409。
+        assertThatThrownBy(() -> service.withdrawArtifact(requestId(), "anonymous", "lib", 1, 1L))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(409));
+        ArtifactResponse withdrawn = service.withdrawArtifact(requestId(), "anonymous", "lib", 1, 2L);
+        assertThat(withdrawn.withdrawn()).isTrue();
+        assertThat(withdrawn.repositoryVersion()).isEqualTo(3L);
+    }
+
+    @Test
+    void concurrentScopedLockSameRequestIdResolvesToSingleResult() throws Exception {
+        registerSyntheticScopedGraph();
+        int threads = 6;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CyclicBarrier barrier = new CyclicBarrier(threads);
+        String rid = requestId();
+
+        List<Future<LockFileResponse>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            futures.add(pool.submit(() -> {
+                barrier.await(5, TimeUnit.SECONDS);
+                return service.createScopedLock(rid, new LockRequest("root", 1, 4L));
+            }));
+        }
+        pool.shutdown();
+
+        LockFileResponse first = futures.get(0).get(30, TimeUnit.SECONDS);
+        for (Future<LockFileResponse> future : futures) {
+            assertThat(future.get(30, TimeUnit.SECONDS)).isEqualTo(first);
+        }
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(1) FROM lock_file", Integer.class))
+                .isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM idempotent_request WHERE request_id = ?",
+                Integer.class, rid)).isEqualTo(1);
+    }
+
+    @Test
+    void scopedLockPersistsScopePathAndEdgesInDatabase() {
+        registerSyntheticScopedGraph();
+        LockFileResponse lock = service.createScopedLock(requestId(), new LockRequest("root", 1, 4L));
+
+        List<String> scopePaths = jdbcTemplate.queryForList(
+                "SELECT scope_path FROM lock_file_entry WHERE lock_file_id = ? ORDER BY scope_path, name",
+                String.class, lock.id());
+        assertThat(scopePaths).containsExactly("[\"root\"]", "[\"root\"]", "[]", "[]");
+
+        Integer edgeCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM lock_file_edge WHERE lock_file_id = ?", Integer.class, lock.id());
+        assertThat(edgeCount).isEqualTo(3);
+        String privateScope = jdbcTemplate.queryForObject(
+                "SELECT scope FROM lock_file_edge WHERE lock_file_id = ? AND name = 'p'",
+                String.class, lock.id());
+        assertThat(privateScope).isEqualTo("PRIVATE");
+        String lockMode = jdbcTemplate.queryForObject(
+                "SELECT lock_mode FROM lock_file WHERE id = ?", String.class, lock.id());
+        assertThat(lockMode).isEqualTo("SCOPED");
     }
 }
