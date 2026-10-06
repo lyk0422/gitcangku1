@@ -2,6 +2,8 @@ package com.example.starter.evidence;
 
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
+import com.example.starter.evidence.dto.DoseLedgerView;
+import com.example.starter.evidence.dto.DoseLimitRegisterRequest;
 import com.example.starter.evidence.dto.EvidenceView;
 import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
@@ -139,6 +141,30 @@ public class EvidenceController {
         StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
                 () -> evidenceService.returnLoan(actorId, evidenceKey, request, hash));
         return toEntity(response);
+    }
+
+    /**
+     * 登记剂量上限：仅当前保管人、证物须为 SEALED、首次登记（不可变）。
+     * 写操作携带 requestId 保证幂等：同键同参重放返回首次结果，同键改参返回 409。
+     */
+    @PostMapping("/{evidenceKey}/dose-limit")
+    public ResponseEntity<String> registerDoseLimit(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                                    @PathVariable String evidenceKey,
+                                                    @Valid @RequestBody DoseLimitRegisterRequest request) {
+        String hash = idempotencyAdvisor.hashStructured(EvidenceService.OP_DOSE_LIMIT_REGISTER,
+                actorId, evidenceKey, request);
+        StoredResponse response = idempotencyAdvisor.guard(request.requestId(), hash,
+                () -> evidenceService.registerDoseLimit(actorId, evidenceKey, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 查询剂量账本明细：仅当前保管人可查；历史冻结照度、区间、当次与累计剂量。
+     */
+    @GetMapping("/{evidenceKey}/dose-ledger")
+    public DoseLedgerView doseLedger(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                     @PathVariable String evidenceKey) {
+        return evidenceService.doseLedger(actorId, evidenceKey);
     }
 
     /**

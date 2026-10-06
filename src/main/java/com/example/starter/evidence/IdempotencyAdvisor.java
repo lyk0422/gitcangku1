@@ -9,6 +9,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.function.Supplier;
 
@@ -39,6 +41,27 @@ public class IdempotencyAdvisor {
                     objectMapper.writeValueAsString(request));
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             return HexFormat.of().formatHex(digest.digest(canonical.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 不可用", e);
+        } catch (Exception e) {
+            throw new IllegalStateException("请求序列化失败", e);
+        }
+    }
+
+    /**
+     * 计算结构化请求指纹（新增写操作使用）：操作、操作者、资源与全部参数（含期望版本）
+     * 放入结构化对象后整体序列化再做 SHA-256，避免分隔符拼接造成的身份碰撞。
+     */
+    public String hashStructured(String operation, String actorId, String resourceKey, Object request) {
+        try {
+            Map<String, Object> identity = new LinkedHashMap<>();
+            identity.put("operation", operation);
+            identity.put("actorId", actorId == null ? "" : actorId);
+            identity.put("resourceKey", resourceKey == null ? "" : resourceKey);
+            identity.put("request", request);
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] bytes = objectMapper.writeValueAsString(identity).getBytes(StandardCharsets.UTF_8);
+            return HexFormat.of().formatHex(digest.digest(bytes));
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 不可用", e);
         } catch (Exception e) {

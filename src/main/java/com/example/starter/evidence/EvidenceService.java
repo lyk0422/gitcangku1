@@ -3,6 +3,11 @@ package com.example.starter.evidence;
 import com.example.starter.error.ApiException;
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
+import com.example.starter.evidence.dto.DoseLedgerView;
+import com.example.starter.evidence.dto.DoseLimitRegisterRequest;
+import com.example.starter.evidence.dto.DoseReturnView;
+import com.example.starter.evidence.dto.DoseSegmentRequest;
+import com.example.starter.evidence.dto.DoseSegmentView;
 import com.example.starter.evidence.dto.EvidenceView;
 import com.example.starter.evidence.dto.InspectionView;
 import com.example.starter.evidence.dto.IntakeRequest;
@@ -16,9 +21,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 /**
  * 证物封存交接核心服务。所有写操作在单事务内完成：
@@ -35,17 +44,25 @@ public class EvidenceService {
     static final String OP_SEAL_INSPECTION = "SEAL_INSPECTION";
     static final String OP_LOAN_BORROW = "LOAN_BORROW";
     static final String OP_LOAN_RETURN = "LOAN_RETURN";
+    static final String OP_DOSE_LIMIT_REGISTER = "DOSE_LIMIT_REGISTER";
 
     /**
      * 借出最长期限：72 小时。
      */
     static final long MAX_LOAN_HOURS = 72;
 
+    /**
+     * 单次归还允许上报的光照区间段数上限。
+     */
+    static final int MAX_DOSE_SEGMENTS = 20;
+
     private final EvidenceRepository evidenceRepository;
     private final TransferRecordRepository transferRepository;
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final DoseLedgerRepository doseLedgerRepository;
+    private final DoseReturnRepository doseReturnRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +71,8 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           DoseLedgerRepository doseLedgerRepository,
+                           DoseReturnRepository doseReturnRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,6 +80,8 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.doseLedgerRepository = doseLedgerRepository;
+        this.doseReturnRepository = doseReturnRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -247,6 +268,13 @@ public class EvidenceService {
         if (evidence.status() == EvidenceStatus.BORROWED) {
             throw ApiException.conflict("证物已存在未归还借出: " + evidenceKey);
         }
+        // 剂量联合裁决：已登记上限且累计达到上限（DOSE_BLOCKED）时禁止新的借出；
+        // 未登记上限的证物不受此规则影响。
+        Optional<DoseLedger> ledger = doseLedgerRepository.findByEvidenceKey(evidenceKey);
+        if (ledger.isPresent()
+                && DoseMath.reachesLimit(ledger.get().cumMilliLuxNanos(), ledger.get().limitLuxMinutes())) {
+            throw ApiException.unprocessable("累计剂量已达上限（DOSE_BLOCKED），禁止借出: " + evidenceKey);
+        }
         LocalDateTime nowUtc = clock.nowUtc();
         if (!request.dueAt().isAfter(nowUtc)) {
             throw ApiException.badRequest("应还时刻须晚于服务端当前时刻");
@@ -269,20 +297,14 @@ public class EvidenceService {
      * 确认归还：仅借出时的保管人，必须指定本次 loanKey、封条是否完好及非空说明。
      * 借用人不能代为确认。完好回到 SEALED，异常进入 SEAL_BROKEN；
      * 借出归还结果、封条核验记录与证物状态在同一事务落库，历史不可覆盖。
+     * 已登记剂量上限的证物：必须携带 1 至 20 段光照区间（非法或缺段 400，不归还也不记剂量），
+     * 剂量按区间精确累计并冻结；超限归还照常成功保存实际剂量，后续借出按 DOSE_BLOCKED 拒绝。
+     * 权限检查先于幂等重放；重放返回首次结果，不重复累计剂量。
      */
     @Transactional
     public StoredResponse returnLoan(String actorId, String evidenceKey,
                                      LoanReturnRequest request, String requestHash) {
-        Optional<StoredResponse> replay = checkReplay(request.commandKey(), requestHash);
-        if (replay.isPresent()) {
-            return replay.get();
-        }
         Evidence evidence = lockEvidence(evidenceKey);
-        // 并发下本事务可能在证物行锁上等待；持锁后复查幂等日志，重放先提交事务的首次结果。
-        replay = checkReplay(request.commandKey(), requestHash);
-        if (replay.isPresent()) {
-            return replay.get();
-        }
         LoanRecord loan = loanRepository.findByLoanKey(request.loanKey())
                 .orElseThrow(() -> ApiException.notFound("借出记录不存在: " + request.loanKey()));
         if (!loan.evidenceKey().equals(evidenceKey)) {
@@ -294,6 +316,11 @@ public class EvidenceService {
         if (!loan.custodianId().equals(actorId)) {
             throw ApiException.conflict("仅借出时的保管人可确认归还: " + actorId);
         }
+        // 权限检查先于重放：持锁并确认操作人资格后才命中幂等日志。
+        Optional<StoredResponse> replay = checkReplay(request.commandKey(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
         if (loan.status() != LoanStatus.ACTIVE || evidence.status() != EvidenceStatus.BORROWED) {
             throw ApiException.conflict("借出已归还，旧借出键不得再次结束借出: " + request.loanKey());
         }
@@ -303,17 +330,123 @@ public class EvidenceService {
             throw ApiException.conflict("借出记录与证物当前未归还借出不一致: " + request.loanKey());
         }
         LocalDateTime nowUtc = clock.nowUtc();
-        if (!loanRepository.completeReturn(loan.id(), request.sealIntact(), request.note(), nowUtc)) {
+        Optional<DoseLedger> ledger = doseLedgerRepository.findByEvidenceKey(evidenceKey);
+        LocalDateTime returnedAt = nowUtc;
+        List<BigDecimal> segmentDoses = List.of();
+        BigDecimal returnDose = null;
+        BigDecimal newCum = null;
+        if (ledger.isPresent()) {
+            segmentDoses = validateDoseSegments(loan, request.segments(), nowUtc);
+            returnedAt = request.segments().get(request.segments().size() - 1).endAt();
+            returnDose = segmentDoses.stream().reduce(BigDecimal.ZERO, BigDecimal::add);
+            newCum = ledger.get().cumMilliLuxNanos().add(returnDose);
+        } else if (request.segments() != null && !request.segments().isEmpty()) {
+            throw ApiException.badRequest("该证物未登记剂量上限，不接受剂量区间: " + evidenceKey);
+        }
+        if (!loanRepository.completeReturn(loan.id(), request.sealIntact(), request.note(), returnedAt)) {
             throw ApiException.conflict("借出已被并发归还: " + request.loanKey());
         }
-        inspectionRepository.insert(evidenceKey, actorId, request.sealIntact(), request.note(),
-                LocalDateTime.now());
+        LocalDateTime now = LocalDateTime.now();
+        if (ledger.isPresent()) {
+            // 剂量归还、账本累计与借出归还在同一事务落库；即使超限也必须成功保存实际剂量。
+            doseReturnRepository.insertReturn(evidenceKey, request.loanKey(), returnDose, newCum,
+                    returnedAt, now);
+            for (int i = 0; i < request.segments().size(); i++) {
+                DoseSegmentRequest segment = request.segments().get(i);
+                doseReturnRepository.insertSegment(evidenceKey, request.loanKey(), i + 1,
+                        segment.startAt(), segment.endAt(), segment.lux(), segmentDoses.get(i), now);
+            }
+            doseLedgerRepository.addDose(evidenceKey, newCum, now);
+        }
+        inspectionRepository.insert(evidenceKey, actorId, request.sealIntact(), request.note(), now);
         EvidenceStatus restored = request.sealIntact()
                 ? EvidenceStatus.SEALED : EvidenceStatus.SEAL_BROKEN;
-        evidenceRepository.updateStatus(evidenceKey, restored, LocalDateTime.now());
+        evidenceRepository.updateStatus(evidenceKey, restored, now);
         LoanRecord returned = loanRepository.findByLoanKey(request.loanKey()).orElseThrow();
         return record(request.commandKey(), OP_LOAN_RETURN, actorId, requestHash,
                 200, toView(returned));
+    }
+
+    /**
+     * 校验归还上报的光照区间并逐段计算剂量（内部精确单位，无舍入）。
+     * 要求 1 至 20 段，自首段等于实际借出时刻起首尾相接、互不重叠，
+     * 末段结束时刻即实际归还时刻，不得晚于服务端当前时刻。
+     */
+    private List<BigDecimal> validateDoseSegments(LoanRecord loan, List<DoseSegmentRequest> segments,
+                                                  LocalDateTime nowUtc) {
+        if (segments == null || segments.isEmpty()) {
+            throw ApiException.badRequest("已登记剂量上限，归还须包含 1 至 " + MAX_DOSE_SEGMENTS
+                    + " 段光照区间: " + loan.loanKey());
+        }
+        if (segments.size() > MAX_DOSE_SEGMENTS) {
+            throw ApiException.badRequest("光照区间段数不得超过 " + MAX_DOSE_SEGMENTS);
+        }
+        LocalDateTime expectedStart = loan.loanAt();
+        for (DoseSegmentRequest segment : segments) {
+            if (!segment.startAt().isBefore(segment.endAt())) {
+                throw ApiException.badRequest("区间开始时刻须早于结束时刻");
+            }
+            if (!segment.startAt().equals(expectedStart)) {
+                throw ApiException.badRequest("区间须自实际借出时刻起首尾相接且互不重叠");
+            }
+            expectedStart = segment.endAt();
+        }
+        LocalDateTime returnedAt = segments.get(segments.size() - 1).endAt();
+        if (returnedAt.isAfter(nowUtc)) {
+            throw ApiException.badRequest("归还时刻不能晚于服务端当前时刻");
+        }
+        return segments.stream()
+                .map(segment -> DoseMath.segmentDose(segment.lux(), segment.startAt(), segment.endAt()))
+                .toList();
+    }
+
+    /**
+     * 登记剂量上限：仅当前保管人、证物须为 SEALED、首次登记（不可变）。
+     * 权限检查先于幂等重放；提供期望版本时必须为 0（登记前账本不存在）。
+     */
+    @Transactional
+    public StoredResponse registerDoseLimit(String actorId, String evidenceKey,
+                                            DoseLimitRegisterRequest request, String requestHash) {
+        Evidence evidence = lockEvidence(evidenceKey);
+        // 权限检查先于重放。
+        requireCustodian(evidence, actorId);
+        Optional<StoredResponse> replay = checkReplay(request.requestId(), requestHash);
+        if (replay.isPresent()) {
+            return replay.get();
+        }
+        if (evidence.status() == EvidenceStatus.SEAL_BROKEN) {
+            throw ApiException.unprocessable("封条已异常，禁止登记剂量上限: " + evidenceKey);
+        }
+        if (evidence.status() != EvidenceStatus.SEALED) {
+            throw ApiException.conflict("仅 SEALED 状态可登记剂量上限: " + evidenceKey);
+        }
+        if (doseLedgerRepository.findByEvidenceKey(evidenceKey).isPresent()) {
+            throw ApiException.conflict("剂量上限已登记，不可变更: " + evidenceKey);
+        }
+        if (request.expectedVersion() != null && request.expectedVersion() != 0) {
+            throw ApiException.conflict("期望版本不匹配，登记前账本不存在（版本 0）: " + evidenceKey);
+        }
+        LocalDateTime now = LocalDateTime.now();
+        doseLedgerRepository.insert(evidenceKey, request.limitLuxMinutes(), now);
+        DoseLedger ledger = doseLedgerRepository.findByEvidenceKey(evidenceKey).orElseThrow();
+        return record(request.requestId(), OP_DOSE_LIMIT_REGISTER, actorId, requestHash,
+                201, toView(ledger, List.of(), List.of()));
+    }
+
+    /**
+     * 查询剂量账本明细：仅当前保管人可查（权限先于一切），
+     * 历史冻结照度、区间、当次与累计剂量；保管权交接不清账，新保管人继承完整账本。
+     */
+    @Transactional(readOnly = true)
+    public DoseLedgerView doseLedger(String actorId, String evidenceKey) {
+        Evidence evidence = evidenceRepository.findByKey(evidenceKey)
+                .orElseThrow(() -> ApiException.notFound("证物不存在: " + evidenceKey));
+        requireCustodian(evidence, actorId);
+        DoseLedger ledger = doseLedgerRepository.findByEvidenceKey(evidenceKey)
+                .orElseThrow(() -> ApiException.notFound("证物未登记剂量上限: " + evidenceKey));
+        List<DoseReturnRecord> returns = doseReturnRepository.findReturnsByEvidenceKey(evidenceKey);
+        List<DoseSegmentRecord> segments = doseReturnRepository.findSegmentsByEvidenceKey(evidenceKey);
+        return toView(ledger, returns, segments);
     }
 
     /**
@@ -424,5 +557,27 @@ public class EvidenceService {
         return new LoanView(loan.loanKey(), loan.evidenceKey(), loan.custodianId(),
                 loan.borrowerId(), loan.purpose(), loan.loanAt(), loan.dueAt(), loan.status(),
                 overdue, loan.sealPassed(), loan.returnNote(), loan.returnedAt());
+    }
+
+    private DoseLedgerView toView(DoseLedger ledger, List<DoseReturnRecord> returns,
+                                  List<DoseSegmentRecord> segments) {
+        Map<String, List<DoseSegmentRecord>> segmentsByLoan = segments.stream()
+                .collect(Collectors.groupingBy(DoseSegmentRecord::loanKey,
+                        LinkedHashMap::new, Collectors.toList()));
+        List<DoseReturnView> returnViews = returns.stream()
+                .map(record -> new DoseReturnView(record.loanKey(), record.returnedAt(),
+                        DoseMath.toDisplayLuxMinutes(record.returnMilliLuxNanos()),
+                        DoseMath.toDisplayLuxMinutes(record.cumMilliLuxNanos()),
+                        segmentsByLoan.getOrDefault(record.loanKey(), List.of()).stream()
+                                .map(segment -> new DoseSegmentView(segment.seq(), segment.startAt(),
+                                        segment.endAt(), segment.lux(),
+                                        DoseMath.toDisplayLuxMinutes(segment.milliLuxNanos())))
+                                .toList()))
+                .toList();
+        DoseStatus status = DoseMath.reachesLimit(ledger.cumMilliLuxNanos(), ledger.limitLuxMinutes())
+                ? DoseStatus.DOSE_BLOCKED : DoseStatus.OK;
+        return new DoseLedgerView(ledger.evidenceKey(), ledger.limitLuxMinutes(),
+                DoseMath.toDisplayLuxMinutes(ledger.cumMilliLuxNanos()), status,
+                ledger.version(), returnViews);
     }
 }
