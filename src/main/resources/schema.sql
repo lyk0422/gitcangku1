@@ -84,10 +84,40 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     done_at TIMESTAMP(6) NULL COMMENT '完成 UTC 时间；仅 DONE 有值，否则为空',
     cancelled_by VARCHAR(128) NULL COMMENT '取消人（操作时的当前指挥人）；仅 CANCELLED 有值，否则为空',
     cancelled_at TIMESTAMP(6) NULL COMMENT '取消 UTC 时间；仅 CANCELLED 有值，否则为空',
+    version INT NOT NULL DEFAULT 1 COMMENT '任务版本，初始 1；配置前置组、完成、取消成功各加 1，用于乐观并发控制（期望版本不一致返回 409）',
     created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
     updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
 ) COMMENT='事件处置任务表';
+
+CREATE TABLE IF NOT EXISTS task_prereq_groups (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id；配置替换时整组删除重建，每任务 1~3 组',
+    group_no INT NOT NULL COMMENT '组序号，从 1 开始按请求顺序编号；完成要求每组至少一个 DONE 成员',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    CONSTRAINT uk_prereq_group UNIQUE (task_id, group_no)
+) COMMENT='任务择一前置组表';
+
+CREATE TABLE IF NOT EXISTS task_prereq_members (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    group_id BIGINT NOT NULL COMMENT '所属前置组 id，关联 task_prereq_groups.id；每组 2~5 个成员',
+    member_incident_id BIGINT NOT NULL COMMENT '成员任务所属事件 id，关联 incidents.id；可跨事件',
+    member_task_id BIGINT NOT NULL COMMENT '成员任务 id，关联 incident_tasks.id；CANCELLED 成员不计入 DONE 依据',
+    expected_task_version INT NOT NULL COMMENT '配置时成员任务的期望版本；与成员当前版本不一致时配置拒绝（409）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    CONSTRAINT uk_prereq_member UNIQUE (group_id, member_incident_id, member_task_id)
+) COMMENT='任务择一前置组成员表';
+
+CREATE TABLE IF NOT EXISTS task_prereq_snapshot (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '完成任务 id，关联 incident_tasks.id；完成时冻结，后续候选完成不修改',
+    group_no INT NOT NULL COMMENT '组序号，与配置时一致',
+    member_incident_id BIGINT NOT NULL COMMENT '成员任务所属事件 id，关联 incidents.id',
+    member_task_id BIGINT NOT NULL COMMENT '成员任务 id，关联 incident_tasks.id',
+    selected BOOLEAN NOT NULL COMMENT '是否为该组选中的 DONE 依据（完成时取完整任务标识字典序最小的 DONE 成员，每组恰一个 TRUE）',
+    frozen_at TIMESTAMP(6) NOT NULL COMMENT '冻结 UTC 时间（即任务完成时刻）',
+    CONSTRAINT uk_prereq_snapshot UNIQUE (task_id, group_no, member_incident_id, member_task_id)
+) COMMENT='任务完成前置组快照表';
 
 CREATE TABLE IF NOT EXISTS incident_task_blockers (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',

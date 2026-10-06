@@ -3,6 +3,7 @@ package com.example.starter.incident;
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.PrereqConfigureRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
@@ -167,6 +168,17 @@ public class IncidentController {
     @GetMapping("/{incidentKey}/tasks/{taskKey}")
     public TaskView getTask(@PathVariable String incidentKey, @PathVariable String taskKey) {
         return service.getTask(incidentKey, taskKey);
+    }
+
+    /**
+     * 配置择一前置组（仅当前指挥人；1~3 组、每组 2~5 个成员，版本与环校验）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/prerequisites")
+    public TaskView configurePrerequisites(@PathVariable String incidentKey,
+                                           @PathVariable String taskKey,
+                                           @RequestHeader("X-Actor-Id") String actor,
+                                           @RequestBody PrereqConfigureRequest req) {
+        return service.configurePrerequisites(incidentKey, taskKey, actor, req);
     }
 
     /**

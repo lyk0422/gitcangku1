@@ -111,4 +111,70 @@ class SchemaH2ScriptTest {
             }
         }
     }
+
+    @Test
+    void h2Schema_prereqTablesEnforceConstraints() throws Exception {
+        String url = "jdbc:h2:mem:schema_h2_prereq;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=0";
+        try (Connection con = DriverManager.getConnection(url, "sa", "")) {
+            ScriptUtils.executeSqlScript(con, new ClassPathResource("schema-h2.sql"));
+
+            Instant now = Instant.parse("2026-09-22T00:00:00Z");
+            try (Statement st = con.createStatement()) {
+                st.execute("INSERT INTO incidents (incident_key, severity, summary, reporter,"
+                        + " status, commander, created_at, updated_at) VALUES"
+                        + " ('IK-1','S1','s','r','COMMANDING','alice','" + Timestamp.from(now)
+                        + "','" + Timestamp.from(now) + "')");
+                // version 缺省为 1
+                st.execute("INSERT INTO incident_tasks (incident_id, task_key, group_code, title,"
+                        + " status, created_by, created_at, updated_at) VALUES (1,'T-1','G','t',"
+                        + "'OPEN','alice','" + Timestamp.from(now) + "','" + Timestamp.from(now)
+                        + "')");
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT version FROM incident_tasks WHERE id = 1")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getInt("version")).isEqualTo(1);
+                }
+
+                // 前置组：(task_id, group_no) 唯一
+                st.execute("INSERT INTO task_prereq_groups (task_id, group_no, created_at)"
+                        + " VALUES (1,1,'" + Timestamp.from(now) + "')");
+                boolean duplicateGroupRejected = false;
+                try {
+                    st.execute("INSERT INTO task_prereq_groups (task_id, group_no, created_at)"
+                            + " VALUES (1,1,'" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateGroupRejected = true;
+                }
+                assertThat(duplicateGroupRejected).isTrue();
+
+                // 前置成员：(group_id, member_incident_id, member_task_id) 唯一
+                st.execute("INSERT INTO task_prereq_members (group_id, member_incident_id,"
+                        + " member_task_id, expected_task_version, created_at) VALUES"
+                        + " (1,1,1,1,'" + Timestamp.from(now) + "')");
+                boolean duplicateMemberRejected = false;
+                try {
+                    st.execute("INSERT INTO task_prereq_members (group_id, member_incident_id,"
+                            + " member_task_id, expected_task_version, created_at) VALUES"
+                            + " (1,1,1,2,'" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateMemberRejected = true;
+                }
+                assertThat(duplicateMemberRejected).isTrue();
+
+                // 完成快照：(task_id, group_no, member_incident_id, member_task_id) 唯一
+                st.execute("INSERT INTO task_prereq_snapshot (task_id, group_no,"
+                        + " member_incident_id, member_task_id, selected, frozen_at) VALUES"
+                        + " (1,1,1,1,TRUE,'" + Timestamp.from(now) + "')");
+                boolean duplicateSnapshotRejected = false;
+                try {
+                    st.execute("INSERT INTO task_prereq_snapshot (task_id, group_no,"
+                            + " member_incident_id, member_task_id, selected, frozen_at) VALUES"
+                            + " (1,1,1,1,FALSE,'" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateSnapshotRejected = true;
+                }
+                assertThat(duplicateSnapshotRejected).isTrue();
+            }
+        }
+    }
 }

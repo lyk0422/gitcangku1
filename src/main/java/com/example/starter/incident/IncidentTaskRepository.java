@@ -53,7 +53,8 @@ public class IncidentTaskRepository {
                 rs.getString("cancelled_by"),
                 cancelledAt == null ? null : cancelledAt.toInstant(),
                 rs.getTimestamp("created_at").toInstant(),
-                rs.getTimestamp("updated_at").toInstant());
+                rs.getTimestamp("updated_at").toInstant(),
+                rs.getInt("version"));
     }
 
     /**
@@ -63,7 +64,7 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 插入 OPEN 任务，返回生成主键。(incident_id, task_key) 唯一约束兜底并发重复插入。
+     * 插入 OPEN 任务（版本初始 1），返回生成主键。(incident_id, task_key) 唯一约束兜底并发重复插入。
      */
     public long insert(IncidentTask task) {
         KeyHolder keys = new GeneratedKeyHolder();
@@ -71,7 +72,7 @@ public class IncidentTaskRepository {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
                             + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            + " created_at, updated_at, version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
@@ -85,6 +86,7 @@ public class IncidentTaskRepository {
             ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
             ps.setTimestamp(11, Timestamp.from(task.createdAt()));
             ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setInt(13, task.version());
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -126,21 +128,29 @@ public class IncidentTaskRepository {
     }
 
     /**
-     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻。
+     * 将 OPEN 任务置为 DONE，记录完成人与 UTC 时刻，版本加一。
      */
     public void markDone(long id, String actor, Instant at) {
         jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
-                        + " updated_at = ? WHERE id = ?",
+                        + " version = version + 1, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
     }
 
     /**
-     * 将 OPEN 任务置为 CANCELLED，记录取消人与 UTC 时刻。
+     * 将 OPEN 任务置为 CANCELLED，记录取消人与 UTC 时刻，版本加一。
      */
     public void markCancelled(long id, String actor, Instant at) {
         jdbc.update("UPDATE incident_tasks SET status = 'CANCELLED', cancelled_by = ?,"
-                        + " cancelled_at = ?, updated_at = ? WHERE id = ?",
+                        + " cancelled_at = ?, version = version + 1, updated_at = ? WHERE id = ?",
                 actor, Timestamp.from(at), Timestamp.from(at), id);
+    }
+
+    /**
+     * 配置前置组成功后版本加一并刷新变更时刻。
+     */
+    public void bumpVersion(long id, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET version = version + 1, updated_at = ? WHERE id = ?",
+                Timestamp.from(at), id);
     }
 
     /**

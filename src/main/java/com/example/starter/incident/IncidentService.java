@@ -7,16 +7,25 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.EnumSet;
+import java.util.HashSet;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.Supplier;
 
+import com.example.starter.incident.TaskPrereqRepository.MemberRow;
+import com.example.starter.incident.TaskPrereqRepository.MemberSpec;
+import com.example.starter.incident.TaskPrereqRepository.SnapshotRow;
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.PrereqConfigureRequest;
+import com.example.starter.incident.dto.Requests.PrereqMemberRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
@@ -30,6 +39,10 @@ import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.PrereqGroupView;
+import com.example.starter.incident.dto.Responses.PrereqMemberView;
+import com.example.starter.incident.dto.Responses.PrereqSnapshotGroupView;
+import com.example.starter.incident.dto.Responses.PrereqSnapshotMemberView;
 import com.example.starter.incident.dto.Responses.StatusChangeView;
 import com.example.starter.incident.dto.Responses.TaskBlockerView;
 import com.example.starter.incident.dto.Responses.TaskView;
@@ -71,16 +84,19 @@ public class IncidentService {
     private final IncidentRepository incidents;
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
+    private final TaskPrereqRepository prereqs;
     private final CommandKeyRepository commandKeys;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
-                           IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           IncidentTaskRepository tasks, TaskPrereqRepository prereqs,
+                           CommandKeyRepository commandKeys,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
+        this.prereqs = prereqs;
         this.commandKeys = commandKeys;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -453,7 +469,7 @@ public class IncidentService {
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
                             groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
-                            now, now));
+                            now, now, 1));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
                     }
@@ -462,16 +478,20 @@ public class IncidentService {
     }
 
     /**
-     * 完成任务：仅当前指挥人；仅 OPEN 可完成；全部阻塞事件进入
-     * CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表。
-     * DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
+     * 完成任务：仅当前指挥人；仅 OPEN 可完成；携带 expectedTaskVersion 时须与当前版本
+     * 一致，否则 409。全部阻塞事件进入 CONTAINED/RESOLVED/CLOSED 且每个前置组均有
+     * DONE 成员（CANCELLED 不满足，全部取消仍阻塞）后才可完成。完成时在依赖图全局锁内
+     * 冻结快照：保留组全集，每组选中 DONE 成员中完整任务标识（事件号+任务号）字典序
+     * 最小者作为依据，后续其他候选完成不改历史。DONE/CANCELLED 为终态，
+     * 重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
     public TaskView completeTask(String incidentKey, String taskKey, String actor,
                                  TaskActionRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "task_complete", hash(incidentKey, taskKey, actor),
+        return runIdempotent(commandKey, "task_complete",
+                hash(incidentKey, taskKey, actor, String.valueOf(req.expectedTaskVersion())),
                 TaskView.class, () -> {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
@@ -480,26 +500,55 @@ public class IncidentService {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能完成");
                     }
+                    requireVersion(task, req.expectedTaskVersion());
+                    // 与配置、成员完成/取消共同锁定依赖图判定
+                    tasks.lockGraph();
                     List<String> unresolved = unresolvedBlockers(task.id());
                     if (!unresolved.isEmpty()) {
                         throw ApiException.conflict("存在未解除阻塞的事件: "
                                 + String.join(",", unresolved), List.copyOf(unresolved));
                     }
-                    tasks.markDone(task.id(), actor, now());
+                    Map<Integer, List<MemberRow>> byGroup = groupMembers(task.id());
+                    List<Integer> unsatisfied = new ArrayList<>();
+                    for (Map.Entry<Integer, List<MemberRow>> entry : byGroup.entrySet()) {
+                        if (entry.getValue().stream().noneMatch(m -> "DONE".equals(m.status()))) {
+                            unsatisfied.add(entry.getKey());
+                        }
+                    }
+                    if (!unsatisfied.isEmpty()) {
+                        throw ApiException.conflict("前置组无 DONE 成员，不能完成: 组 "
+                                + unsatisfied, List.copyOf(unsatisfied));
+                    }
+                    Instant now = now();
+                    // 冻结快照：保留组全集与每组选中的 DONE 依据（标识字典序最小者）
+                    for (Map.Entry<Integer, List<MemberRow>> entry : byGroup.entrySet()) {
+                        MemberRow selected = entry.getValue().stream()
+                                .filter(m -> "DONE".equals(m.status()))
+                                .min(Comparator.comparing(MemberRow::incidentKey)
+                                        .thenComparing(MemberRow::taskKey))
+                                .orElseThrow();
+                        for (MemberRow member : entry.getValue()) {
+                            prereqs.insertSnapshot(task.id(), entry.getKey(),
+                                    member.memberIncidentId(), member.memberTaskId(),
+                                    member == selected, now);
+                        }
+                    }
+                    tasks.markDone(task.id(), actor, now);
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
 
     /**
-     * 取消任务：仅当前指挥人；仅 OPEN 可取消；DONE/CANCELLED 为终态，
-     * 重复操作按 commandKey 幂等规则返回首次结果。
+     * 取消任务：仅当前指挥人；仅 OPEN 可取消；携带 expectedTaskVersion 时须与当前版本
+     * 一致，否则 409。DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
     public TaskView cancelTask(String incidentKey, String taskKey, String actor,
                                TaskActionRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "task_cancel", hash(incidentKey, taskKey, actor),
+        return runIdempotent(commandKey, "task_cancel",
+                hash(incidentKey, taskKey, actor, String.valueOf(req.expectedTaskVersion())),
                 TaskView.class, () -> {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
@@ -508,7 +557,109 @@ public class IncidentService {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能取消");
                     }
+                    requireVersion(task, req.expectedTaskVersion());
+                    // 与配置、成员完成/取消、当前任务完成共同锁定依赖图判定
+                    tasks.lockGraph();
                     tasks.markCancelled(task.id(), actor, now());
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 配置择一前置组：仅当前指挥人（权限检查先于幂等重放，交接后旧指挥无权写入）；
+     * 任务须为 OPEN 且 expectedTaskVersion 与当前版本一致，否则 409；已完成任务不能修改组。
+     * 1~3 组、每组 2~5 个成员，成员以事件号+任务号标识、可跨事件，组内重复成员 400；
+     * 成员期望版本与其当前版本不一致 409。配置替换在依赖图全局锁内对全部候选边做
+     * 任务级环检测，任一环 422 且不留边；原事件阻塞图检查不受影响。
+     * requestId 幂等：同键同参（组内换序同参）重放首次完整响应，异参 409，失败不占键。
+     */
+    @Transactional
+    public TaskView configurePrerequisites(String incidentKey, String taskKey, String actor,
+                                           PrereqConfigureRequest req) {
+        String requestId = requireText(req.requestId(), "requestId");
+        if (req.expectedTaskVersion() == null) {
+            throw ApiException.badRequest("expectedTaskVersion 不能为空");
+        }
+        int expectedVersion = req.expectedTaskVersion();
+        if (req.groups() == null || req.groups().isEmpty() || req.groups().size() > 3) {
+            throw ApiException.badRequest("前置组数量须为 1~3");
+        }
+        // 参数规范化：去空白、组内重复 400；组内换序不影响幂等参数比较
+        List<List<PrereqMemberRequest>> groups = new ArrayList<>();
+        for (List<PrereqMemberRequest> group : req.groups()) {
+            if (group == null || group.size() < 2 || group.size() > 5) {
+                throw ApiException.badRequest("每组前置任务须为 2~5 个");
+            }
+            Set<List<String>> seen = new HashSet<>();
+            List<PrereqMemberRequest> members = new ArrayList<>();
+            for (PrereqMemberRequest member : group) {
+                String memberIncident = requireText(member.incidentKey(), "member.incidentKey");
+                String memberTask = requireText(member.taskKey(), "member.taskKey");
+                if (member.expectedTaskVersion() == null) {
+                    throw ApiException.badRequest("member.expectedTaskVersion 不能为空");
+                }
+                if (!seen.add(List.of(memberIncident, memberTask))) {
+                    throw ApiException.badRequest(
+                            "组内前置成员重复: " + memberIncident + "/" + memberTask);
+                }
+                members.add(new PrereqMemberRequest(memberIncident, memberTask,
+                        member.expectedTaskVersion()));
+            }
+            groups.add(members);
+        }
+        Incident incident = lockIncident(incidentKey);
+        requireCommander(incident, actor);
+        String requestHash = structuredHash(actor, incidentKey, taskKey, expectedVersion, groups);
+        return runIdempotent(requestId, "task_prereq_configure", requestHash, TaskView.class,
+                () -> {
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    if (task.status() != TaskStatus.OPEN) {
+                        throw ApiException.conflict(
+                                "任务已处于终态 " + task.status() + "，不能修改前置组");
+                    }
+                    requireVersion(task, expectedVersion);
+                    // 解析成员（可跨事件）并校验成员期望版本
+                    List<List<MemberSpec>> specs = new ArrayList<>();
+                    List<List<String>> labels = new ArrayList<>();
+                    for (List<PrereqMemberRequest> group : groups) {
+                        List<MemberSpec> specGroup = new ArrayList<>();
+                        List<String> labelGroup = new ArrayList<>();
+                        for (PrereqMemberRequest member : group) {
+                            Incident memberIncident = incidents.findByKey(member.incidentKey())
+                                    .orElseThrow(() -> ApiException.notFound(
+                                            "前置成员事件不存在: " + member.incidentKey()));
+                            IncidentTask memberTask = tasks
+                                    .findByKey(memberIncident.id(), member.taskKey())
+                                    .orElseThrow(() -> ApiException.notFound("前置成员任务不存在: "
+                                            + member.incidentKey() + "/" + member.taskKey()));
+                            if (memberTask.version() != member.expectedTaskVersion()) {
+                                throw ApiException.conflict("前置成员任务版本已变化: "
+                                        + member.incidentKey() + "/" + member.taskKey()
+                                        + "，期望 " + member.expectedTaskVersion()
+                                        + "，当前 " + memberTask.version());
+                            }
+                            specGroup.add(new MemberSpec(memberIncident.id(), memberTask.id(),
+                                    member.expectedTaskVersion()));
+                            labelGroup.add(member.incidentKey() + "/" + member.taskKey());
+                        }
+                        specs.add(specGroup);
+                        labels.add(labelGroup);
+                    }
+                    // 全局图锁：串行化候选边环检测与组替换，与成员完成/取消、当前任务完成互斥
+                    tasks.lockGraph();
+                    for (int g = 0; g < specs.size(); g++) {
+                        for (int m = 0; m < specs.get(g).size(); m++) {
+                            if (prereqs.isReachableTask(specs.get(g).get(m).memberTaskId(),
+                                    task.id())) {
+                                throw ApiException.illegalTransition("前置组会形成任务依赖环: 成员 "
+                                        + labels.get(g).get(m) + " 已直接或间接依赖任务 " + taskKey);
+                            }
+                        }
+                    }
+                    Instant now = now();
+                    prereqs.replaceGroups(task.id(), specs, now);
+                    tasks.bumpVersion(task.id(), now);
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
     }
@@ -632,7 +783,8 @@ public class IncidentService {
     }
 
     /**
-     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务。
+     * 组装任务视图：阻塞状态按目标事件查询时的当前状态计算，不写回依赖任务；
+     * 前置组成员任务状态同样为查询时实时值；完成快照仅 DONE 且有配置时存在。
      */
     private TaskView toTaskView(IncidentTask task) {
         List<TaskBlockerView> blockers = incidents.listBlockingIncidents(task.id()).stream()
@@ -641,7 +793,92 @@ public class IncidentService {
                 .toList();
         return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
                 blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
-                task.cancelledBy(), task.cancelledAt());
+                task.cancelledBy(), task.cancelledAt(), task.version(),
+                toPrereqGroups(prereqs.listMembersByTask(task.id())),
+                toSnapshotGroups(prereqs.listSnapshot(task.id())));
+    }
+
+    /**
+     * 期望版本校验：携带期望值且与任务当前版本不一致时 409（旧版本拒绝）。
+     */
+    private static void requireVersion(IncidentTask task, Integer expectedTaskVersion) {
+        if (expectedTaskVersion != null && expectedTaskVersion != task.version()) {
+            throw ApiException.conflict("任务版本已变化，期望 " + expectedTaskVersion
+                    + "，当前 " + task.version());
+        }
+    }
+
+    /**
+     * 查询任务前置组成员并按组序号分组（组内按成员标识排序）。
+     */
+    private Map<Integer, List<MemberRow>> groupMembers(long taskId) {
+        Map<Integer, List<MemberRow>> byGroup = new TreeMap<>();
+        for (MemberRow row : prereqs.listMembersByTask(taskId)) {
+            byGroup.computeIfAbsent(row.groupNo(), k -> new ArrayList<>()).add(row);
+        }
+        return byGroup;
+    }
+
+    /**
+     * 结构化幂等身份：操作、操作者、资源及全部参数和期望版本组装为规范化 JSON
+     * （组内成员按标识排序，换序同参；组顺序保留）后取 SHA-256，避免分隔符拼接碰撞。
+     */
+    private String structuredHash(String actor, String incidentKey, String taskKey,
+                                  int expectedTaskVersion,
+                                  List<List<PrereqMemberRequest>> groups) {
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("operation", "task_prereq_configure");
+        identity.put("actor", actor);
+        identity.put("incidentKey", incidentKey);
+        identity.put("taskKey", taskKey);
+        identity.put("expectedTaskVersion", expectedTaskVersion);
+        List<List<Map<String, Object>>> groupList = new ArrayList<>();
+        for (List<PrereqMemberRequest> group : groups) {
+            List<Map<String, Object>> members = new ArrayList<>();
+            for (PrereqMemberRequest member : group) {
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("incidentKey", member.incidentKey());
+                entry.put("taskKey", member.taskKey());
+                entry.put("expectedTaskVersion", member.expectedTaskVersion());
+                members.add(entry);
+            }
+            members.sort(Comparator.comparing((Map<String, Object> e) -> (String) e.get("incidentKey"))
+                    .thenComparing(e -> (String) e.get("taskKey")));
+            groupList.add(members);
+        }
+        identity.put("groups", groupList);
+        return hash(toJson(identity));
+    }
+
+    private static List<PrereqGroupView> toPrereqGroups(List<MemberRow> rows) {
+        Map<Integer, List<PrereqMemberView>> byGroup = new TreeMap<>();
+        for (MemberRow row : rows) {
+            byGroup.computeIfAbsent(row.groupNo(), k -> new ArrayList<>())
+                    .add(new PrereqMemberView(row.incidentKey(), row.taskKey(),
+                            row.expectedTaskVersion(), row.status(), "DONE".equals(row.status())));
+        }
+        return byGroup.entrySet().stream()
+                .map(e -> new PrereqGroupView(e.getKey(), e.getValue()))
+                .toList();
+    }
+
+    private static List<PrereqSnapshotGroupView> toSnapshotGroups(List<SnapshotRow> rows) {
+        if (rows.isEmpty()) {
+            return null;
+        }
+        Map<Integer, List<SnapshotRow>> byGroup = new TreeMap<>();
+        for (SnapshotRow row : rows) {
+            byGroup.computeIfAbsent(row.groupNo(), k -> new ArrayList<>()).add(row);
+        }
+        return byGroup.entrySet().stream()
+                .map(e -> new PrereqSnapshotGroupView(e.getKey(),
+                        e.getValue().stream().filter(SnapshotRow::selected).findFirst()
+                                .map(s -> s.incidentKey() + "/" + s.taskKey()).orElse(null),
+                        e.getValue().stream()
+                                .map(s -> new PrereqSnapshotMemberView(s.incidentKey(),
+                                        s.taskKey(), s.selected()))
+                                .toList()))
+                .toList();
     }
 
     private static TransferView toTransferView(IncidentTransfer transfer) {

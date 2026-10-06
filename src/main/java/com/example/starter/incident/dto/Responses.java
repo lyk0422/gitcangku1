@@ -63,12 +63,40 @@ public final class Responses {
     }
 
     /**
+     * 前置组成员视图：status 为成员任务查询时的当前状态；satisfied 表示该成员为 DONE，
+     * 可计入所在组的完成依据（CANCELLED 不满足）。
+     */
+    public record PrereqMemberView(String incidentKey, String taskKey, int expectedTaskVersion,
+                                   String status, boolean satisfied) {
+    }
+
+    /** 择一前置组视图：groupNo 从 1 开始；完成要求每组至少一个 satisfied 成员。 */
+    public record PrereqGroupView(int groupNo, List<PrereqMemberView> members) {
+    }
+
+    /** 完成快照成员视图：selected 标识该组冻结时选中的 DONE 依据。 */
+    public record PrereqSnapshotMemberView(String incidentKey, String taskKey, boolean selected) {
+    }
+
+    /**
+     * 完成快照组视图：selectedBasis 为选中依据的完整任务标识（incidentKey/taskKey），
+     * 取完成时 DONE 成员中字典序最小者；快照冻结后不随后续候选完成变化。
+     */
+    public record PrereqSnapshotGroupView(int groupNo, String selectedBasis,
+                                          List<PrereqSnapshotMemberView> members) {
+    }
+
+    /**
      * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * cancelledBy/cancelledAt 仅 CANCELLED 有值。version 初始 1，配置前置组、完成、
+     * 取消成功各加一；prerequisiteGroups 为当前择一前置组配置（无则空表）；
+     * completionSnapshot 为完成时冻结的前置组快照（未完成或无配置为 null）。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
                            List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt,
+                           int version, List<PrereqGroupView> prerequisiteGroups,
+                           List<PrereqSnapshotGroupView> completionSnapshot) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */
