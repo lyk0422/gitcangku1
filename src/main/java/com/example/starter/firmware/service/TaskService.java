@@ -8,6 +8,7 @@ import com.example.starter.firmware.domain.Device;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
+import com.example.starter.firmware.domain.ReleaseType;
 import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
@@ -55,6 +56,7 @@ public class TaskService {
     /**
      * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
      * PAUSED 时不创建新任务，已有任务仍可查看与回执。
+     * 拓扑波次发布服从拓扑隔离：普通拉取只返回已有任务，不逐个创建，须通过领取波次整体创建。
      */
     public PullResponse pull(String deviceId, String requestId) {
         String fingerprint = String.join("|", "task.pull", deviceId);
@@ -69,6 +71,9 @@ public class TaskService {
             var existing = taskRepository.findByReleaseAndDevice(order.id(), deviceId);
             if (existing.isPresent()) {
                 return new PullResponse(TaskView.of(existing.get(), order));
+            }
+            if (order.releaseType() == ReleaseType.TOPOLOGY) {
+                return new PullResponse(null);
             }
             if (order.status() != ReleaseStatus.ACTIVE
                     || !device.currentVersion().equals(order.fromVersion())
@@ -109,6 +114,10 @@ public class TaskService {
                     releaseRepository.incrementRoundStats(snapshot.releaseId(), request.result());
                     if (request.result() == ReceiptResult.SUCCESS) {
                         deviceRepository.updateCurrentVersion(task.deviceId(), lockedOrder.toVersion());
+                        if (lockedOrder.releaseType() == ReleaseType.TOPOLOGY) {
+                            // 拓扑波次：仅 SUCCESS 恢复健康（解除停机）；FAILED 保持不健康
+                            deviceRepository.updateDown(task.deviceId(), false);
+                        }
                     }
                     ReleaseOrder updated = releaseRepository.findById(snapshot.releaseId()).orElseThrow();
                     pauseIfThresholdReached(updated, taskId);

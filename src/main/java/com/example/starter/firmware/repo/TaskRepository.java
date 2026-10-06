@@ -87,4 +87,21 @@ public class TaskRepository {
                 Long.class, releaseId, deviceId);
         return count == null ? 0 : count;
     }
+
+    /**
+     * 按状态查询发布单下任务的设备ID；拓扑波次用于计算已领取集合与取消时释放停机。
+     */
+    public List<String> findDeviceIdsByReleaseAndStatus(long releaseId, TaskStatus status) {
+        return jdbc.query("SELECT device_id FROM rollout_task WHERE release_id = ? AND status = ?"
+                        + " ORDER BY device_id",
+                (rs, rowNum) -> rs.getString("device_id"), releaseId, status.name());
+    }
+
+    /**
+     * 查询发布单下已有任务的设备ID（不限状态），拓扑波次用于计算未领取集合。
+     */
+    public List<String> findDeviceIdsByRelease(long releaseId) {
+        return jdbc.query("SELECT device_id FROM rollout_task WHERE release_id = ? ORDER BY device_id",
+                (rs, rowNum) -> rs.getString("device_id"), releaseId);
+    }
 }

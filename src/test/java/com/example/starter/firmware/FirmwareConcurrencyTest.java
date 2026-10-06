@@ -66,6 +66,10 @@ class FirmwareConcurrencyTest {
 
     @BeforeEach
     void setUp() {
+        jdbc.update("DELETE FROM release_wave_member");
+        jdbc.update("DELETE FROM release_wave");
+        jdbc.update("DELETE FROM release_topology_edge");
+        jdbc.update("DELETE FROM release_topology_node");
         jdbc.update("DELETE FROM rollout_task");
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");

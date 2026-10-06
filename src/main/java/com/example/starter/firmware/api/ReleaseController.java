@@ -4,6 +4,7 @@ import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
 import com.example.starter.firmware.service.ReleaseService;
 import com.example.starter.firmware.service.TaskService;
+import com.example.starter.firmware.service.TopologyWaveService;
 import jakarta.validation.Valid;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -14,7 +15,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 发布单：创建、扩量、取消、人工恢复、监控统计与暂停/恢复历史、任务明细查询。
+ * 发布单：创建、扩量、取消、人工恢复、监控统计与暂停/恢复历史、任务明细查询、拓扑波次领取。
  */
 @RestController
 @RequestMapping("/api/releases")
@@ -22,10 +23,13 @@ public class ReleaseController {
 
     private final ReleaseService releaseService;
     private final TaskService taskService;
+    private final TopologyWaveService topologyWaveService;
 
-    public ReleaseController(ReleaseService releaseService, TaskService taskService) {
+    public ReleaseController(ReleaseService releaseService, TaskService taskService,
+                             TopologyWaveService topologyWaveService) {
         this.releaseService = releaseService;
         this.taskService = taskService;
+        this.topologyWaveService = topologyWaveService;
     }
 
     @PostMapping
@@ -46,6 +50,11 @@ public class ReleaseController {
     @PostMapping("/{releaseId}/resume")
     public ReleaseView resume(@PathVariable long releaseId, @Valid @RequestBody ResumeReleaseRequest request) {
         return releaseService.resume(releaseId, request);
+    }
+
+    @PostMapping("/{releaseId}/waves")
+    public WaveView claimWave(@PathVariable long releaseId, @Valid @RequestBody ClaimWaveRequest request) {
+        return topologyWaveService.claim(releaseId, request);
     }
 
     @GetMapping("/{releaseId}/monitor")

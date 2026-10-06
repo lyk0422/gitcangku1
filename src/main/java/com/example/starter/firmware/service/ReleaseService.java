@@ -10,7 +10,10 @@ import com.example.starter.firmware.api.ResumeRecordView;
 import com.example.starter.firmware.api.ResumeReleaseRequest;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
+import com.example.starter.firmware.domain.ReleaseType;
+import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.repo.DeviceRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
 import com.example.starter.firmware.repo.ResumeRecordRepository;
@@ -20,29 +23,37 @@ import org.springframework.stereotype.Service;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.List;
 
 /**
  * 发布单生命周期：创建（版本从1开始）、扩量（版本校验+只增不减）、失败率自动暂停、
  * 人工恢复（版本加一并开启新监控轮次）、取消（未终结任务转 CANCELLED）。
+ * 拓扑波次类型在创建时校验并冻结设备无向图；取消时释放待执行任务成员的停机标记。
  */
 @Service
 public class ReleaseService {
 
     private final ReleaseRepository releaseRepository;
     private final TaskRepository taskRepository;
+    private final DeviceRepository deviceRepository;
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
+    private final TopologyWaveService topologyWaveService;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
+                          DeviceRepository deviceRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
+                          TopologyWaveService topologyWaveService,
                           IdempotencyService idempotency, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
+        this.deviceRepository = deviceRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
+        this.topologyWaveService = topologyWaveService;
         this.idempotency = idempotency;
         this.clock = clock;
     }
@@ -55,14 +66,24 @@ public class ReleaseService {
         int threshold = request.effectiveFailureThresholdPercent();
         String fingerprint = String.join("|", "release.create", request.model(), request.fromVersion(),
                 request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
-                String.valueOf(threshold));
+                String.valueOf(threshold),
+                TopologyWaveService.topologyFingerprint(request.topology()));
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
             long id;
             try {
-                id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
-                        request.ratio(), sampleFloor, threshold);
+                if (request.topology() == null) {
+                    id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
+                            request.ratio(), sampleFloor, threshold);
+                } else {
+                    id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
+                            request.ratio(), sampleFloor, threshold,
+                            ReleaseType.TOPOLOGY, request.topology().topologyVersion());
+                }
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
+            }
+            if (request.topology() != null) {
+                topologyWaveService.freezeTopology(id, request.model(), request.topology());
             }
             return ReleaseView.of(findOrder(id));
         }, ReleaseView.class);
@@ -125,8 +146,15 @@ public class ReleaseService {
             ReleaseOrder order = releaseRepository.findByIdForUpdate(releaseId)
                     .orElseThrow(() -> ApiException.notFound("RELEASE_NOT_FOUND", "发布单不存在: " + releaseId));
             if (order.status() == ReleaseStatus.ACTIVE || order.status() == ReleaseStatus.PAUSED) {
+                // 拓扑波次：先取出待执行任务成员，取消后释放其停机标记；已失败设备不自动恢复
+                List<String> pendingDevices = order.releaseType() == ReleaseType.TOPOLOGY
+                        ? taskRepository.findDeviceIdsByReleaseAndStatus(releaseId, TaskStatus.PENDING)
+                        : List.of();
                 releaseRepository.cancel(releaseId);
                 taskRepository.cancelPendingByRelease(releaseId);
+                for (String deviceId : pendingDevices) {
+                    deviceRepository.updateDown(deviceId, false);
+                }
             }
             return ReleaseView.of(findOrder(releaseId));
         }, ReleaseView.class);

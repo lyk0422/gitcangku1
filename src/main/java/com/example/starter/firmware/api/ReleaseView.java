@@ -3,15 +3,16 @@ package com.example.starter.firmware.api;
 import com.example.starter.firmware.domain.ReleaseOrder;
 
 /**
- * 发布单视图。
+ * 发布单视图。releaseType 为 STANDARD 或 TOPOLOGY；topologyVersion 仅 TOPOLOGY 类型非空。
  */
 public record ReleaseView(long releaseId, int version, String model, String fromVersion, String toVersion,
                           int ratio, String status, int sampleFloor, int failureThresholdPercent,
-                          int monitorRound) {
+                          int monitorRound, String releaseType, Integer topologyVersion) {
 
     public static ReleaseView of(ReleaseOrder order) {
         return new ReleaseView(order.id(), order.version(), order.model(), order.fromVersion(),
                 order.toVersion(), order.ratio(), order.status().name(), order.sampleFloor(),
-                order.failureThresholdPercent(), order.monitorRound());
+                order.failureThresholdPercent(), order.monitorRound(), order.releaseType().name(),
+                order.topologyVersion());
     }
 }
