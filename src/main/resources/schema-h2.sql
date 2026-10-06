@@ -100,3 +100,38 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS incident_risk_models (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    initial_risk INT NOT NULL,
+    residual_limit INT NOT NULL,
+    version BIGINT NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_risk_model_incident UNIQUE (incident_id)
+);
+
+CREATE TABLE IF NOT EXISTS incident_risk_barriers (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    barrier_key VARCHAR(128) NOT NULL,
+    task_key VARCHAR(128) NOT NULL,
+    numerator INT NOT NULL,
+    denominator INT NOT NULL,
+    revoked TINYINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_barrier_key UNIQUE (incident_id, barrier_key)
+);
+
+CREATE TABLE IF NOT EXISTS incident_containment_snapshots (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    barrier_key VARCHAR(128) NOT NULL,
+    task_key VARCHAR(128) NOT NULL,
+    task_status VARCHAR(16) NOT NULL,
+    numerator INT NOT NULL,
+    denominator INT NOT NULL,
+    frozen_at TIMESTAMP(6) NOT NULL
+);

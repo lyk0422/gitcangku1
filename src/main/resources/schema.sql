@@ -100,3 +100,38 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS incident_risk_models (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id；每事件至多一个残余风险模型',
+    initial_risk INT NOT NULL COMMENT '初始风险 R，1~1000 整数，首次设置后不可修改',
+    residual_limit INT NOT NULL COMMENT '允许残余上限 L，非负整数且小于 R，首次设置后不可修改',
+    version BIGINT NOT NULL COMMENT '模型乐观锁版本，初始为 0；屏障修改/撤销携带 expectedVersion 匹配成功后加一',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_risk_model_incident UNIQUE (incident_id)
+) COMMENT='事件合成残余风险模型表（合成数据，不连接真实安全设备）';
+
+CREATE TABLE IF NOT EXISTS incident_risk_barriers (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id；每事件至多 5 个未撤销屏障',
+    barrier_key VARCHAR(128) NOT NULL COMMENT '屏障业务键，事件内唯一',
+    task_key VARCHAR(128) NOT NULL COMMENT '绑定的处置任务键，关联 incident_tasks.task_key；登记/换绑时任务须为 OPEN；仅任务 DONE 且屏障未撤销时计入残余',
+    numerator INT NOT NULL COMMENT '削减率分子 p，0~1000 整数且不大于分母',
+    denominator INT NOT NULL COMMENT '削减率分母 q，1~1000 正整数；削减率为 p/q，残余按 R×Π(1-p/q) 精确有理数核算',
+    revoked TINYINT NOT NULL DEFAULT 0 COMMENT '是否已撤销：0 有效 / 1 已撤销；撤销后不计入残余且不可再修改',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_barrier_key UNIQUE (incident_id, barrier_key)
+) COMMENT='事件防护屏障登记表';
+
+CREATE TABLE IF NOT EXISTS incident_containment_snapshots (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    barrier_key VARCHAR(128) NOT NULL COMMENT '遏制时刻有效（未撤销）屏障的业务键',
+    task_key VARCHAR(128) NOT NULL COMMENT '遏制时刻屏障绑定的任务键',
+    task_status VARCHAR(16) NOT NULL COMMENT '遏制时刻绑定任务的状态快照（OPEN/DONE/CANCELLED）；冻结后不再随任务变化',
+    numerator INT NOT NULL COMMENT '遏制时刻屏障削减率分子 p 快照',
+    denominator INT NOT NULL COMMENT '遏制时刻屏障削减率分母 q 快照',
+    frozen_at TIMESTAMP(6) NOT NULL COMMENT '冻结 UTC 时间（进入 CONTAINED 的时刻）；同一事件全部快照行取同一时刻'
+) COMMENT='遏制时刻有效屏障冻结快照表；进入 CONTAINED 时写入一次，后续屏障合法加强不改旧依据';

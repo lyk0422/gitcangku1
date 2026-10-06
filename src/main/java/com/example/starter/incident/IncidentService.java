@@ -72,16 +72,19 @@ public class IncidentService {
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
     private final CommandKeyRepository commandKeys;
+    private final IncidentRiskService riskService;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
                            IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           IncidentRiskService riskService,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
         this.commandKeys = commandKeys;
+        this.riskService = riskService;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -272,6 +275,11 @@ public class IncidentService {
                             throw ApiException.conflict(
                                     "仍有未完成的处置任务，不能进入 RESOLVED", unfinished);
                         }
+                    }
+                    if (targetStatus == IncidentStatus.CONTAINED) {
+                        // 遏制门禁：已建立残余风险模型时，按有效屏障精确核算残余，
+                        // 残余须不大于允许上限 L，否则 422；通过后同事务冻结有效屏障快照
+                        riskService.assertContainableAndFreeze(incident);
                     }
                     Instant now = now();
                     incidents.updateState(incident.id(), targetStatus, incident.commander(), now);
