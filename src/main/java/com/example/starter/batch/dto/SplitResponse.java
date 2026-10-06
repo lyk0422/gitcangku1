@@ -1,6 +1,7 @@
 package com.example.starter.batch.dto;
 
 import com.example.starter.batch.BatchStatus;
+import com.example.starter.batch.BatchType;
 
 import java.time.Instant;
 import java.util.List;
@@ -17,7 +18,7 @@ public record SplitResponse(
 ) {
 
     /**
-     * 拆分产生的子批概要。
+     * 拆分产生的子批概要。quantity/maxSampleAmount 仅 QUANTIFIED 批有值，STANDARD 批为 null。
      */
     public record SplitChild(
             String batchKey,
@@ -26,7 +27,10 @@ public record SplitResponse(
             Instant producedAt,
             BatchStatus status,
             List<String> requiredTests,
-            Instant createdAt
+            Instant createdAt,
+            BatchType batchType,
+            Integer quantity,
+            Integer maxSampleAmount
     ) {
     }
 }

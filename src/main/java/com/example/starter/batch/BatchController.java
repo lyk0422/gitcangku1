@@ -6,6 +6,7 @@ import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
+import com.example.starter.batch.dto.SplitQuantitiesRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
@@ -91,11 +92,21 @@ public class BatchController {
 
     /**
      * 拆分批次：仅当前可用的 RELEASED 父批可拆成 2～5 个全新子批，父批置为 SPLIT。
+     * QUANTIFIED 批请使用 /split-quantities。
      */
     @PostMapping("/{batchKey}/split")
     public ResponseEntity<String> split(@PathVariable String batchKey,
                                         @Valid @RequestBody SplitRequest request) {
         return stored(service.split(batchKey, request));
+    }
+
+    /**
+     * 按数量拆分：仅当前可用的 RELEASED QUANTIFIED 父批；子批数量和必须等于父批剩余量。
+     */
+    @PostMapping("/{batchKey}/split-quantities")
+    public ResponseEntity<String> splitQuantities(@PathVariable String batchKey,
+                                                  @Valid @RequestBody SplitQuantitiesRequest request) {
+        return stored(service.splitQuantities(batchKey, request));
     }
 
     /**

@@ -15,16 +15,20 @@ public class BatchRepository {
 
     /**
      * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
+     * quantity/maxSampleAmount 仅 QUANTIFIED 批非空；consumedAmount 为累计消耗量。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, String status, String createdAt,
+                           String batchType, Integer quantity, Integer maxSampleAmount,
+                           int consumedAmount) {
     }
 
     /**
-     * test_result 表行记录。
+     * test_result 表行记录。sampleKey/consumeAmount 仅绑定破坏性消耗的检验非空。
      */
     public record TestRow(long id, String batchKey, String testKey, String testItem,
-                          String outcome, String inspector, String createdAt) {
+                          String outcome, String inspector, String createdAt,
+                          String sampleKey, Integer consumeAmount) {
     }
 
     /**
@@ -54,15 +58,25 @@ public class BatchRepository {
     public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
     }
 
+    /**
+     * sample_voucher 表行记录：破坏性检验样本消耗凭证，创建后不可撤销。
+     */
+    public record VoucherRow(long id, String batchKey, String sampleKey, String testKey,
+                             int amount, int remainingAfter, String createdAt) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
-            rs.getString("status"), rs.getString("created_at"));
+            rs.getString("status"), rs.getString("created_at"),
+            rs.getString("batch_type"), (Integer) rs.getObject("quantity"),
+            (Integer) rs.getObject("max_sample_amount"), rs.getInt("consumed_amount"));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("test_key"),
             rs.getString("test_item"), rs.getString("outcome"),
-            rs.getString("inspector"), rs.getString("created_at"));
+            rs.getString("inspector"), rs.getString("created_at"),
+            rs.getString("sample_key"), (Integer) rs.getObject("consume_amount"));
 
     private static final RowMapper<ApprovalRow> APPROVAL_MAPPER = (rs, n) -> new ApprovalRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("command_key"),
@@ -81,6 +95,11 @@ public class BatchRepository {
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
             rs.getInt("seq"), rs.getString("created_at"));
 
+    private static final RowMapper<VoucherRow> VOUCHER_MAPPER = (rs, n) -> new VoucherRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getString("sample_key"),
+            rs.getString("test_key"), rs.getInt("amount"), rs.getInt("remaining_after"),
+            rs.getString("created_at"));
+
     private final JdbcTemplate jdbc;
 
     public BatchRepository(JdbcTemplate jdbc) {
@@ -93,7 +112,7 @@ public class BatchRepository {
     }
 
     /**
-     * 行锁读取批次，串行化同一批次上的检验/批准/召回事务。
+     * 行锁读取批次，串行化同一批次上的检验/批准/召回/拆分事务。
      */
     public Optional<BatchRow> findBatchForUpdate(String batchKey) {
         return jdbc.query("SELECT * FROM batch WHERE batch_key = ? FOR UPDATE", BATCH_MAPPER, batchKey)
@@ -101,10 +120,12 @@ public class BatchRepository {
     }
 
     public void insertBatch(BatchRow row) {
-        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status,"
+                        + " batch_type, quantity, max_sample_amount, consumed_amount, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(),
-                row.status(), row.createdAt());
+                row.status(), row.batchType(), row.quantity(), row.maxSampleAmount(),
+                row.consumedAmount(), row.createdAt());
     }
 
     public void insertRequiredTest(String batchKey, String testItem, int seq) {
@@ -122,6 +143,14 @@ public class BatchRepository {
         jdbc.update("UPDATE batch SET status = ? WHERE batch_key = ?", status, batchKey);
     }
 
+    /**
+     * 累加批次破坏性检验消耗量；调用方须持有该批次行锁。
+     */
+    public void addConsumedAmount(String batchKey, int delta) {
+        jdbc.update("UPDATE batch SET consumed_amount = consumed_amount + ? WHERE batch_key = ?",
+                delta, batchKey);
+    }
+
     public List<BatchRow> findAvailableBatches() {
         return jdbc.query("SELECT * FROM batch WHERE status <> 'RECALLED' ORDER BY id", BATCH_MAPPER);
     }
@@ -133,10 +162,10 @@ public class BatchRepository {
     }
 
     public void insertTest(TestRow row) {
-        jdbc.update("INSERT INTO test_result (batch_key, test_key, test_item, outcome, inspector, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO test_result (batch_key, test_key, test_item, outcome, inspector,"
+                        + " sample_key, consume_amount, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 row.batchKey(), row.testKey(), row.testItem(), row.outcome(),
-                row.inspector(), row.createdAt());
+                row.inspector(), row.sampleKey(), row.consumeAmount(), row.createdAt());
     }
 
     public List<TestRow> findTests(String batchKey) {
@@ -208,5 +237,29 @@ public class BatchRepository {
     public List<String> findRecalledKeys() {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
+    }
+
+    /**
+     * 按批次与样本凭证键查询消耗凭证；同一批次内 sampleKey 唯一。
+     */
+    public Optional<VoucherRow> findVoucher(String batchKey, String sampleKey) {
+        return jdbc.query("SELECT * FROM sample_voucher WHERE batch_key = ? AND sample_key = ?",
+                        VOUCHER_MAPPER, batchKey, sampleKey)
+                .stream().findFirst();
+    }
+
+    public void insertVoucher(VoucherRow row) {
+        jdbc.update("INSERT INTO sample_voucher (batch_key, sample_key, test_key, amount,"
+                        + " remaining_after, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.sampleKey(), row.testKey(), row.amount(),
+                row.remainingAfter(), row.createdAt());
+    }
+
+    /**
+     * 某批次全部样本消耗凭证，按落账顺序返回。
+     */
+    public List<VoucherRow> findVouchers(String batchKey) {
+        return jdbc.query("SELECT * FROM sample_voucher WHERE batch_key = ? ORDER BY id",
+                VOUCHER_MAPPER, batchKey);
     }
 }
