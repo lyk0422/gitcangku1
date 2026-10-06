@@ -105,6 +105,14 @@ public class ObservationController {
                 .toList();
     }
 
+    /**
+     * 按 observationId 查询历次收件（源输入原始值、单位与精确规范值），按收件时刻先后排序。
+     */
+    @GetMapping("/{observationId}/receipts")
+    public List<ObservationReceipt> listReceipts(@PathVariable String observationId) {
+        return observationService.listReceipts(observationId);
+    }
+
     private ResolutionResponse resolutionResponse(ResolutionRecord record) {
         ObservationSnapshot pointed = observationService.getVersionSnapshot(
                 record.observationId(), record.newVersion());

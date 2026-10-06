@@ -16,10 +16,11 @@ import java.util.Map;
  * @param baseVersion            离线修改所基于的基线版本号（服务端据此重新读取基线重算冲突）
  * @param expectedCurrentVersion 客户端预期的解决前当前版本号，不匹配返回 409
  * @param location               观测地点候选完整值
- * @param reading                观测读数候选完整值，十进制字符串，最多三位小数
+ * @param reading                观测读数候选完整值，十进制字符串，最多三位小数；带量纲记录按 readingUnit 解释
  * @param note                   观测备注候选完整值
  * @param selections             冲突字段选择，键为字段名，值为 CURRENT 或 CANDIDATE；必须恰好覆盖本次仍冲突的字段
  * @param operator               操作者标识
+ * @param readingUnit            读数原始单位：长度 m/cm，温度 C/K；带量纲记录必填且不得跨量纲，旧无单位记录不得提供
  */
 public record ResolveConflictRequest(
         @NotBlank @Size(max = 128) String requestId,
@@ -31,5 +32,16 @@ public record ResolveConflictRequest(
         String reading,
         @NotNull @Size(max = 1024) String note,
         @NotNull Map<String, String> selections,
-        @NotBlank @Size(max = 128) String operator) {
+        @NotBlank @Size(max = 128) String operator,
+        @Size(max = 8) String readingUnit) {
+
+    /**
+     * 旧无单位读数的解决请求：单位为 null。
+     */
+    public ResolveConflictRequest(String requestId, String resolutionId, Integer baseVersion,
+                                  Integer expectedCurrentVersion, String location, String reading,
+                                  String note, Map<String, String> selections, String operator) {
+        this(requestId, resolutionId, baseVersion, expectedCurrentVersion, location, reading, note,
+                selections, operator, null);
+    }
 }

@@ -5,7 +5,9 @@
 CREATE TABLE IF NOT EXISTS observation_current (
     observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
     location VARCHAR(512) NOT NULL COMMENT '观测地点（可编辑字段）',
-    reading VARCHAR(64) NOT NULL COMMENT '观测读数，十进制字符串，最多三位小数，比较按数值（可编辑字段）',
+    reading VARCHAR(64) NOT NULL COMMENT '当前规范读数：带量纲记录为精确规范值（长度 m/温度 C，不舍入），旧无单位记录为原始十进制字符串；最多三位小数输入，比较按数值（可编辑字段）',
+    reading_unit VARCHAR(8) NULL COMMENT '当前读数的原始上报单位（m/cm/C/K）；旧无单位读数为 NULL',
+    dimension VARCHAR(16) NULL COMMENT '量纲：LENGTH/TEMPERATURE，创建时固定不可跨量纲提交；NULL 表示旧无单位读数（不自动推断量纲）',
     note VARCHAR(1024) NOT NULL COMMENT '观测备注（可编辑字段）',
     version INT NOT NULL COMMENT '当前版本号，从 1 开始',
     deleted BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已删除：TRUE 表示当前状态为删除墓碑',
@@ -18,11 +20,32 @@ CREATE TABLE IF NOT EXISTS observation_version (
     observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
     version INT NOT NULL COMMENT '版本号，从 1 开始，与 observation_current.version 对应',
     location VARCHAR(512) NULL COMMENT '该版本观测地点快照；删除墓碑版本为 NULL',
-    reading VARCHAR(64) NULL COMMENT '该版本观测读数快照（十进制字符串原文）；删除墓碑版本为 NULL',
+    reading VARCHAR(64) NULL COMMENT '该版本规范读数快照（带量纲记录为精确规范值，长度 m/温度 C）；删除墓碑版本为 NULL',
+    reading_unit VARCHAR(8) NULL COMMENT '该版本读数的原始上报单位（m/cm/C/K），写入后永不修改；旧无单位读数为 NULL',
+    dimension VARCHAR(16) NULL COMMENT '量纲快照：LENGTH/TEMPERATURE；旧无单位读数为 NULL',
     note VARCHAR(1024) NULL COMMENT '该版本观测备注快照；删除墓碑版本为 NULL',
     deleted BOOLEAN NOT NULL COMMENT '该版本是否为删除墓碑：TRUE 时业务字段无意义',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '该版本生成时间（服务器时区）',
     PRIMARY KEY (observation_id, version)
+);
+
+-- 源输入收件表：每次成功收件（创建/合并/冲突解决）追加一行，另存原值、单位与精确规范值；
+-- 规范读数等价、业务版本不前进时也必须留下收件溯源；失败回滚不留收件。
+CREATE TABLE IF NOT EXISTS observation_receipt (
+    receipt_id BIGINT NOT NULL AUTO_INCREMENT COMMENT '收件记录自增标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '产生该收件的请求标识（与 request_log 对应）',
+    operation VARCHAR(16) NOT NULL COMMENT '收件来源操作：CREATE / MERGE / RESOLVE',
+    dimension VARCHAR(16) NULL COMMENT '量纲：LENGTH/TEMPERATURE；旧无单位读数为 NULL',
+    original_value VARCHAR(64) NOT NULL COMMENT '源输入原始读数（十进制原文，最多三位小数）',
+    original_unit VARCHAR(8) NULL COMMENT '源输入原始单位（m/cm/C/K）；旧无单位读数为 NULL',
+    normalized_value VARCHAR(64) NOT NULL COMMENT '精确规范读数：长度统一为 m，温度统一为 C，不舍入',
+    result_version INT NOT NULL COMMENT '收件确认后观测记录所处版本号（等价不增版时为当前版本）',
+    received_at_utc TIMESTAMP NOT NULL COMMENT '收件时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '收件落库时间（服务器时区）',
+    PRIMARY KEY (receipt_id),
+    -- 同一请求只产生一条收件：与 request_log 的占位-回填机制配合，重放不重复收件。
+    UNIQUE (request_id)
 );
 
 -- 幂等去重表：仅记录成功结果，失败不占键；与业务变更同事务原子提交。
@@ -46,6 +69,9 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     new_version INT NOT NULL COMMENT '解决后指向的版本号；无变化解决时等于 previous_version',
     candidate_location VARCHAR(512) NOT NULL COMMENT '客户端提交的候选地点完整值',
     candidate_reading VARCHAR(64) NOT NULL COMMENT '客户端提交的候选读数完整值（十进制原文，最多三位小数）',
+    candidate_reading_unit VARCHAR(8) NULL COMMENT '候选读数的原始单位（m/cm/C/K）；旧无单位读数为 NULL',
+    resolved_reading VARCHAR(64) NULL COMMENT '裁决冻结的精确规范读数（长度 m/温度 C，不舍入）；删除墓碑场景不涉及',
+    resolved_reading_source VARCHAR(16) NULL COMMENT '冻结读数来源：CURRENT（保留当前）/CANDIDATE（接受候选）',
     candidate_note VARCHAR(1024) NOT NULL COMMENT '客户端提交的候选备注完整值',
     conflict_fields VARCHAR(256) NOT NULL COMMENT '服务端重算出的冲突字段名列表（JSON 数组原文，固定顺序 location/reading/note）',
     field_selections VARCHAR(512) NOT NULL COMMENT '各冲突字段的人工选择（JSON 对象原文，值为 CURRENT/CANDIDATE）',

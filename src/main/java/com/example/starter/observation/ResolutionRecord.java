@@ -6,20 +6,23 @@ import java.util.List;
 /**
  * 不可变冲突解决记录：对应 conflict_resolution 表的一行，成功解决后原子落库，永不修改。
  *
- * @param resolutionId        全局唯一解决记录标识
- * @param observationId       观测记录唯一标识
- * @param requestId           生成该记录的请求标识
- * @param baseVersion         基线版本号
- * @param previousVersion     解决前当前版本号
- * @param newVersion          解决后指向的版本号（无变化解决时等于 previousVersion）
- * @param candidateLocation   候选地点完整值
- * @param candidateReading    候选读数完整值（十进制原文）
- * @param candidateNote       候选备注完整值
- * @param conflictFields      服务端重算出的冲突字段名列表
- * @param fieldSelections     各冲突字段的人工选择（CURRENT/CANDIDATE 的 JSON 原文）
- * @param operator            操作者标识
- * @param resolvedAtUtc       解决完成时刻（UTC）
- * @param contentChanged      解决后内容是否发生变化：false 表示未生成新观测版本
+ * @param resolutionId           全局唯一解决记录标识
+ * @param observationId          观测记录唯一标识
+ * @param requestId              生成该记录的请求标识
+ * @param baseVersion            基线版本号
+ * @param previousVersion        解决前当前版本号
+ * @param newVersion             解决后指向的版本号（无变化解决时等于 previousVersion）
+ * @param candidateLocation      候选地点完整值
+ * @param candidateReading       候选读数完整值（十进制原文）
+ * @param candidateNote          候选备注完整值
+ * @param conflictFields         服务端重算出的冲突字段名列表
+ * @param fieldSelections        各冲突字段的人工选择（CURRENT/CANDIDATE 的 JSON 原文）
+ * @param operator               操作者标识
+ * @param resolvedAtUtc          解决完成时刻（UTC）
+ * @param contentChanged         解决后内容是否发生变化：false 表示未生成新观测版本
+ * @param candidateReadingUnit   候选读数的原始单位（m/cm/C/K）；旧无单位读数为 null
+ * @param resolvedReading        裁决冻结的精确规范读数（长度 m/温度 C，不舍入）
+ * @param resolvedReadingSource  冻结读数来源：CURRENT（保留当前）/CANDIDATE（接受候选）
  */
 public record ResolutionRecord(
         String resolutionId,
@@ -35,5 +38,8 @@ public record ResolutionRecord(
         String fieldSelections,
         String operator,
         Instant resolvedAtUtc,
-        boolean contentChanged) {
+        boolean contentChanged,
+        String candidateReadingUnit,
+        String resolvedReading,
+        String resolvedReadingSource) {
 }

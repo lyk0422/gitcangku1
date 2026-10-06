@@ -29,18 +29,22 @@ import java.util.Set;
  * 再对 observation_current 行加锁（SELECT ... FOR UPDATE）完成业务判定与变更，
  * 最后回填去重记录的响应并整体提交；任何业务失败都会回滚，去重记录不占键。
  *
+ * <p>量纲规则：创建时固定量纲（LENGTH 支持 m/cm，TEMPERATURE 支持 C/K），后续提交不得跨量纲；
+ * 旧无单位读数不自动推断量纲。存储与合并比较一律使用精确规范值（长度 m、温度 C，不舍入），
+ * 等价不同单位（如 100cm 与 1m、273.15K 与 0C）不增业务版本；每次成功收件都另存
+ * 原值、原始单位与规范值到 observation_receipt，不因等价省掉收件溯源。
+ *
  * <p>合并规则（按字段比较基线 base、当前 current、候选 candidate）：
  * 候选未改（等于基线）保留当前；当前未改接受候选；两边改为相同值也接受；
- * 否则整次 409，不写入任何部分结果。读数按数值比较，其余字段按原文比较。
+ * 否则整次 409，不写入任何部分结果。读数按精确规范值比较，其余字段按原文比较。
  *
  * <p>显式冲突解决（RESOLVE）在同一套占位与行锁机制内执行：事务内重读基线与最新当前版本重算冲突，
  * 人工选择必须恰好覆盖重算后的冲突字段；成功后原子写入新观测版本（内容无变化则不加版本）、
- * 不可变 conflict_resolution 记录与 request_log 响应。resolutionId 全局唯一，同参重放、改参 409。
+ * 不可变 conflict_resolution 记录（冻结所选来源与精确规范读数）与 request_log 响应。
+ * resolutionId 全局唯一，同参重放、改参 409。
  */
 @Service
 public class ObservationService {
-
-    private static final String SEPARATOR = "\u0001";
 
     /**
      * 三个可编辑字段的固定顺序：冲突重算、选择校验与指纹均以此顺序处理，保证结果稳定。
@@ -50,28 +54,44 @@ public class ObservationService {
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
     private final ResolutionRepository resolutionRepository;
+    private final ReceiptRepository receiptRepository;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public ObservationService(ObservationRepository observationRepository,
                               RequestLogRepository requestLogRepository,
                               ResolutionRepository resolutionRepository,
+                              ReceiptRepository receiptRepository,
                               ObjectMapper objectMapper,
                               Clock clock) {
         this.observationRepository = observationRepository;
         this.requestLogRepository = requestLogRepository;
         this.resolutionRepository = resolutionRepository;
+        this.receiptRepository = receiptRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
 
     /**
      * 创建观测记录，初始版本为 1。记录已存在返回 409。
+     * 带量纲创建时固定量纲并保存规范读数与原始单位；成功后写入收件记录。
      */
     @Transactional
     public WriteOutcome create(CreateObservationRequest request) {
-        String fingerprint = fingerprint("CREATE", request.observationId(), request.location(),
-                request.reading(), request.note());
+        Dimension dimension = parseDimension(request.dimension());
+        String normalizedReading = normalizeCreateReading(dimension, request.reading(), request.readingUnit());
+        String dimensionName = dimension == null ? null : dimension.name();
+
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("operation", "CREATE");
+        identity.put("observationId", request.observationId());
+        identity.put("operator", request.operator());
+        identity.put("location", request.location());
+        identity.put("reading", request.reading());
+        identity.put("readingUnit", request.readingUnit());
+        identity.put("dimension", request.dimension());
+        identity.put("note", request.note());
+        String fingerprint = fingerprint(identity);
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -85,7 +105,8 @@ public class ObservationService {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
         ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
-                request.location(), request.reading(), request.note(), false);
+                request.location(), normalizedReading, request.readingUnit(), dimensionName,
+                request.note(), false);
         try {
             observationRepository.insertCurrent(snapshot);
         } catch (DuplicateKeyException e) {
@@ -93,16 +114,27 @@ public class ObservationService {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
         observationRepository.insertVersion(snapshot);
+        insertReceipt(request.requestId(), "CREATE", snapshot.observationId(), dimensionName,
+                request.reading(), request.readingUnit(), normalizedReading, snapshot.version());
         return complete(request.requestId(), HttpStatus.CREATED, ObservationResponse.of(snapshot));
     }
 
     /**
      * 离线提交：基于 baseVersion 的三方合并。合并结果与当前完全相同则不加版本，否则版本加一。
+     * 读数按精确规范值比较：等价不同单位不增版本，但成功收件仍写入收件记录。
      */
     @Transactional
     public WriteOutcome merge(String observationId, MergeObservationRequest request) {
-        String fingerprint = fingerprint("MERGE", observationId, String.valueOf(request.baseVersion()),
-                request.location(), request.reading(), request.note());
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("operation", "MERGE");
+        identity.put("observationId", observationId);
+        identity.put("operator", request.operator());
+        identity.put("baseVersion", request.baseVersion());
+        identity.put("location", request.location());
+        identity.put("reading", request.reading());
+        identity.put("readingUnit", request.readingUnit());
+        identity.put("note", request.note());
+        String fingerprint = fingerprint(identity);
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -117,6 +149,8 @@ public class ObservationService {
         if (current.deleted()) {
             throw ApiException.gone("observation already deleted: " + observationId);
         }
+        String normalizedCandidate = normalizeSubmittedReading(current.dimension(),
+                request.reading(), request.readingUnit());
         ObservationSnapshot base = observationRepository.findVersion(observationId, request.baseVersion())
                 .orElseThrow(() -> ApiException.notFound(
                         "base version not found: " + observationId + "@" + request.baseVersion()));
@@ -124,23 +158,32 @@ public class ObservationService {
         List<String> conflictFields = new ArrayList<>();
         String mergedLocation = mergeField("location", base.location(), current.location(),
                 request.location(), conflictFields);
-        String mergedReading = mergeReadingField(base.reading(), current.reading(),
-                request.reading(), conflictFields);
+        ReadingMerge readingMerge = mergeReading(base.reading(), current.reading(), current.readingUnit(),
+                normalizedCandidate, request.readingUnit());
+        if (readingMerge.conflict()) {
+            conflictFields.add("reading");
+        }
         String mergedNote = mergeField("note", base.note(), current.note(), request.note(), conflictFields);
         if (!conflictFields.isEmpty()) {
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, readingMerge.reading(), readingMerge.unit(), current.dimension(),
+                mergedNote, false);
         if (sameContent(merged, current)) {
-            // 合并结果与当前完全相同：返回当前版本，不加版本
+            // 合并结果与当前完全相同（含规范读数等价）：返回当前版本，不加版本，但仍留下收件溯源
+            insertReceipt(request.requestId(), "MERGE", observationId, current.dimension(),
+                    request.reading(), request.readingUnit(), normalizedCandidate, current.version());
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
         ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, readingMerge.reading(), readingMerge.unit(), current.dimension(),
+                mergedNote, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
+        insertReceipt(request.requestId(), "MERGE", observationId, current.dimension(),
+                request.reading(), request.readingUnit(), normalizedCandidate, next.version());
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
     }
 
@@ -149,7 +192,12 @@ public class ObservationService {
      */
     @Transactional
     public WriteOutcome delete(String observationId, DeleteObservationRequest request) {
-        String fingerprint = fingerprint("DELETE", observationId, String.valueOf(request.expectedVersion()));
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("operation", "DELETE");
+        identity.put("observationId", observationId);
+        identity.put("operator", request.operator());
+        identity.put("expectedVersion", request.expectedVersion());
+        String fingerprint = fingerprint(identity);
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -186,15 +234,26 @@ public class ObservationService {
 
     /**
      * 显式冲突解决：事务内重读基线与最新当前版本并按原三方规则重算冲突，不信任客户端上次看到的冲突列表。
-     * 选择恰好覆盖本次仍冲突字段时生成新版本（内容无变化则不加版本）并原子写入不可变解决记录。
+     * 选择恰好覆盖本次仍冲突字段时生成新版本（内容无变化则不加版本）并原子写入不可变解决记录、
+     * 收件记录与 request_log 响应。读数按精确规范值重算与冻结，裁决冻结所选来源与精确规范值。
      */
     @Transactional
     public ResolveOutcome resolveConflict(String observationId, ResolveConflictRequest request) {
         Map<String, FieldSelection> selections = parseSelections(request.selections());
         String normalizedSelections = writeSelectionsJson(selections);
-        String fingerprint = fingerprint("RESOLVE", observationId, request.resolutionId(),
-                String.valueOf(request.baseVersion()), String.valueOf(request.expectedCurrentVersion()),
-                request.location(), request.reading(), request.note(), normalizedSelections, request.operator());
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("operation", "RESOLVE");
+        identity.put("observationId", observationId);
+        identity.put("operator", request.operator());
+        identity.put("resolutionId", request.resolutionId());
+        identity.put("baseVersion", request.baseVersion());
+        identity.put("expectedCurrentVersion", request.expectedCurrentVersion());
+        identity.put("location", request.location());
+        identity.put("reading", request.reading());
+        identity.put("readingUnit", request.readingUnit());
+        identity.put("note", request.note());
+        identity.put("selections", normalizedSelections);
+        String fingerprint = fingerprint(identity);
         ResolveOutcome replayed = checkResolveReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -223,6 +282,9 @@ public class ObservationService {
             throw ApiException.gone("observation already deleted: " + observationId);
         }
 
+        String normalizedCandidate = normalizeSubmittedReading(current.dimension(),
+                request.reading(), request.readingUnit());
+
         if (request.expectedCurrentVersion() != current.version()) {
             throw ApiException.conflict("expectedCurrentVersion mismatch", current.version());
         }
@@ -235,7 +297,7 @@ public class ObservationService {
         if (locationConflict) {
             conflictFields.add("location");
         }
-        boolean readingConflict = fieldConflicts(base.reading(), current.reading(), request.reading(), true);
+        boolean readingConflict = fieldConflicts(base.reading(), current.reading(), normalizedCandidate, true);
         if (readingConflict) {
             conflictFields.add("reading");
         }
@@ -247,18 +309,20 @@ public class ObservationService {
 
         String resolvedLocation = resolveFieldValue(locationConflict, selections.get("location"),
                 base.location(), current.location(), request.location(), false);
-        String resolvedReading = resolveFieldValue(readingConflict, selections.get("reading"),
-                base.reading(), current.reading(), request.reading(), true);
+        ResolvedReading resolvedReading = resolveReading(readingConflict, selections.get("reading"),
+                base.reading(), current, normalizedCandidate, request.readingUnit());
         String resolvedNote = resolveFieldValue(noteConflict, selections.get("note"),
                 base.note(), current.note(), request.note(), false);
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                resolvedLocation, resolvedReading, resolvedNote, false);
+                resolvedLocation, resolvedReading.value(), resolvedReading.unit(), current.dimension(),
+                resolvedNote, false);
         boolean contentChanged = !sameContent(merged, current);
         int newVersion = contentChanged ? current.version() + 1 : current.version();
         if (contentChanged) {
             ObservationSnapshot next = new ObservationSnapshot(observationId, newVersion,
-                    resolvedLocation, resolvedReading, resolvedNote, false);
+                    resolvedLocation, resolvedReading.value(), resolvedReading.unit(), current.dimension(),
+                    resolvedNote, false);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
         }
@@ -268,7 +332,8 @@ public class ObservationService {
                 request.baseVersion(), current.version(), newVersion,
                 request.location(), request.reading(), request.note(),
                 List.copyOf(conflictFields), normalizedSelections, request.operator(),
-                Instant.now(clock), contentChanged);
+                Instant.now(clock), contentChanged,
+                request.readingUnit(), resolvedReading.value(), resolvedReading.source());
         try {
             resolutionRepository.insert(record);
         } catch (DuplicateKeyException e) {
@@ -284,8 +349,13 @@ public class ObservationService {
             return completeResolve(request.requestId(), HttpStatus.OK, resolutionResponseOf(winner));
         }
 
+        // 收件与业务版本变化同事务保存：候选输入的原值、单位与精确规范值留痕
+        insertReceipt(request.requestId(), "RESOLVE", observationId, current.dimension(),
+                request.reading(), request.readingUnit(), normalizedCandidate, newVersion);
+
         ObservationSnapshot pointed = contentChanged
-                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
+                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading.value(),
+                        resolvedReading.unit(), current.dimension(), resolvedNote, false)
                 : current;
         return completeResolve(request.requestId(), HttpStatus.OK,
                 ResolutionResponse.of(record, pointed, objectMapper));
@@ -347,18 +417,126 @@ public class ObservationService {
     }
 
     /**
-     * 读数字段三方合并：按数值比较（BigDecimal），其余规则与普通字段一致。
+     * 读数字段三方合并：按精确规范值比较（BigDecimal），其余规则与普通字段一致。
+     * 返回合并后的规范读数及其原始单位：接受候选时随候选单位，保留当前时随当前单位。
      */
-    private String mergeReadingField(String base, String current, String candidate,
-                                     List<String> conflictFields) {
-        if (readingEquals(candidate, base)) {
-            return current;
+    private ReadingMerge mergeReading(String baseReading, String currentReading, String currentUnit,
+                                      String normalizedCandidate, String candidateUnit) {
+        if (readingEquals(normalizedCandidate, baseReading)) {
+            return new ReadingMerge(currentReading, currentUnit, false);
         }
-        if (readingEquals(current, base) || readingEquals(candidate, current)) {
-            return candidate;
+        if (readingEquals(currentReading, baseReading) || readingEquals(normalizedCandidate, currentReading)) {
+            return new ReadingMerge(normalizedCandidate, candidateUnit, false);
         }
-        conflictFields.add("reading");
-        return current;
+        return new ReadingMerge(currentReading, currentUnit, true);
+    }
+
+    /**
+     * 读数合并结果：规范读数、原始单位与是否冲突。
+     */
+    private record ReadingMerge(String reading, String unit, boolean conflict) {
+    }
+
+    /**
+     * 冲突解决中的读数取值：冲突字段按人工选择冻结来源与精确规范值；非冲突字段按原三方规则自动合并。
+     */
+    private ResolvedReading resolveReading(boolean conflict, FieldSelection selection,
+                                           String baseReading, ObservationSnapshot current,
+                                           String normalizedCandidate, String candidateUnit) {
+        if (conflict) {
+            if (selection == FieldSelection.CANDIDATE) {
+                return new ResolvedReading(normalizedCandidate, candidateUnit, "CANDIDATE");
+            }
+            return new ResolvedReading(current.reading(), current.readingUnit(), "CURRENT");
+        }
+        ReadingMerge auto = mergeReading(baseReading, current.reading(), current.readingUnit(),
+                normalizedCandidate, candidateUnit);
+        String source = readingEquals(auto.reading(), normalizedCandidate)
+                && !readingEquals(normalizedCandidate, baseReading) ? "CANDIDATE" : "CURRENT";
+        return new ResolvedReading(auto.reading(), auto.unit(), source);
+    }
+
+    /**
+     * 裁决冻结的读数：精确规范值、原始单位与来源（CURRENT/CANDIDATE）。
+     */
+    private record ResolvedReading(String value, String unit, String source) {
+    }
+
+    /**
+     * 创建请求的读数规范化：dimension 与 readingUnit 必须同时提供或同时缺省；
+     * 非法量纲、单位不属于量纲均 400。旧无单位读数不自动推断量纲，按原文存储。
+     */
+    private String normalizeCreateReading(Dimension dimension, String reading, String readingUnit) {
+        if (dimension == null) {
+            if (readingUnit != null && !readingUnit.isBlank()) {
+                throw ApiException.badRequest("readingUnit requires dimension; "
+                        + "unit-less readings do not infer a dimension");
+            }
+            return reading;
+        }
+        return normalizeWithDimension(dimension, reading, readingUnit);
+    }
+
+    /**
+     * 后续提交（合并/解决）的读数规范化：量纲在创建时固定，不得跨量纲提交；
+     * 带量纲记录必须携带属于该量纲的单位，旧无单位记录不得携带单位。
+     */
+    private String normalizeSubmittedReading(String recordDimension, String reading, String readingUnit) {
+        if (recordDimension == null) {
+            if (readingUnit != null && !readingUnit.isBlank()) {
+                throw ApiException.badRequest("observation has no fixed dimension; "
+                        + "unit-less readings do not infer a dimension, submit without readingUnit");
+            }
+            return reading;
+        }
+        return normalizeWithDimension(Dimension.valueOf(recordDimension), reading, readingUnit);
+    }
+
+    private String normalizeWithDimension(Dimension dimension, String reading, String readingUnit) {
+        if (readingUnit == null || readingUnit.isBlank()) {
+            throw ApiException.badRequest("readingUnit is required for dimension " + dimension.name());
+        }
+        if (!dimension.supports(readingUnit)) {
+            throw ApiException.badRequest("unsupported unit '" + readingUnit + "' for dimension "
+                    + dimension.name() + "; cross-dimension or unknown units are rejected");
+        }
+        return dimension.normalize(readingUnit, reading);
+    }
+
+    /**
+     * 解析创建请求的量纲：缺省（null/空白）返回 null 表示旧无单位读数；非法量纲名 400。
+     */
+    private Dimension parseDimension(String dimension) {
+        if (dimension == null || dimension.isBlank()) {
+            return null;
+        }
+        Dimension parsed = Dimension.parse(dimension);
+        if (parsed == null) {
+            throw ApiException.badRequest("unsupported dimension: " + dimension
+                    + "; supported: LENGTH, TEMPERATURE");
+        }
+        return parsed;
+    }
+
+    /**
+     * 成功收件落库：另存原值、原始单位与精确规范值，与业务变更同事务提交。
+     */
+    private void insertReceipt(String requestId, String operation, String observationId, String dimension,
+                               String originalValue, String originalUnit, String normalizedValue,
+                               int resultVersion) {
+        receiptRepository.insert(new ObservationReceipt(null, observationId, requestId, operation,
+                dimension, originalValue, originalUnit, normalizedValue, resultVersion,
+                Instant.now(clock)));
+    }
+
+    /**
+     * 按 observationId 查询历次收件（原始输入溯源），按收件时刻先后排序；观测记录不存在返回 404。
+     */
+    @Transactional(readOnly = true)
+    public List<ObservationReceipt> listReceipts(String observationId) {
+        observationRepository.findCurrent(observationId)
+                .orElseThrow(() -> ApiException.notFound("observation not found: " + observationId));
+        return receiptRepository.findByObservationId(observationId);
     }
 
     /**
@@ -418,14 +596,20 @@ public class ObservationService {
         return new WriteOutcome(status.value(), body);
     }
 
-    private String fingerprint(String operation, String... parts) {
-        StringBuilder raw = new StringBuilder(operation);
-        for (String part : parts) {
-            raw.append(SEPARATOR).append(part == null ? "<null>" : part);
+    /**
+     * 请求指纹：操作、操作者、资源与全部参数（含期望版本）按固定键序组成结构化 JSON 后取 SHA-256。
+     * 结构化序列化避免分隔符碰撞：参数内容中的任意字符（含控制符）都不会改变字段边界。
+     */
+    private String fingerprint(Map<String, Object> identity) {
+        String raw;
+        try {
+            raw = objectMapper.writeValueAsString(identity);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("failed to serialize request identity", e);
         }
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(digest.digest(raw.toString().getBytes(StandardCharsets.UTF_8)));
+            return HexFormat.of().formatHex(digest.digest(raw.getBytes(StandardCharsets.UTF_8)));
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 not available", e);
         }
@@ -608,6 +792,7 @@ public class ObservationService {
                 && record.previousVersion() == request.expectedCurrentVersion()
                 && Objects.equals(record.candidateLocation(), request.location())
                 && Objects.equals(record.candidateReading(), request.reading())
+                && Objects.equals(record.candidateReadingUnit(), request.readingUnit())
                 && Objects.equals(record.candidateNote(), request.note())
                 && Objects.equals(record.fieldSelections(), normalizedSelections)
                 && Objects.equals(record.operator(), request.operator());

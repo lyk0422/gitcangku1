@@ -39,9 +39,10 @@ public class ResolutionRepository {
         jdbcTemplate.update(
                 "INSERT INTO conflict_resolution (resolution_id, observation_id, request_id, "
                         + "base_version, previous_version, new_version, candidate_location, candidate_reading, "
+                        + "candidate_reading_unit, resolved_reading, resolved_reading_source, "
                         + "candidate_note, conflict_fields, field_selections, operator, content_changed, "
                         + "resolved_at_utc, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 record.resolutionId(),
                 record.observationId(),
                 record.requestId(),
@@ -50,6 +51,9 @@ public class ResolutionRepository {
                 record.newVersion(),
                 record.candidateLocation(),
                 record.candidateReading(),
+                record.candidateReadingUnit(),
+                record.resolvedReading(),
+                record.resolvedReadingSource(),
                 record.candidateNote(),
                 writeJson(record.conflictFields()),
                 record.fieldSelections(),
@@ -63,10 +67,7 @@ public class ResolutionRepository {
      */
     public Optional<ResolutionRecord> findByResolutionId(String resolutionId) {
         return jdbcTemplate.query(
-                        "SELECT resolution_id, observation_id, request_id, base_version, previous_version, "
-                                + "new_version, candidate_location, candidate_reading, candidate_note, "
-                                + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc "
-                                + "FROM conflict_resolution WHERE resolution_id = ?",
+                        "SELECT " + RESOLUTION_COLUMNS + " FROM conflict_resolution WHERE resolution_id = ?",
                         RESOLUTION_MAPPER, resolutionId)
                 .stream().findFirst();
     }
@@ -76,10 +77,7 @@ public class ResolutionRepository {
      */
     public List<ResolutionRecord> findByObservationId(String observationId) {
         return jdbcTemplate.query(
-                "SELECT resolution_id, observation_id, request_id, base_version, previous_version, "
-                        + "new_version, candidate_location, candidate_reading, candidate_note, "
-                        + "conflict_fields, field_selections, operator, content_changed, resolved_at_utc "
-                        + "FROM conflict_resolution WHERE observation_id = ? "
+                "SELECT " + RESOLUTION_COLUMNS + " FROM conflict_resolution WHERE observation_id = ? "
                         + "ORDER BY resolved_at_utc ASC, resolution_id ASC",
                 RESOLUTION_MAPPER, observationId);
     }
@@ -111,6 +109,12 @@ public class ResolutionRepository {
         }
     }
 
+    private static final String RESOLUTION_COLUMNS =
+            "resolution_id, observation_id, request_id, base_version, previous_version, new_version, "
+                    + "candidate_location, candidate_reading, candidate_reading_unit, resolved_reading, "
+                    + "resolved_reading_source, candidate_note, conflict_fields, field_selections, operator, "
+                    + "content_changed, resolved_at_utc";
+
     private final RowMapper<ResolutionRecord> RESOLUTION_MAPPER = (rs, rowNum) -> new ResolutionRecord(
             rs.getString("resolution_id"),
             rs.getString("observation_id"),
@@ -125,5 +129,8 @@ public class ResolutionRepository {
             rs.getString("field_selections"),
             rs.getString("operator"),
             rs.getTimestamp("resolved_at_utc").toInstant(),
-            rs.getBoolean("content_changed"));
+            rs.getBoolean("content_changed"),
+            rs.getString("candidate_reading_unit"),
+            rs.getString("resolved_reading"),
+            rs.getString("resolved_reading_source"));
 }
