@@ -68,4 +68,11 @@ public class ApiException extends RuntimeException {
     public static ApiException gone(String message) {
         return new ApiException(HttpStatus.GONE, message, null, null);
     }
+
+    /**
+     * 422：业务规则不满足（如闭合导线闭合差越限、引用缺位移或墓碑观测），不写入任何结果。
+     */
+    public static ApiException unprocessable(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, null);
+    }
 }

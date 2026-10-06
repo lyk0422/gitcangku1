@@ -11,6 +11,7 @@ import java.util.Map;
 
 /**
  * 冲突解决响应：返回不可变解决记录要点及解决后指向版本的内容。
+ * 位移字段组（dx/dy/w）仅在解决后版本携带位移时出现。
  *
  * @param resolutionId    全局唯一解决记录标识
  * @param observationId   观测记录唯一标识
@@ -26,6 +27,9 @@ import java.util.Map;
  * @param location        解决后版本的观测地点
  * @param reading         解决后版本的观测读数
  * @param note            解决后版本的观测备注
+ * @param dx              解决后版本的位移 X 分量（米）；无位移时不返回
+ * @param dy              解决后版本的位移 Y 分量（米）；无位移时不返回
+ * @param w               解决后版本的边长权重（米）；无位移时不返回
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ResolutionResponse(
@@ -42,7 +46,10 @@ public record ResolutionResponse(
         Instant resolvedAtUtc,
         String location,
         String reading,
-        String note) {
+        String note,
+        String dx,
+        String dy,
+        String w) {
 
     private static final TypeReference<Map<String, String>> SELECTIONS_TYPE = new TypeReference<>() {
     };
@@ -66,7 +73,10 @@ public record ResolutionResponse(
                 record.resolvedAtUtc(),
                 pointed.location(),
                 pointed.reading(),
-                pointed.note());
+                pointed.note(),
+                pointed.dx(),
+                pointed.dy(),
+                pointed.w());
     }
 
     private static Map<String, String> parseSelections(String json, ObjectMapper objectMapper) {

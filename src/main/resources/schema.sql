@@ -7,6 +7,9 @@ CREATE TABLE IF NOT EXISTS observation_current (
     location VARCHAR(512) NOT NULL COMMENT '观测地点（可编辑字段）',
     reading VARCHAR(64) NOT NULL COMMENT '观测读数，十进制字符串，最多三位小数，比较按数值（可编辑字段）',
     note VARCHAR(1024) NOT NULL COMMENT '观测备注（可编辑字段）',
+    dx VARCHAR(64) NULL COMMENT '二维位移 X 分量，单位米，十进制字符串，最多三位小数，比较按数值；与 dy/w 组成完整字段组，NULL 表示无位移',
+    dy VARCHAR(64) NULL COMMENT '二维位移 Y 分量，单位米，十进制字符串，最多三位小数，比较按数值；NULL 表示无位移',
+    w VARCHAR(64) NULL COMMENT '边长权重，单位米，正数十进制字符串，最多三位小数；NULL 表示无位移',
     version INT NOT NULL COMMENT '当前版本号，从 1 开始',
     deleted BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已删除：TRUE 表示当前状态为删除墓碑',
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次变更时间（服务器时区）',
@@ -20,6 +23,9 @@ CREATE TABLE IF NOT EXISTS observation_version (
     location VARCHAR(512) NULL COMMENT '该版本观测地点快照；删除墓碑版本为 NULL',
     reading VARCHAR(64) NULL COMMENT '该版本观测读数快照（十进制字符串原文）；删除墓碑版本为 NULL',
     note VARCHAR(1024) NULL COMMENT '该版本观测备注快照；删除墓碑版本为 NULL',
+    dx VARCHAR(64) NULL COMMENT '该版本位移 X 分量快照（米，十进制原文，最多三位小数）；删除墓碑版本为 NULL',
+    dy VARCHAR(64) NULL COMMENT '该版本位移 Y 分量快照（米，十进制原文，最多三位小数）；删除墓碑版本为 NULL',
+    w VARCHAR(64) NULL COMMENT '该版本边长权重快照（米，正数十进制原文，最多三位小数）；删除墓碑版本为 NULL',
     deleted BOOLEAN NOT NULL COMMENT '该版本是否为删除墓碑：TRUE 时业务字段无意义',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '该版本生成时间（服务器时区）',
     PRIMARY KEY (observation_id, version)
@@ -47,6 +53,9 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     candidate_location VARCHAR(512) NOT NULL COMMENT '客户端提交的候选地点完整值',
     candidate_reading VARCHAR(64) NOT NULL COMMENT '客户端提交的候选读数完整值（十进制原文，最多三位小数）',
     candidate_note VARCHAR(1024) NOT NULL COMMENT '客户端提交的候选备注完整值',
+    candidate_dx VARCHAR(64) NULL COMMENT '客户端提交的候选位移 X 分量（米，十进制原文，最多三位小数）；无位移候选为 NULL',
+    candidate_dy VARCHAR(64) NULL COMMENT '客户端提交的候选位移 Y 分量（米，十进制原文，最多三位小数）；无位移候选为 NULL',
+    candidate_w VARCHAR(64) NULL COMMENT '客户端提交的候选边长权重（米，正数十进制原文，最多三位小数）；无位移候选为 NULL',
     conflict_fields VARCHAR(256) NOT NULL COMMENT '服务端重算出的冲突字段名列表（JSON 数组原文，固定顺序 location/reading/note）',
     field_selections VARCHAR(512) NOT NULL COMMENT '各冲突字段的人工选择（JSON 对象原文，值为 CURRENT/CANDIDATE）',
     operator VARCHAR(128) NOT NULL COMMENT '执行冲突解决的操作者标识',
@@ -58,4 +67,33 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 不设置指向 observation_current 的外键：观测记录删除仅置墓碑（当前行保留），
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
+);
+
+-- 闭合导线成果主表：生成成功后原子落库，冻结闭合差与总权重，永不修改。
+CREATE TABLE IF NOT EXISTS traverse_result (
+    traverse_id VARCHAR(64) NOT NULL COMMENT '闭合导线成果唯一标识（服务端生成）',
+    request_id VARCHAR(128) NOT NULL COMMENT '生成该成果的请求标识（requestId），全局唯一，支撑同参重放',
+    operator VARCHAR(128) NOT NULL COMMENT '执行成果生成的操作者标识',
+    leg_count INT NOT NULL COMMENT '导线边数（3 至 10）',
+    closure_dx VARCHAR(64) NOT NULL COMMENT 'X 向闭合差（米，十进制原文，为各边 dx 之和）',
+    closure_dy VARCHAR(64) NOT NULL COMMENT 'Y 向闭合差（米，十进制原文，为各边 dy 之和）',
+    total_weight VARCHAR(64) NOT NULL COMMENT '各边边长权重之和（米，正数十进制原文）',
+    generated_at_utc TIMESTAMP NOT NULL COMMENT '成果生成时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (traverse_id),
+    UNIQUE (request_id)
+);
+
+-- 闭合导线成果边表：按输入顺序冻结每边引用的观测版本、原始位移与修正后位移，永不修改。
+CREATE TABLE IF NOT EXISTS traverse_leg (
+    traverse_id VARCHAR(64) NOT NULL COMMENT '所属成果标识',
+    leg_index INT NOT NULL COMMENT '边序号，从 1 开始，按提交输入顺序',
+    observation_id VARCHAR(64) NOT NULL COMMENT '引用的观测记录标识',
+    observation_version INT NOT NULL COMMENT '生成时核对通过的观测当前版本号（冻结，不随后续变更回改）',
+    dx VARCHAR(64) NOT NULL COMMENT '该边原始位移 X 分量（米，十进制原文，最多三位小数）',
+    dy VARCHAR(64) NOT NULL COMMENT '该边原始位移 Y 分量（米，十进制原文，最多三位小数）',
+    w VARCHAR(64) NOT NULL COMMENT '该边边长权重（米，正数十进制原文，最多三位小数）',
+    adjusted_dx VARCHAR(64) NOT NULL COMMENT '修正后位移 X 分量（米，六位小数十进制原文；末边取前边之和的相反数，全边精确闭合）',
+    adjusted_dy VARCHAR(64) NOT NULL COMMENT '修正后位移 Y 分量（米，六位小数十进制原文；末边取前边之和的相反数，全边精确闭合）',
+    PRIMARY KEY (traverse_id, leg_index)
 );

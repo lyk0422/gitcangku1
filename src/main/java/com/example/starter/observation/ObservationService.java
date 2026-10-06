@@ -43,9 +43,10 @@ public class ObservationService {
     private static final String SEPARATOR = "\u0001";
 
     /**
-     * 三个可编辑字段的固定顺序：冲突重算、选择校验与指纹均以此顺序处理，保证结果稳定。
+     * 可编辑字段的固定顺序：冲突重算、选择校验与指纹均以此顺序处理，保证结果稳定。
+     * displacement 表示位移字段组（dx/dy/w），作为完整字段组参与三方合并，不拆拼来源。
      */
-    private static final List<String> FIELDS = List.of("location", "reading", "note");
+    private static final List<String> FIELDS = List.of("location", "reading", "note", "displacement");
 
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
@@ -70,8 +71,9 @@ public class ObservationService {
      */
     @Transactional
     public WriteOutcome create(CreateObservationRequest request) {
+        validateDisplacement(request.dx(), request.dy(), request.w());
         String fingerprint = fingerprint("CREATE", request.observationId(), request.location(),
-                request.reading(), request.note());
+                request.reading(), request.note(), request.dx(), request.dy(), request.w());
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -85,7 +87,8 @@ public class ObservationService {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
         ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
-                request.location(), request.reading(), request.note(), false);
+                request.location(), request.reading(), request.note(),
+                request.dx(), request.dy(), request.w(), false);
         try {
             observationRepository.insertCurrent(snapshot);
         } catch (DuplicateKeyException e) {
@@ -101,8 +104,10 @@ public class ObservationService {
      */
     @Transactional
     public WriteOutcome merge(String observationId, MergeObservationRequest request) {
+        validateDisplacement(request.dx(), request.dy(), request.w());
         String fingerprint = fingerprint("MERGE", observationId, String.valueOf(request.baseVersion()),
-                request.location(), request.reading(), request.note());
+                request.location(), request.reading(), request.note(),
+                request.dx(), request.dy(), request.w());
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -127,18 +132,22 @@ public class ObservationService {
         String mergedReading = mergeReadingField(base.reading(), current.reading(),
                 request.reading(), conflictFields);
         String mergedNote = mergeField("note", base.note(), current.note(), request.note(), conflictFields);
+        String[] mergedDisplacement = mergeDisplacement(base, current,
+                request.dx(), request.dy(), request.w(), conflictFields);
         if (!conflictFields.isEmpty()) {
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, mergedReading, mergedNote,
+                mergedDisplacement[0], mergedDisplacement[1], mergedDisplacement[2], false);
         if (sameContent(merged, current)) {
             // 合并结果与当前完全相同：返回当前版本，不加版本
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
         ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
-                mergedLocation, mergedReading, mergedNote, false);
+                mergedLocation, mergedReading, mergedNote,
+                mergedDisplacement[0], mergedDisplacement[1], mergedDisplacement[2], false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
@@ -168,7 +177,7 @@ public class ObservationService {
             throw ApiException.conflict("expectedVersion mismatch", current.version());
         }
         ObservationSnapshot tombstone = new ObservationSnapshot(observationId, current.version() + 1,
-                null, null, null, true);
+                null, null, null, null, null, null, true);
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
@@ -190,11 +199,13 @@ public class ObservationService {
      */
     @Transactional
     public ResolveOutcome resolveConflict(String observationId, ResolveConflictRequest request) {
+        validateDisplacement(request.dx(), request.dy(), request.w());
         Map<String, FieldSelection> selections = parseSelections(request.selections());
         String normalizedSelections = writeSelectionsJson(selections);
         String fingerprint = fingerprint("RESOLVE", observationId, request.resolutionId(),
                 String.valueOf(request.baseVersion()), String.valueOf(request.expectedCurrentVersion()),
-                request.location(), request.reading(), request.note(), normalizedSelections, request.operator());
+                request.location(), request.reading(), request.note(),
+                request.dx(), request.dy(), request.w(), normalizedSelections, request.operator());
         ResolveOutcome replayed = checkResolveReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -243,6 +254,11 @@ public class ObservationService {
         if (noteConflict) {
             conflictFields.add("note");
         }
+        boolean displacementConflict = displacementConflicts(base, current,
+                request.dx(), request.dy(), request.w());
+        if (displacementConflict) {
+            conflictFields.add("displacement");
+        }
         validateSelectionCoverage(selections.keySet(), conflictFields);
 
         String resolvedLocation = resolveFieldValue(locationConflict, selections.get("location"),
@@ -251,14 +267,18 @@ public class ObservationService {
                 base.reading(), current.reading(), request.reading(), true);
         String resolvedNote = resolveFieldValue(noteConflict, selections.get("note"),
                 base.note(), current.note(), request.note(), false);
+        String[] resolvedDisplacement = resolveDisplacement(displacementConflict,
+                selections.get("displacement"), base, current, request.dx(), request.dy(), request.w());
 
         ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                resolvedLocation, resolvedReading, resolvedNote, false);
+                resolvedLocation, resolvedReading, resolvedNote,
+                resolvedDisplacement[0], resolvedDisplacement[1], resolvedDisplacement[2], false);
         boolean contentChanged = !sameContent(merged, current);
         int newVersion = contentChanged ? current.version() + 1 : current.version();
         if (contentChanged) {
             ObservationSnapshot next = new ObservationSnapshot(observationId, newVersion,
-                    resolvedLocation, resolvedReading, resolvedNote, false);
+                    resolvedLocation, resolvedReading, resolvedNote,
+                    resolvedDisplacement[0], resolvedDisplacement[1], resolvedDisplacement[2], false);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
         }
@@ -267,6 +287,7 @@ public class ObservationService {
                 request.resolutionId(), observationId, request.requestId(),
                 request.baseVersion(), current.version(), newVersion,
                 request.location(), request.reading(), request.note(),
+                request.dx(), request.dy(), request.w(),
                 List.copyOf(conflictFields), normalizedSelections, request.operator(),
                 Instant.now(clock), contentChanged);
         try {
@@ -285,7 +306,8 @@ public class ObservationService {
         }
 
         ObservationSnapshot pointed = contentChanged
-                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
+                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote,
+                        resolvedDisplacement[0], resolvedDisplacement[1], resolvedDisplacement[2], false)
                 : current;
         return completeResolve(request.requestId(), HttpStatus.OK,
                 ResolutionResponse.of(record, pointed, objectMapper));
@@ -362,12 +384,14 @@ public class ObservationService {
     }
 
     /**
-     * 判断合并结果与当前版本内容是否完全相同（读数按数值，其余按原文）。
+     * 判断合并结果与当前版本内容是否完全相同（读数与位移按数值，其余按原文）。
      */
     private boolean sameContent(ObservationSnapshot merged, ObservationSnapshot current) {
         return Objects.equals(merged.location(), current.location())
                 && Objects.equals(merged.note(), current.note())
-                && readingEquals(merged.reading(), current.reading());
+                && readingEquals(merged.reading(), current.reading())
+                && displacementEquals(merged.dx(), merged.dy(), merged.w(),
+                        current.dx(), current.dy(), current.w());
     }
 
     private boolean readingEquals(String left, String right) {
@@ -375,6 +399,82 @@ public class ObservationService {
             return Objects.equals(left, right);
         }
         return new BigDecimal(left).compareTo(new BigDecimal(right)) == 0;
+    }
+
+    /**
+     * 校验位移字段组：dx/dy/w 必须同时提供或同时缺省；提供时 w 必须为正长度。
+     */
+    private void validateDisplacement(String dx, String dy, String w) {
+        int provided = (dx != null ? 1 : 0) + (dy != null ? 1 : 0) + (w != null ? 1 : 0);
+        if (provided == 0) {
+            return;
+        }
+        if (provided < 3) {
+            throw ApiException.badRequest(
+                    "dx, dy and w must be provided together as a complete displacement group");
+        }
+        if (new BigDecimal(w).signum() <= 0) {
+            throw ApiException.badRequest("w must be a positive length in meters");
+        }
+    }
+
+    /**
+     * 位移字段组数值相等判定：dx/dy/w 三个分量全部按数值相等（null 安全）才视为同组。
+     */
+    private boolean displacementEquals(String dx1, String dy1, String w1, String dx2, String dy2, String w2) {
+        return readingEquals(dx1, dx2) && readingEquals(dy1, dy2) && readingEquals(w1, w2);
+    }
+
+    /**
+     * 位移字段组三方合并：候选组未改保留当前组；当前组未改或两组相同接受候选组；否则整组记录冲突。
+     * 返回值为合并后整组 [dx, dy, w]，来源单一，不拆拼。
+     */
+    private String[] mergeDisplacement(ObservationSnapshot base, ObservationSnapshot current,
+                                       String candidateDx, String candidateDy, String candidateW,
+                                       List<String> conflictFields) {
+        if (displacementEquals(candidateDx, candidateDy, candidateW, base.dx(), base.dy(), base.w())) {
+            return new String[]{current.dx(), current.dy(), current.w()};
+        }
+        if (displacementEquals(current.dx(), current.dy(), current.w(), base.dx(), base.dy(), base.w())
+                || displacementEquals(candidateDx, candidateDy, candidateW,
+                        current.dx(), current.dy(), current.w())) {
+            return new String[]{candidateDx, candidateDy, candidateW};
+        }
+        conflictFields.add("displacement");
+        return new String[]{current.dx(), current.dy(), current.w()};
+    }
+
+    /**
+     * 位移字段组冲突重算：与单字段三方规则一致，候选组未改或任一侧未改或两组相同均不冲突。
+     */
+    private boolean displacementConflicts(ObservationSnapshot base, ObservationSnapshot current,
+                                          String candidateDx, String candidateDy, String candidateW) {
+        if (displacementEquals(candidateDx, candidateDy, candidateW, base.dx(), base.dy(), base.w())) {
+            return false;
+        }
+        if (displacementEquals(current.dx(), current.dy(), current.w(), base.dx(), base.dy(), base.w())
+                || displacementEquals(candidateDx, candidateDy, candidateW,
+                        current.dx(), current.dy(), current.w())) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * 计算位移字段组解决结果：冲突时按人工选择整组取当前或候选；非冲突时按原三方规则整组自动合并。
+     */
+    private String[] resolveDisplacement(boolean conflict, FieldSelection selection,
+                                         ObservationSnapshot base, ObservationSnapshot current,
+                                         String candidateDx, String candidateDy, String candidateW) {
+        if (conflict) {
+            return selection == FieldSelection.CANDIDATE
+                    ? new String[]{candidateDx, candidateDy, candidateW}
+                    : new String[]{current.dx(), current.dy(), current.w()};
+        }
+        if (displacementEquals(candidateDx, candidateDy, candidateW, base.dx(), base.dy(), base.w())) {
+            return new String[]{current.dx(), current.dy(), current.w()};
+        }
+        return new String[]{candidateDx, candidateDy, candidateW};
     }
 
     /**
@@ -458,7 +558,8 @@ public class ObservationService {
         for (Map.Entry<String, String> entry : raw.entrySet()) {
             String field = entry.getKey() == null ? null : entry.getKey().trim();
             if (field == null || !FIELDS.contains(field)) {
-                throw ApiException.badRequest("selection key must be one of location/reading/note: " + field);
+                throw ApiException.badRequest(
+                        "selection key must be one of location/reading/note/displacement: " + field);
             }
             FieldSelection selection = FieldSelection.fromValue(entry.getValue());
             if (selection == null) {
@@ -609,6 +710,9 @@ public class ObservationService {
                 && Objects.equals(record.candidateLocation(), request.location())
                 && Objects.equals(record.candidateReading(), request.reading())
                 && Objects.equals(record.candidateNote(), request.note())
+                && Objects.equals(record.candidateDx(), request.dx())
+                && Objects.equals(record.candidateDy(), request.dy())
+                && Objects.equals(record.candidateW(), request.w())
                 && Objects.equals(record.fieldSelections(), normalizedSelections)
                 && Objects.equals(record.operator(), request.operator());
     }
