@@ -180,6 +180,54 @@ class EquipmentConcurrencyTests {
         }
     }
 
+    /** 并发同 requestId 原始读数（量程设备）：全部重放首次成功结果，归一值只落库一次。 */
+    @Test
+    void concurrentRawReading_sameRequestId_singleEffect() throws Exception {
+        register("eq-craw", 10000);
+        mockMvc.perform(post("/api/equipment/eq-craw/meter-range")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"requestId":"craw-mr","expectedVersion":1,"meterRangeMinutes":1000}
+                                """))
+                .andExpect(status().isCreated());
+
+        int threads = 8;
+        CountDownLatch gate = new CountDownLatch(1);
+        String body = """
+                {"requestId":"craw-1","operator":"tester","expectedVersion":2,"readingId":"r1",
+                 "sampledAt":"2026-01-01T10:00:00Z","raw":5,"wrapCount":1}
+                """;
+        List<Future<MvcResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            futures.add(executor.submit(() -> {
+                gate.await(5, TimeUnit.SECONDS);
+                return postJson("/api/equipment/eq-craw/readings", body);
+            }));
+        }
+        gate.countDown();
+
+        Set<String> bodies = new HashSet<>();
+        for (Future<MvcResult> future : futures) {
+            MvcResult result = future.get(15, TimeUnit.SECONDS);
+            assertEquals(201, result.getResponse().getStatus(),
+                    "并发同键同参应全部重放成功结果");
+            bodies.add(result.getResponse().getContentAsString());
+        }
+        assertEquals(1, bodies.size(), "所有并发响应应完全相同（重放同一成功结果）");
+
+        // 业务效果只发生一次：一条读数、归一值 1005、版本仅前进一次
+        mockMvc.perform(get("/api/equipment/eq-craw/readings"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(1))
+                .andExpect(jsonPath("$[0].cumulativeMinutes").value(1005))
+                .andExpect(jsonPath("$[0].wrapCount").value(1));
+        mockMvc.perform(get("/api/equipment/eq-craw/status"))
+                .andExpect(jsonPath("$.version").value(3));
+        Integer idemCount = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM idempotency_request WHERE request_id = 'craw-1'", Integer.class);
+        assertEquals(1, idemCount, "同一 requestId 只应占一个幂等键");
+    }
+
     /** 并发不同 requestId 新增不同读数：串行化后均按版本推进，无丢失更新。 */
     @Test
     void concurrentDistinctWrites_noLostUpdate() throws Exception {

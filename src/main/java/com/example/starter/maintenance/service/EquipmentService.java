@@ -15,6 +15,7 @@ import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
+import com.example.starter.maintenance.api.dto.SetMeterRangeRequest;
 import com.example.starter.maintenance.api.dto.StatusResponse;
 
 /**
@@ -26,16 +27,22 @@ public class EquipmentService {
 
     private final EquipmentTxService txService;
     private final IdempotencyService idempotency;
+    private final RequestFingerprint fingerprints;
 
-    public EquipmentService(EquipmentTxService txService, IdempotencyService idempotency) {
+    public EquipmentService(EquipmentTxService txService, IdempotencyService idempotency,
+                            RequestFingerprint fingerprints) {
         this.txService = txService;
         this.idempotency = idempotency;
+        this.fingerprints = fingerprints;
     }
 
     public EquipmentResponse register(RegisterEquipmentRequest req) {
-        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes();
-        return recoverDuplicateKey(req.requestId(), "REGISTER_EQUIPMENT", fingerprint,
+        return recoverDuplicateKey(req.requestId(), "REGISTER_EQUIPMENT", fingerprints.register(req),
                 EquipmentResponse.class, () -> txService.register(req));
+    }
+
+    public EquipmentResponse setMeterRange(String equipmentId, SetMeterRangeRequest req) {
+        return txService.setMeterRange(equipmentId, req);
     }
 
     public ReadingResponse addReading(String equipmentId, AddReadingRequest req) {

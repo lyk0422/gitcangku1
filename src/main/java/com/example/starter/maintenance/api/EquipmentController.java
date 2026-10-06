@@ -21,6 +21,7 @@ import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
+import com.example.starter.maintenance.api.dto.SetMeterRangeRequest;
 import com.example.starter.maintenance.api.dto.StatusResponse;
 import com.example.starter.maintenance.service.EquipmentService;
 
@@ -42,6 +43,14 @@ public class EquipmentController {
     @ResponseStatus(HttpStatus.CREATED)
     public EquipmentResponse register(@Valid @RequestBody RegisterEquipmentRequest req) {
         return service.register(req);
+    }
+
+    /** 登记量程：仅可在设备尚无读数时登记不可变正整数量程 M；已登记返回 409，已有读数返回 422。 */
+    @PostMapping("/{equipmentId}/meter-range")
+    @ResponseStatus(HttpStatus.CREATED)
+    public EquipmentResponse setMeterRange(@PathVariable String equipmentId,
+                                           @Valid @RequestBody SetMeterRangeRequest req) {
+        return service.setMeterRange(equipmentId, req);
     }
 
     /** 新增工时读数（允许补录历史）；按采样时刻排序后累计分钟须单调不减，否则 422。 */
