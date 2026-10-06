@@ -47,6 +47,9 @@ public class TranslationService {
         if (distinct != segments.size()) {
             throw ApiException.unprocessable("初始段落 segmentId 重复");
         }
+        for (ApiDtos.SegmentInput segment : segments) {
+            requireValidBidi(segment.sourceText());
+        }
         long documentId = repository.insertDocument(languages);
         for (ApiDtos.SegmentInput segment : segments) {
             repository.insertSegment(documentId, segment.segmentId(), segment.sourceText());
@@ -57,6 +60,7 @@ public class TranslationService {
     /** 增加段落：segmentId 文档内唯一，草稿版本加一。 */
     @Transactional
     public ApiDtos.SegmentResponse addSegment(long documentId, ApiDtos.AddSegmentRequest request) {
+        requireValidBidi(request.sourceText());
         DocumentRow document = lockDocument(documentId);
         if (repository.findSegment(documentId, request.segmentId()).isPresent()) {
             throw ApiException.conflict("段落已存在: " + request.segmentId());
@@ -70,6 +74,7 @@ public class TranslationService {
     @Transactional
     public ApiDtos.SegmentResponse reviseSource(long documentId, String segmentId,
                                               ApiDtos.ReviseSourceRequest request) {
+        requireValidBidi(request.sourceText());
         DocumentRow document = lockDocument(documentId);
         SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
         int sourceVersion = segment.sourceVersion() + 1;
@@ -81,11 +86,12 @@ public class TranslationService {
     /**
      * 译文提交：所依据源文版本必须等于当前源文版本；绑定当前术语版本，
      * 当前源文命中的术语规则要求译文包含对应必译文本，否则 422 返回全部违规术语且不写译文；
-     * 译文版本递增，草稿版本加一。
+     * 译文版本递增，草稿版本加一。新文本先执行双向隔离符校验，非法 422 且不改变原稿。
      */
     @Transactional
     public ApiDtos.TranslationResponse submitTranslation(long documentId, String segmentId, String language,
                                                          String actorId, ApiDtos.SubmitTranslationRequest request) {
+        requireValidBidi(request.content());
         DocumentRow document = lockDocument(documentId);
         String normalizedLanguage = normalizeLanguage(language);
         if (!document.targetLanguages().contains(normalizedLanguage)) {
@@ -111,7 +117,10 @@ public class TranslationService {
                 translationVersion, segment.sourceVersion(), document.termVersion(), draftVersion);
     }
 
-    /** 译文批准：审核人不得是作者，且必须同时匹配当前源文与译文版本。 */
+    /**
+     * 译文批准：审核人不得是作者，且必须同时匹配当前源文与译文版本。
+     * 批准前复核库存译文的双向隔离符合法性：历史不合法旧稿保留可查，但不能重新批准。
+     */
     @Transactional
     public ApiDtos.ApprovalResponse approveTranslation(long documentId, String segmentId, String language,
                                                        String actorId, ApiDtos.ApproveTranslationRequest request) {
@@ -121,6 +130,7 @@ public class TranslationService {
         TranslationRow translation = repository.findTranslation(documentId, segmentId, normalizedLanguage)
                 .orElseThrow(() -> ApiException.notFound(
                         "译文不存在: " + segmentId + "/" + normalizedLanguage));
+        requireValidBidi(translation.content());
         if (translation.author().equals(actorId)) {
             throw ApiException.unprocessable("审核人不得是该译文作者");
         }
@@ -176,6 +186,7 @@ public class TranslationService {
     /**
      * 发布：校验期望版本（不符 409），再校验全部段落在全部目标语言均有有效批准（缺译或审核失效 422）、
      * 译文绑定当前术语版本（过期 422）且满足当前术语规则（违规 422 并返回全部违规术语），
+     * 并对全部候选稿执行双向隔离符校验（任一非法整次 422）；
      * 全部通过后原子生成完整只读快照（固化术语版本与实际规则集）并递增发布版本；
      * 任何失败回滚，不产生部分快照。
      */
@@ -222,6 +233,7 @@ public class TranslationService {
                     throw ApiException.unprocessable("批准已失效: " + segment.segmentId() + "/" + language
                             + "，源文或译文版本已改变");
                 }
+                requireValidBidi(translation.content());
                 termViolations.addAll(findViolations(
                         segment.sourceText(), language, translation.content(), termRules));
             }
@@ -313,6 +325,17 @@ public class TranslationService {
 
     private static String normalizeLanguage(String language) {
         return language.trim().toLowerCase(Locale.ROOT);
+    }
+
+    /**
+     * 双向隔离符校验：非法时抛 422 并附从 0 起的出错码点索引；
+     * 合法文本（含其他控制符）原样接受，不删除、不修复任何字符。
+     */
+    private static void requireValidBidi(String text) {
+        int errorIndex = BidiIsolateValidator.findErrorIndex(text);
+        if (errorIndex >= 0) {
+            throw ApiException.bidiViolation("文本含非法双向控制符，出错码点索引 " + errorIndex, errorIndex);
+        }
     }
 
     private static List<String> normalizeLanguages(List<String> languages) {

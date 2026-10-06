@@ -1,15 +1,19 @@
 package com.example.starter.translation.service;
 
+import com.example.starter.translation.config.BidiCharacterEscapes;
+import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 
 /**
  * 写操作结果：HTTP 状态码与 JSON 响应体。成功结果会序列化存入 request_log 用于重放。
+ * 序列化对双向控制符使用转义展示，与接口 JSON 输出保持一致，不改变文本内容。
  */
 public record WriteResult(int status, String body) {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final ObjectMapper MAPPER = new ObjectMapper(JsonFactory.builder().build()
+            .setCharacterEscapes(new BidiCharacterEscapes()));
 
     /** 以给定状态码序列化响应体。 */
     public static WriteResult of(int status, Object body) {
