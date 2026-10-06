@@ -68,6 +68,10 @@ public class ReleaseService {
             }
             Measurement measurement = locked.get();
             List<String> reasons = new ArrayList<>();
+            if (measurement.sessionId() != null) {
+                // 会话成员只能随已关闭会话整批放行，防止跳过方向链
+                reasons.add("SESSION_MEMBER");
+            }
             if (measurement.status() == MeasurementStatus.RELEASED) {
                 reasons.add("ALREADY_RELEASED");
             } else if (measurement.status() != MeasurementStatus.PENDING) {

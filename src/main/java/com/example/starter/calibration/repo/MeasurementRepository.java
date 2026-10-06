@@ -12,29 +12,39 @@ import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
+import com.example.starter.calibration.model.Direction;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
 
 /**
  * 测量记录持久化。measurement_key 全局唯一作为幂等键；状态流转由放行事务在行锁内完成。
+ * 迟滞会话成员（session_id 非空）只能随已关闭会话整批放行。
  */
 @Repository
 public class MeasurementRepository {
 
-    private static final RowMapper<Measurement> MAPPER = (rs, rowNum) -> new Measurement(
-            rs.getLong("id"),
-            rs.getString("measurement_key"),
-            rs.getString("instrument_id"),
-            JdbcTimes.fromDb(rs.getObject("measured_at", LocalDateTime.class)),
-            rs.getBigDecimal("raw_reading"),
-            rs.getBigDecimal("lower_limit"),
-            rs.getBigDecimal("upper_limit"),
-            rs.getString("submitted_by"),
-            rs.getLong("certificate_id"),
-            rs.getBigDecimal("computed_value"),
-            rs.getBoolean("passed"),
-            MeasurementStatus.valueOf(rs.getString("status")),
-            JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
+    private static final RowMapper<Measurement> MAPPER = (rs, rowNum) -> {
+        Long sessionId = rs.getObject("session_id") == null ? null : rs.getLong("session_id");
+        Integer sessionSeq = rs.getObject("session_seq") == null ? null : rs.getInt("session_seq");
+        String direction = rs.getString("direction");
+        return new Measurement(
+                rs.getLong("id"),
+                rs.getString("measurement_key"),
+                rs.getString("instrument_id"),
+                JdbcTimes.fromDb(rs.getObject("measured_at", LocalDateTime.class)),
+                rs.getBigDecimal("raw_reading"),
+                rs.getBigDecimal("lower_limit"),
+                rs.getBigDecimal("upper_limit"),
+                rs.getString("submitted_by"),
+                rs.getLong("certificate_id"),
+                rs.getBigDecimal("computed_value"),
+                rs.getBoolean("passed"),
+                MeasurementStatus.valueOf(rs.getString("status")),
+                sessionId,
+                sessionSeq,
+                direction == null ? null : Direction.valueOf(direction),
+                JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
+    };
 
     private final JdbcTemplate jdbc;
 
@@ -51,8 +61,9 @@ public class MeasurementRepository {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO measurement "
                             + "(measurement_key, instrument_id, measured_at, raw_reading, lower_limit, upper_limit, "
-                            + "submitted_by, certificate_id, computed_value, passed, status, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            + "submitted_by, certificate_id, computed_value, passed, status, "
+                            + "session_id, session_seq, direction, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, measurement.measurementKey());
             ps.setString(2, measurement.instrumentId());
@@ -65,7 +76,18 @@ public class MeasurementRepository {
             ps.setBigDecimal(9, measurement.computedValue());
             ps.setBoolean(10, measurement.passed());
             ps.setString(11, measurement.status().name());
-            ps.setObject(12, JdbcTimes.toDb(measurement.createdAt()));
+            if (measurement.sessionId() == null) {
+                ps.setObject(12, null);
+            } else {
+                ps.setLong(12, measurement.sessionId());
+            }
+            if (measurement.sessionSeq() == null) {
+                ps.setObject(13, null);
+            } else {
+                ps.setInt(13, measurement.sessionSeq());
+            }
+            ps.setString(14, measurement.direction() == null ? null : measurement.direction().name());
+            ps.setObject(15, JdbcTimes.toDb(measurement.createdAt()));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -85,6 +107,22 @@ public class MeasurementRepository {
     public Optional<Measurement> findByKeyForUpdate(String key) {
         return jdbc.query("SELECT * FROM measurement WHERE measurement_key = ? FOR UPDATE", MAPPER, key)
                 .stream().findFirst();
+    }
+
+    /**
+     * 按会话 ID 查询全部成员（按会话内序号升序，不加锁）。
+     */
+    public List<Measurement> findBySessionId(long sessionId) {
+        return jdbc.query("SELECT * FROM measurement WHERE session_id = ? ORDER BY session_seq",
+                MAPPER, sessionId);
+    }
+
+    /**
+     * 按会话 ID 查询全部成员并加行锁（须在事务内调用），用于会话整批放行。
+     */
+    public List<Measurement> findBySessionIdForUpdate(long sessionId) {
+        return jdbc.query("SELECT * FROM measurement WHERE session_id = ? ORDER BY session_seq FOR UPDATE",
+                MAPPER, sessionId);
     }
 
     /**

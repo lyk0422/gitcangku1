@@ -31,8 +31,10 @@ class CertificateApiTest {
     void clean() {
         jdbc.update("DELETE FROM release_record");
         jdbc.update("DELETE FROM measurement");
+        jdbc.update("DELETE FROM calibration_session");
         jdbc.update("DELETE FROM calibration_certificate");
         jdbc.update("DELETE FROM instrument_lock");
+        jdbc.update("DELETE FROM idempotency_record");
     }
 
     private String certJson(String instrument, String from, String to, String a, String b) {

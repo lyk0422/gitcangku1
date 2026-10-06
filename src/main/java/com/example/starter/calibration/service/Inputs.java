@@ -27,6 +27,17 @@ final class Inputs {
         return value.trim();
     }
 
+    /**
+     * 非空文本且长度不超过 maxLength（裁剪后计长）。
+     */
+    static String requireText(String value, String field, int maxLength) {
+        String text = requireText(value, field);
+        if (text.length() > maxLength) {
+            throw ApiException.badRequest(field + " 长度不能超过 " + maxLength);
+        }
+        return text;
+    }
+
     static BigDecimal requireDecimal(String value, String field) {
         if (value == null || !DECIMAL.matcher(value.trim()).matches()) {
             throw ApiException.badRequest(field + " 必须为最多 6 位小数的十进制字符串");
