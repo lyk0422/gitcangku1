@@ -1,5 +1,7 @@
 package com.example.starter.api.dto;
 
+import com.example.starter.domain.ObstacleHit;
+
 import java.util.List;
 
 /**
@@ -11,6 +13,7 @@ import java.util.List;
  * @param airspaceVersion 审核时的空域版本
  * @param conclusion      CLEAR / BLOCKED / STALE
  * @param hitZoneIds      BLOCKED 时命中的全部 zoneId（字典序去重），否则为空列表
+ * @param hitObstacles    BLOCKED 时命中的圆形障碍明细（障碍版本、命中线段与两半径），否则为空列表
  * @param pointsSnapshot  审核时不可变的航点快照
  * @param current         仅当前查询返回：当前航线/空域是否仍与审核版本匹配
  */
@@ -21,6 +24,7 @@ public record ReviewResultDto(
         Long airspaceVersion,
         String conclusion,
         List<String> hitZoneIds,
+        List<ObstacleHit> hitObstacles,
         List<RoutePointDto> pointsSnapshot,
         Boolean current) {
 }

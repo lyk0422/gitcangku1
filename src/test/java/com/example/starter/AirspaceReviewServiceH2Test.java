@@ -66,6 +66,7 @@ class AirspaceReviewServiceH2Test {
         jdbc.update("DELETE FROM route_point");
         jdbc.update("DELETE FROM route");
         jdbc.update("DELETE FROM no_fly_zone");
+        jdbc.update("DELETE FROM obstacle");
         jdbc.update("UPDATE airspace_meta SET global_version = 0 WHERE id = 1");
     }
 

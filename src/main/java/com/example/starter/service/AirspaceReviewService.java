@@ -2,6 +2,10 @@ package com.example.starter.service;
 
 import com.example.starter.api.ApiException;
 import com.example.starter.api.dto.MutationResponse;
+import com.example.starter.api.dto.ObstacleCreateRequest;
+import com.example.starter.api.dto.ObstacleResult;
+import com.example.starter.api.dto.ObstacleReviseRequest;
+import com.example.starter.api.dto.ObstacleRevokeRequest;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
 import com.example.starter.api.dto.RouteCreateRequest;
@@ -12,11 +16,15 @@ import com.example.starter.api.dto.ZoneCreateRequest;
 import com.example.starter.api.dto.ZoneResult;
 import com.example.starter.api.dto.ZoneRevokeRequest;
 import com.example.starter.domain.Geometry;
+import com.example.starter.domain.ObstacleHit;
+import com.example.starter.domain.ObstacleStatus;
 import com.example.starter.domain.Point;
 import com.example.starter.domain.ReviewConclusion;
 import com.example.starter.domain.ZoneStatus;
 import com.example.starter.repo.AirspaceRepository;
 import com.example.starter.repo.DedupPo;
+import com.example.starter.repo.ObstaclePo;
+import com.example.starter.repo.ObstacleRepository;
 import com.example.starter.repo.ReviewPo;
 import com.example.starter.repo.ReviewRepository;
 import com.example.starter.repo.RoutePo;
@@ -64,10 +72,17 @@ public class AirspaceReviewService {
     static final String KIND_ROUTE_CREATE = "ROUTE_CREATE";
     static final String KIND_ROUTE_REPLACE = "ROUTE_REPLACE";
     static final String KIND_REVIEW = "REVIEW";
+    static final String KIND_OBSTACLE_CREATE = "OBSTACLE_CREATE";
+    static final String KIND_OBSTACLE_REVISE = "OBSTACLE_REVISE";
+    static final String KIND_OBSTACLE_REVOKE = "OBSTACLE_REVOKE";
+
+    /** 包络/障碍半径上限（米）：坐标范围 ±100000，该上限足以覆盖全部有效几何。 */
+    static final int MAX_RADIUS = 1_000_000;
 
     private final AirspaceRepository airspaceRepo;
     private final RouteRepository routeRepo;
     private final ReviewRepository reviewRepo;
+    private final ObstacleRepository obstacleRepo;
     private final ObjectMapper objectMapper;
     private final Clock clock;
     private final TransactionTemplate txTemplate;
@@ -75,12 +90,14 @@ public class AirspaceReviewService {
     public AirspaceReviewService(AirspaceRepository airspaceRepo,
                                  RouteRepository routeRepo,
                                  ReviewRepository reviewRepo,
+                                 ObstacleRepository obstacleRepo,
                                  ObjectMapper objectMapper,
                                  Clock clock,
                                  PlatformTransactionManager transactionManager) {
         this.airspaceRepo = airspaceRepo;
         this.routeRepo = routeRepo;
         this.reviewRepo = reviewRepo;
+        this.obstacleRepo = obstacleRepo;
         this.objectMapper = objectMapper;
         this.clock = clock;
         this.txTemplate = new TransactionTemplate(transactionManager);
@@ -128,26 +145,28 @@ public class AirspaceReviewService {
 
     // ============================ 航线 ============================
 
-    /** 创建航线（初始版本 1）。 */
+    /** 创建航线（初始版本 1）；envelopeRadius 为 null 表示旧无包络航线，按 0 处理。 */
     public MutationResponse createRoute(RouteCreateRequest request) {
         return withIdempotency(request.requestId(), KIND_ROUTE_CREATE, canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
+            int envelopeRadius = normalizeEnvelopeRadius(request.envelopeRadius());
             if (routeRepo.findRoute(request.routeId()) != null) {
                 throw new ApiException(HttpStatus.CONFLICT, "ROUTE_ALREADY_EXISTS",
                         "航线已存在: " + request.routeId());
             }
-            routeRepo.insertRoute(request.routeId(), points);
+            routeRepo.insertRoute(request.routeId(), envelopeRadius, points);
             return new MutationResponse(request.requestId(), false,
-                    new RouteResult(request.routeId(), 1));
+                    new RouteResult(request.routeId(), 1, envelopeRadius));
         });
     }
 
-    /** 替换航线点列，expectedVersion 不匹配返回 409；成功版本加一。 */
+    /** 替换航线点列与包络半径，expectedVersion 不匹配返回 409；成功版本加一。 */
     public MutationResponse replaceRoute(RouteReplaceRequest request) {
         return withIdempotency(request.requestId(), KIND_ROUTE_REPLACE, canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
+            int envelopeRadius = normalizeEnvelopeRadius(request.envelopeRadius());
             RoutePo route = routeRepo.findRoute(request.routeId());
             if (route == null) {
                 throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
@@ -160,7 +179,7 @@ public class AirspaceReviewService {
             }
             // 条件更新兜底并发替换：更新 0 行说明版本已被其他事务推进
             int updated = routeRepo.compareAndIncrementVersion(
-                    request.routeId(), request.expectedVersion());
+                    request.routeId(), request.expectedVersion(), envelopeRadius);
             if (updated == 0) {
                 throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
                         "航线版本已变化，请使用最新 expectedVersion 重试");
@@ -168,7 +187,88 @@ public class AirspaceReviewService {
             routeRepo.deletePoints(request.routeId());
             routeRepo.insertPoints(request.routeId(), points);
             return new MutationResponse(request.requestId(), false,
-                    new RouteResult(request.routeId(), request.expectedVersion() + 1));
+                    new RouteResult(request.routeId(), request.expectedVersion() + 1, envelopeRadius));
+        });
+    }
+
+    // ============================ 圆形障碍 ============================
+
+    /** 登记圆形障碍（初始版本 1）；障碍变更与全局空域版本推进同一事务提交。 */
+    public MutationResponse createObstacle(ObstacleCreateRequest request) {
+        return withIdempotency(request.requestId(), KIND_OBSTACLE_CREATE, canonicalHash(request), () -> {
+            validateObstacleGeometry(request.centerX(), request.centerY(), request.radius());
+            if (obstacleRepo.findObstacle(request.obstacleId()) != null) {
+                throw new ApiException(HttpStatus.CONFLICT, "OBSTACLE_ALREADY_EXISTS",
+                        "圆形障碍已存在: " + request.obstacleId());
+            }
+            long globalVersion = airspaceRepo.incrementGlobalVersion();
+            obstacleRepo.insertObstacle(new ObstaclePo(request.obstacleId(), 1,
+                    request.centerX(), request.centerY(), request.radius(),
+                    ObstacleStatus.ACTIVE.name()));
+            return new MutationResponse(request.requestId(), false,
+                    new ObstacleResult(request.obstacleId(), ObstacleStatus.ACTIVE.name(),
+                            1, globalVersion));
+        });
+    }
+
+    /** 修订障碍圆心/半径，expectedVersion 不匹配返回 409；成功版本加一并生成新档案版本。 */
+    public MutationResponse reviseObstacle(ObstacleReviseRequest request) {
+        return withIdempotency(request.requestId(), KIND_OBSTACLE_REVISE, canonicalHash(request), () -> {
+            validateObstacleGeometry(request.centerX(), request.centerY(), request.radius());
+            ObstaclePo obstacle = obstacleRepo.findObstacle(request.obstacleId());
+            if (obstacle == null) {
+                throw new ApiException(HttpStatus.NOT_FOUND, "OBSTACLE_NOT_FOUND",
+                        "圆形障碍不存在: " + request.obstacleId());
+            }
+            if (ObstacleStatus.REVOKED.name().equals(obstacle.status())) {
+                throw new ApiException(HttpStatus.CONFLICT, "OBSTACLE_ALREADY_REVOKED",
+                        "圆形障碍已撤销，不可修订: " + request.obstacleId());
+            }
+            if (obstacle.version() != request.expectedVersion()) {
+                throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                        "障碍版本不匹配：expected=" + request.expectedVersion()
+                                + ", current=" + obstacle.version());
+            }
+            long globalVersion = airspaceRepo.incrementGlobalVersion();
+            // 条件更新兜底并发修订：更新 0 行说明版本已被其他事务推进
+            int updated = obstacleRepo.compareAndRevise(request.obstacleId(),
+                    request.expectedVersion(), request.centerX(), request.centerY(), request.radius());
+            if (updated == 0) {
+                throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                        "障碍版本已变化，请使用最新 expectedVersion 重试");
+            }
+            return new MutationResponse(request.requestId(), false,
+                    new ObstacleResult(request.obstacleId(), ObstacleStatus.ACTIVE.name(),
+                            request.expectedVersion() + 1, globalVersion));
+        });
+    }
+
+    /** 撤销障碍，expectedVersion 不匹配返回 409；成功版本加一，撤销后不再参与审查。 */
+    public MutationResponse revokeObstacle(ObstacleRevokeRequest request) {
+        return withIdempotency(request.requestId(), KIND_OBSTACLE_REVOKE, canonicalHash(request), () -> {
+            ObstaclePo obstacle = obstacleRepo.findObstacle(request.obstacleId());
+            if (obstacle == null) {
+                throw new ApiException(HttpStatus.NOT_FOUND, "OBSTACLE_NOT_FOUND",
+                        "圆形障碍不存在: " + request.obstacleId());
+            }
+            if (ObstacleStatus.REVOKED.name().equals(obstacle.status())) {
+                throw new ApiException(HttpStatus.CONFLICT, "OBSTACLE_ALREADY_REVOKED",
+                        "圆形障碍已撤销: " + request.obstacleId());
+            }
+            if (obstacle.version() != request.expectedVersion()) {
+                throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                        "障碍版本不匹配：expected=" + request.expectedVersion()
+                                + ", current=" + obstacle.version());
+            }
+            long globalVersion = airspaceRepo.incrementGlobalVersion();
+            int updated = obstacleRepo.compareAndRevoke(request.obstacleId(), request.expectedVersion());
+            if (updated == 0) {
+                throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                        "障碍版本已变化，请使用最新 expectedVersion 重试");
+            }
+            return new MutationResponse(request.requestId(), false,
+                    new ObstacleResult(request.obstacleId(), ObstacleStatus.REVOKED.name(),
+                            request.expectedVersion() + 1, globalVersion));
         });
     }
 
@@ -195,7 +295,7 @@ public class AirspaceReviewService {
                         "空域版本不是当前版本：submitted=" + request.airspaceVersion()
                                 + ", current=" + globalVersion);
             }
-            // 持锁状态下读取全部有效禁飞区，与上面的版本号同属一个一致状态
+            // 持锁状态下读取全部有效禁飞区与圆形障碍，与上面的版本号同属一个一致状态
             List<ZonePo> activeZones = airspaceRepo.findActiveZones();
             Set<String> hits = new TreeSet<>();
             for (ZonePo zone : activeZones) {
@@ -204,12 +304,31 @@ public class AirspaceReviewService {
                     hits.add(zone.zoneId());
                 }
             }
-            String conclusion = hits.isEmpty()
+            // 水平包络审查：只使用指定航线版本的已登记坐标与包络半径，
+            // 每条登记线段到圆心最小距离不大于两半径之和（含接触）即命中
+            List<ObstaclePo> activeObstacles = obstacleRepo.findActiveObstacles();
+            List<ObstacleHit> obstacleHits = new ArrayList<>();
+            int envelopeRadius = route.envelopeRadius();
+            List<Point> routePoints = route.points();
+            for (ObstaclePo obstacle : activeObstacles) {
+                long radiusSum = (long) obstacle.radius() + envelopeRadius;
+                for (int i = 0; i + 1 < routePoints.size(); i++) {
+                    Point a = routePoints.get(i);
+                    Point b = routePoints.get(i + 1);
+                    if (Geometry.segmentWithinCircle(a.x(), a.y(), b.x(), b.y(),
+                            obstacle.centerX(), obstacle.centerY(), radiusSum)) {
+                        obstacleHits.add(new ObstacleHit(obstacle.obstacleId(),
+                                obstacle.version(), i, obstacle.radius(), envelopeRadius));
+                    }
+                }
+            }
+            String conclusion = hits.isEmpty() && obstacleHits.isEmpty()
                     ? ReviewConclusion.CLEAR.name()
                     : ReviewConclusion.BLOCKED.name();
             String reviewId = "rv_" + UUID.randomUUID();
             ReviewPo po = new ReviewPo(reviewId, request.routeId(), route.version(), globalVersion,
-                    conclusion, new ArrayList<>(hits), List.copyOf(route.points()),
+                    conclusion, new ArrayList<>(hits), List.copyOf(obstacleHits),
+                    List.copyOf(route.points()),
                     request.requestId(), nowMillis());
             reviewRepo.insertReview(po);
             return new MutationResponse(request.requestId(), false, toDto(po, conclusion, true));
@@ -340,13 +459,39 @@ public class AirspaceReviewService {
                 "航线至少需要两个不同的点");
     }
 
+    /** 包络半径归一化：null 视为旧无包络航线（0）；负值或超上限为非法参数。 */
+    private static int normalizeEnvelopeRadius(Integer envelopeRadius) {
+        if (envelopeRadius == null) {
+            return 0;
+        }
+        if (envelopeRadius < 0 || envelopeRadius > MAX_RADIUS) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_ENVELOPE_RADIUS",
+                    "航线包络半径必须是 0~" + MAX_RADIUS + " 米的非负整数: " + envelopeRadius);
+        }
+        return envelopeRadius;
+    }
+
+    /** 障碍几何校验：圆心为平面米坐标范围内整数，半径为非负整数米。 */
+    private static void validateObstacleGeometry(int centerX, int centerY, int radius) {
+        if (radius < 0 || radius > MAX_RADIUS) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_OBSTACLE_RADIUS",
+                    "障碍半径必须是 0~" + MAX_RADIUS + " 米的非负整数: " + radius);
+        }
+        if (centerX < -100000 || centerX > 100000 || centerY < -100000 || centerY > 100000) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_OBSTACLE_CENTER",
+                    "障碍圆心必须在平面米坐标范围 [-100000,100000] 内: ("
+                            + centerX + "," + centerY + ")");
+        }
+    }
+
     private static ReviewResultDto toDto(ReviewPo po, String conclusion, Boolean current) {
         List<RoutePointDto> snapshot = new ArrayList<>(po.pointsSnapshot().size());
         for (Point p : po.pointsSnapshot()) {
             snapshot.add(new RoutePointDto(p.x(), p.y()));
         }
         return new ReviewResultDto(po.reviewId(), po.routeId(), po.routeVersion(),
-                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()), snapshot, current);
+                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()),
+                List.copyOf(po.hitObstacles()), snapshot, current);
     }
 
     private long nowMillis() {

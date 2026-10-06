@@ -1,6 +1,10 @@
 package com.example.starter.repo;
 
+import com.example.starter.domain.ObstacleHit;
 import com.example.starter.domain.Point;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -11,24 +15,32 @@ import java.util.List;
 
 /**
  * 审核结果与幂等去重数据访问。
- * 点快照以 "x,y;x,y" 文本保存，命中 zoneId 以逗号拼接，均为不可变内容。
+ * 点快照以 "x,y;x,y" 文本保存，命中 zoneId 以逗号拼接，
+ * 命中障碍明细以 JSON 数组保存，均为不可变内容。
  */
 @Repository
 public class ReviewRepository {
 
-    private final JdbcTemplate jdbc;
+    private static final String REVIEW_COLUMNS = "review_id, route_id, route_version, "
+            + "airspace_version, conclusion, hit_zone_ids, hit_obstacles, points_snapshot, "
+            + "request_id, created_at";
 
-    public ReviewRepository(JdbcTemplate jdbc) {
+    private final JdbcTemplate jdbc;
+    private final ObjectMapper objectMapper;
+
+    public ReviewRepository(JdbcTemplate jdbc, ObjectMapper objectMapper) {
         this.jdbc = jdbc;
+        this.objectMapper = objectMapper;
     }
 
-    private static final RowMapper<ReviewPo> REVIEW_MAPPER = (rs, n) -> new ReviewPo(
+    private final RowMapper<ReviewPo> reviewMapper = (rs, n) -> new ReviewPo(
             rs.getString("review_id"),
             rs.getString("route_id"),
             rs.getInt("route_version"),
             rs.getLong("airspace_version"),
             rs.getString("conclusion"),
             decodeZoneIds(rs.getString("hit_zone_ids")),
+            decodeObstacleHits(rs.getString("hit_obstacles")),
             decodePoints(rs.getString("points_snapshot")),
             rs.getString("request_id"),
             rs.getLong("created_at"));
@@ -36,30 +48,27 @@ public class ReviewRepository {
     /** 按 reviewId 查询不可变审核记录，不存在返回 null。 */
     public ReviewPo findReview(String reviewId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE review_id = ?",
-                REVIEW_MAPPER, reviewId).stream().findFirst().orElse(null);
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE review_id = ?",
+                reviewMapper, reviewId).stream().findFirst().orElse(null);
     }
 
     /** 查询某航线最新的一条审核记录（按创建时间、reviewId 倒序），没有返回 null。 */
     public ReviewPo findLatestReview(String routeId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE route_id = ? "
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE route_id = ? "
                         + "ORDER BY created_at DESC, review_id DESC LIMIT 1",
-                REVIEW_MAPPER, routeId).stream().findFirst().orElse(null);
+                reviewMapper, routeId).stream().findFirst().orElse(null);
     }
 
     /** 插入不可变审核结果（调用方负责事务）。 */
     public void insertReview(ReviewPo po) {
         jdbc.update("INSERT INTO review "
                         + "(review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "hit_zone_ids, hit_obstacles, points_snapshot, request_id, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 po.reviewId(), po.routeId(), po.routeVersion(), po.airspaceVersion(),
-                po.conclusion(), encodeZoneIds(po.hitZoneIds()), encodePoints(po.pointsSnapshot()),
+                po.conclusion(), encodeZoneIds(po.hitZoneIds()),
+                encodeObstacleHits(po.hitObstacles()), encodePoints(po.pointsSnapshot()),
                 po.requestId(), po.createdAt());
     }
 
@@ -117,5 +126,27 @@ public class ReviewRepository {
             return new ArrayList<>();
         }
         return new ArrayList<>(Arrays.asList(text.split(",")));
+    }
+
+    /** 命中障碍明细编码为 JSON 数组（结构化存储，无分隔符碰撞）。 */
+    private String encodeObstacleHits(List<ObstacleHit> hits) {
+        try {
+            return objectMapper.writeValueAsString(hits);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("命中障碍明细序列化失败", ex);
+        }
+    }
+
+    /** 命中障碍明细解码；空串按空列表处理。 */
+    private List<ObstacleHit> decodeObstacleHits(String text) {
+        if (text == null || text.isEmpty()) {
+            return new ArrayList<>();
+        }
+        try {
+            return objectMapper.readValue(text, new TypeReference<List<ObstacleHit>>() {
+            });
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("命中障碍明细反序列化失败", ex);
+        }
     }
 }

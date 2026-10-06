@@ -1,10 +1,13 @@
 package com.example.starter.domain;
 
+import java.math.BigInteger;
 import java.util.List;
 
 /**
  * 二维平面几何判定。本题只模拟二维平面，不用于真实飞行。
  * 禁飞区为非退化轴对齐闭矩形，边界接触也算命中。
+ * 圆形障碍按水平包络判定：线段到圆心最小距离不大于两半径之和即命中，
+ * 接触也算命中；全部比较使用精确平方距离，不开根取整。
  */
 public final class Geometry {
 
@@ -99,5 +102,57 @@ public final class Geometry {
     public static boolean inRectangle(long x, long y,
                                       int xMin, int yMin, int xMax, int yMax) {
         return x >= xMin && x <= xMax && y >= yMin && y <= yMax;
+    }
+
+    /**
+     * 判断线段（含端点与内部投影）到圆心的最小距离是否不大于 radiusSum。
+     *
+     * <p>用于水平包络审查：radiusSum 为障碍半径与航线包络半径之和，
+     * 距离不大于该和（含恰好接触）即命中。比较全程使用精确平方距离：
+     * 端点情形用 long 平方距离，内部投影情形用向量叉积比较
+     * cross² ≤ radiusSum² · len²，以 BigInteger 承载避免 long 溢出，
+     * 不对任何开根结果取整。</p>
+     *
+     * @param ax        端点 A 的 X（米）
+     * @param ay        端点 A 的 Y（米）
+     * @param bx        端点 B 的 X（米）
+     * @param by        端点 B 的 Y（米）
+     * @param cx        圆心 X（米）
+     * @param cy        圆心 Y（米）
+     * @param radiusSum 两半径之和（米），非负
+     * @return true 表示线段与半径为 radiusSum 的圆相交或接触
+     */
+    public static boolean segmentWithinCircle(long ax, long ay, long bx, long by,
+                                              long cx, long cy, long radiusSum) {
+        long radius2 = radiusSum * radiusSum;
+        // 1. 任一端点到圆心的平方距离不超过半径平方即命中（含接触）
+        long dax = cx - ax;
+        long day = cy - ay;
+        if (dax * dax + day * day <= radius2) {
+            return true;
+        }
+        long dbx = cx - bx;
+        long dby = cy - by;
+        if (dbx * dbx + dby * dby <= radius2) {
+            return true;
+        }
+        // 2. 圆心在线段上的投影落在线段内部时，还需比较垂距
+        long dx = bx - ax;
+        long dy = by - ay;
+        long len2 = dx * dx + dy * dy;
+        if (len2 == 0L) {
+            // 零长度线段：两个端点（同一点）已在上面判定
+            return false;
+        }
+        long tNum = dax * dx + day * dy;
+        if (tNum <= 0L || tNum >= len2) {
+            // 最近点是端点，已在上面判定
+            return false;
+        }
+        // 内部投影：垂距平方 = cross² / len²，精确比较 cross² <= radiusSum² · len²
+        long cross = dax * dy - day * dx;
+        BigInteger cross2 = BigInteger.valueOf(cross).multiply(BigInteger.valueOf(cross));
+        BigInteger limit = BigInteger.valueOf(radius2).multiply(BigInteger.valueOf(len2));
+        return cross2.compareTo(limit) <= 0;
     }
 }

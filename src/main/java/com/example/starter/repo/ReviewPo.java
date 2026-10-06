@@ -1,5 +1,6 @@
 package com.example.starter.repo;
 
+import com.example.starter.domain.ObstacleHit;
 import com.example.starter.domain.Point;
 
 import java.util.List;
@@ -13,11 +14,12 @@ import java.util.List;
  * @param airspaceVersion 审核时的空域版本
  * @param conclusion      CLEAR / BLOCKED
  * @param hitZoneIds      命中 zoneId（字典序去重）
+ * @param hitObstacles    命中的圆形障碍明细（障碍版本、命中线段与两半径）
  * @param pointsSnapshot  审核时航点不可变快照
  * @param requestId       提交审核的请求标识
  * @param createdAt       创建时间（epoch 毫秒）
  */
 public record ReviewPo(String reviewId, String routeId, int routeVersion, long airspaceVersion,
-                       String conclusion, List<String> hitZoneIds, List<Point> pointsSnapshot,
-                       String requestId, long createdAt) {
+                       String conclusion, List<String> hitZoneIds, List<ObstacleHit> hitObstacles,
+                       List<Point> pointsSnapshot, String requestId, long createdAt) {
 }

@@ -30,9 +30,10 @@ CREATE TABLE IF NOT EXISTS no_fly_zone (
 -- 航线当前状态：routeId 唯一，版本从 1 开始，替换成功加一
 -- touch 仅用于审核事务对该行产生真实更新以加行级写锁，与替换操作互斥
 CREATE TABLE IF NOT EXISTS route (
-    route_id  VARCHAR(64) PRIMARY KEY COMMENT '航线唯一标识',
-    version   INT NOT NULL COMMENT '当前航线版本，初始 1，每次成功替换加一',
-    touch     BIGINT NOT NULL COMMENT '仅用于审核事务加行级写锁的计数器，无业务含义'
+    route_id         VARCHAR(64) PRIMARY KEY COMMENT '航线唯一标识',
+    version          INT NOT NULL COMMENT '当前航线版本，初始 1，每次成功替换加一',
+    envelope_radius  INT NOT NULL DEFAULT 0 COMMENT '当前版本水平包络半径，非负整数米；旧无包络航线视为 0',
+    touch            BIGINT NOT NULL COMMENT '仅用于审核事务加行级写锁的计数器，无业务含义'
 ) COMMENT = '航线当前版本状态';
 
 -- 航线点（当前版本，2~50 个，按 seq 顺序连接）
@@ -44,6 +45,19 @@ CREATE TABLE IF NOT EXISTS route_point (
     PRIMARY KEY (route_id, seq)
 ) COMMENT = '航线当前版本有序航点';
 
+-- 圆形障碍档案：obstacleId 唯一，版本从 1 开始，修订/撤销带 expectedVersion 成功加一；
+-- 只保留当前版本行，旧版本不可改；圆心为平面米坐标，半径非负整数米。
+-- 登记/修订/撤销都会推进全局空域版本，与审查取同一版本视图。
+CREATE TABLE IF NOT EXISTS obstacle (
+    obstacle_id  VARCHAR(64) PRIMARY KEY COMMENT '圆形障碍唯一标识',
+    version      INT NOT NULL COMMENT '障碍档案版本，初始 1，每次成功修订或撤销加一；旧版本不可改',
+    center_x     INT NOT NULL COMMENT '圆心 X 坐标，平面米坐标，范围 [-100000,100000]',
+    center_y     INT NOT NULL COMMENT '圆心 Y 坐标，平面米坐标，范围 [-100000,100000]',
+    radius       INT NOT NULL COMMENT '障碍半径，非负整数米',
+    status       VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 有效参与审查；REVOKED 已撤销不参与审查',
+    touch        BIGINT NOT NULL COMMENT '仅用于行级写锁的计数器，无业务含义'
+) COMMENT = '圆形障碍档案（当前版本状态）';
+
 -- 审核不可变结果
 CREATE TABLE IF NOT EXISTS review (
     review_id         VARCHAR(64) PRIMARY KEY COMMENT '审核记录唯一标识（不可变）',
@@ -52,6 +66,7 @@ CREATE TABLE IF NOT EXISTS review (
     airspace_version  BIGINT NOT NULL COMMENT '审核明确指定的空域版本',
     conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过或 BLOCKED 命中，永不改变',
     hit_zone_ids      CLOB NOT NULL COMMENT '命中的全部 zoneId，字典序去重后逗号拼接；未命中为空串',
+    hit_obstacles     CLOB NOT NULL COMMENT '命中的圆形障碍明细 JSON 数组：障碍标识、障碍版本、命中线段序号、障碍半径与航线包络半径；未命中为空数组',
     points_snapshot   VARCHAR(4000) NOT NULL COMMENT '审核时航点不可变快照，格式 x,y;x,y',
     request_id        VARCHAR(64) NOT NULL COMMENT '提交审核的写操作请求标识',
     created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
@@ -62,7 +77,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
-    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
+    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW/OBSTACLE_CREATE/OBSTACLE_REVISE/OBSTACLE_REVOKE',
     request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'

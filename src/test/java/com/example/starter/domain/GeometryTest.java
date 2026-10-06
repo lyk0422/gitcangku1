@@ -90,4 +90,59 @@ class GeometryTest {
                 new Point(0, 0), new Point(10, 10), new Point(100, 10));
         assertTrue(Geometry.polylineHitsRectangle(laterSegment, X_MIN, Y_MIN, X_MAX, Y_MAX));
     }
+
+    // ============================ 线段-圆水平包络判定 ============================
+
+    private static boolean withinCircle(int ax, int ay, int bx, int by,
+                                        int cx, int cy, long radiusSum) {
+        return Geometry.segmentWithinCircle(ax, ay, bx, by, cx, cy, radiusSum);
+    }
+
+    @Test
+    void interiorProjectionExactlyAtRadiusSumHits() {
+        // 题干合成场景：线段 (0,0)-(10,0)，圆心 (5,3)，半径和 3，垂距恰为 3 → 接触即命中
+        assertTrue(withinCircle(0, 0, 10, 0, 5, 3, 3));
+        // 圆心移到 (5,4)，垂距 4 > 3 → 不命中
+        assertFalse(withinCircle(0, 0, 10, 0, 5, 4, 3));
+    }
+
+    @Test
+    void interiorProjectionBeyondRadiusSumMisses() {
+        // 垂距 3，半径和 2 → 不命中；半径和 4 → 命中
+        assertFalse(withinCircle(0, 0, 10, 0, 5, 3, 2));
+        assertTrue(withinCircle(0, 0, 10, 0, 5, 3, 4));
+        // 圆心在线段下方同样判定
+        assertTrue(withinCircle(0, 0, 10, 0, 5, -3, 3));
+        assertFalse(withinCircle(0, 0, 10, 0, 5, -4, 3));
+    }
+
+    @Test
+    void endpointDistanceCountsIncludingContact() {
+        // 圆心 (-3,0) 到端点 (0,0) 距离恰为 3：接触命中；半径和 2 不命中
+        assertTrue(withinCircle(0, 0, 10, 0, -3, 0, 3));
+        assertFalse(withinCircle(0, 0, 10, 0, -3, 0, 2));
+        // 圆心 coincides 端点：半径和 0 也命中
+        assertTrue(withinCircle(0, 0, 10, 0, 0, 0, 0));
+        // 最近点是端点（投影落在线段外）：(20,1) 到 (10,0) 距离平方 101
+        assertFalse(withinCircle(0, 0, 10, 0, 20, 1, 10));
+        assertTrue(withinCircle(0, 0, 10, 0, 20, 1, 11));
+    }
+
+    @Test
+    void zeroLengthSegmentUsesPointDistance() {
+        // 零长度线段（重复航点）按点到圆心距离判定
+        assertTrue(withinCircle(5, 5, 5, 5, 5, 8, 3));
+        assertFalse(withinCircle(5, 5, 5, 5, 5, 8, 2));
+    }
+
+    @Test
+    void exactSquaredDistanceBoundaryNotRounded() {
+        // 垂距平方 = cross²/len²：线段 (0,0)-(3,0)，圆心 (1,2)，垂距恰为 2
+        // 半径和 2 命中（接触），1 不命中；若先开根取整会误判边界
+        assertTrue(withinCircle(0, 0, 3, 0, 1, 2, 2));
+        assertFalse(withinCircle(0, 0, 3, 0, 1, 2, 1));
+        // 非整数垂距：线段 (0,0)-(10,0)，圆心 (5,1)，垂距 1；半径和 0 不命中
+        assertFalse(withinCircle(0, 0, 10, 0, 5, 1, 0));
+        assertTrue(withinCircle(0, 0, 10, 0, 5, 1, 1));
+    }
 }
