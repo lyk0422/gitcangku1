@@ -60,13 +60,16 @@ public class PlanService {
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
+    private final PowerService powerService;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+                       PowerService powerService,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
+        this.powerService = powerService;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
     }
@@ -161,8 +164,15 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
+                List<Map<String, Object>> powerViolations = powerService.validatePowerBudget(
+                        plan.opDate(), occupancies, List.of(plan.id()));
+                if (!powerViolations.isEmpty()) {
+                    throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "POWER_BUDGET_EXCEEDED",
+                            "存在超限时间片，计划保持草稿", powerViolations);
+                }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                powerService.recordPlanAudit("PUBLISH", plan.opDate(), sectionIdsOf(occupancies));
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
                 return response;
@@ -183,14 +193,17 @@ public class PlanService {
         }
         try {
             return tx.execute(status -> {
+                planRepo.acquirePublishLock();
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.PUBLISHED) {
                     throw conflict("PLAN_STATE_CONFLICT",
                             "仅已发布计划可取消，当前状态: " + plan.status());
                 }
+                List<Occupancy> occupancies = planRepo.findOccupancies(plan.id());
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.CANCELLED, now);
+                powerService.recordPlanAudit("CANCEL", plan.opDate(), sectionIdsOf(occupancies));
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_CANCEL, requestKey, hash, toJson(response), now);
                 return response;
@@ -260,10 +273,20 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "新草稿存在时隙冲突，改签未生效", conflicts);
                 }
+                // 功率集合 = 移除旧计划 + 加入完整新计划；自身旧占用不重复计
+                List<Map<String, Object>> powerViolations = powerService.validatePowerBudget(
+                        newPlan.opDate(), occupancies, List.of(newPlan.id(), oldPlan.id()));
+                if (!powerViolations.isEmpty()) {
+                    throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "POWER_BUDGET_EXCEEDED",
+                            "新草稿存在超限时间片，改签未生效", powerViolations);
+                }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+                List<String> auditSections = new ArrayList<>(sectionIdsOf(occupancies));
+                auditSections.addAll(sectionIdsOf(planRepo.findOccupancies(oldPlan.id())));
+                powerService.recordPlanAudit("RESCHEDULE", newPlan.opDate(), auditSections);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
                 idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
@@ -329,7 +352,7 @@ public class PlanService {
     public List<PublishedSlotView> getPublishedSlots(LocalDate opDate, String sectionId) {
         return planRepo.findPublishedSlots(opDate, List.of(sectionId), List.of(-1L)).stream()
                 .map(s -> new PublishedSlotView(s.scheduleKey(), s.trainNo(), s.sectionId(),
-                        s.startUtc(), s.endUtc()))
+                        s.startUtc(), s.endUtc(), s.powerKw()))
                 .toList();
     }
 
@@ -339,7 +362,8 @@ public class PlanService {
         DayPlan plan = planRepo.findByKey(scheduleKey)
                 .orElseThrow(() -> notFound(scheduleKey));
         List<OccupancyView> views = planRepo.findOccupancies(plan.id()).stream()
-                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
+                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc(),
+                        o.powerKw()))
                 .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
                 plan.status().name(), views);
@@ -349,9 +373,17 @@ public class PlanService {
         List<Occupancy> result = new ArrayList<>(requests.size());
         for (int i = 0; i < requests.size(); i++) {
             OccupancyRequest r = requests.get(i);
-            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.startUtc(), r.endUtc()));
+            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.startUtc(),
+                    r.endUtc(), r.powerKwOrZero()));
         }
         return result;
+    }
+
+    private List<String> sectionIdsOf(List<Occupancy> occupancies) {
+        return occupancies.stream()
+                .map(Occupancy::sectionId)
+                .collect(java.util.stream.Collectors.toCollection(TreeSet::new))
+                .stream().toList();
     }
 
     /**
@@ -507,7 +539,8 @@ public class PlanService {
     private void appendOccupancies(StringBuilder sb, List<OccupancyRequest> occupancies) {
         for (OccupancyRequest o : occupancies) {
             sb.append('\n').append(o.trainNo()).append('|').append(o.sectionId()).append('|')
-                    .append(o.startUtc().toEpochMilli()).append('|').append(o.endUtc().toEpochMilli());
+                    .append(o.startUtc().toEpochMilli()).append('|').append(o.endUtc().toEpochMilli())
+                    .append('|').append(o.powerKwOrZero());
         }
     }
 

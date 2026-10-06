@@ -41,7 +41,8 @@ public class PlanRepository {
             rs.getString("train_no"),
             rs.getString("section_id"),
             Instant.ofEpochMilli(rs.getLong("start_utc")),
-            Instant.ofEpochMilli(rs.getLong("end_utc")));
+            Instant.ofEpochMilli(rs.getLong("end_utc")),
+            rs.getInt("power_kw"));
 
     private static final RowMapper<RescheduleLink> LINK_MAPPER = (rs, n) -> new RescheduleLink(
             rs.getLong("id"),
@@ -115,8 +116,8 @@ public class PlanRepository {
      */
     public void insertOccupancies(long planId, List<Occupancy> occupancies) {
         jdbc.batchUpdate(
-                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, start_utc, end_utc)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, start_utc, end_utc,"
+                        + " power_kw) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 occupancies, occupancies.size(),
                 (ps, o) -> {
                     ps.setLong(1, planId);
@@ -125,6 +126,7 @@ public class PlanRepository {
                     ps.setString(4, o.sectionId());
                     ps.setLong(5, o.startUtc().toEpochMilli());
                     ps.setLong(6, o.endUtc().toEpochMilli());
+                    ps.setInt(7, o.powerKw());
                 });
     }
 
@@ -132,7 +134,7 @@ public class PlanRepository {
      * 查询计划占用，按计划内序号升序。
      */
     public List<Occupancy> findOccupancies(long planId) {
-        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc"
+        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc, power_kw"
                         + " FROM rail_plan_occupancy WHERE plan_id = ? ORDER BY seq",
                 OCCUPANCY_MAPPER, planId);
     }
@@ -164,7 +166,7 @@ public class PlanRepository {
         StringJoiner sectionPlaceholders = new StringJoiner(", ");
         sectionIds.forEach(s -> sectionPlaceholders.add("?"));
         StringBuilder sql = new StringBuilder(
-                "SELECT p.schedule_key, o.train_no, o.section_id, o.start_utc, o.end_utc"
+                "SELECT p.schedule_key, o.train_no, o.section_id, o.start_utc, o.end_utc, o.power_kw"
                         + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
                         + " WHERE p.status = 'PUBLISHED' AND p.op_date = ?");
         List<Object> args = new ArrayList<>();
@@ -183,7 +185,8 @@ public class PlanRepository {
                 rs.getString("train_no"),
                 rs.getString("section_id"),
                 Instant.ofEpochMilli(rs.getLong("start_utc")),
-                Instant.ofEpochMilli(rs.getLong("end_utc"))), args.toArray());
+                Instant.ofEpochMilli(rs.getLong("end_utc")),
+                rs.getInt("power_kw")), args.toArray());
     }
 
     /**
@@ -218,5 +221,32 @@ public class PlanRepository {
      */
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
+    }
+
+    /**
+     * 指定区段当前是否存在已发布计划的生效占用（绑定前须先取消旧占用）。
+     */
+    public boolean hasPublishedOccupancies(String sectionId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND o.section_id = ?",
+                Integer.class, sectionId);
+        return count != null && count > 0;
+    }
+
+    /**
+     * 指定区段集合上当前已发布计划涉及的运营日集合（升序去重），用于绑定/调参裁决快照。
+     */
+    public List<LocalDate> findPublishedOpDates(Collection<String> sectionIds) {
+        if (sectionIds.isEmpty()) {
+            return List.of();
+        }
+        StringJoiner placeholders = new StringJoiner(", ");
+        sectionIds.forEach(s -> placeholders.add("?"));
+        return jdbc.query("SELECT DISTINCT p.op_date FROM rail_day_plan p"
+                        + " JOIN rail_plan_occupancy o ON o.plan_id = p.id"
+                        + " WHERE p.status = 'PUBLISHED' AND o.section_id IN (" + placeholders + ")"
+                        + " ORDER BY p.op_date",
+                (rs, n) -> rs.getObject("op_date", LocalDate.class), sectionIds.toArray());
     }
 }

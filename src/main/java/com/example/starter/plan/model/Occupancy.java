@@ -12,7 +12,8 @@ import java.time.Instant;
  * @param sectionId 区段 ID
  * @param startUtc  占用开始时刻（含），UTC
  * @param endUtc    占用结束时刻（不含），UTC，必须晚于 startUtc
+ * @param powerKw   列车声明取电功率，非负整数千瓦；未绑定变电所的区段不参与预算校验
  */
 public record Occupancy(long id, long planId, int seq, String trainNo, String sectionId,
-                        Instant startUtc, Instant endUtc) {
+                        Instant startUtc, Instant endUtc, int powerKw) {
 }
