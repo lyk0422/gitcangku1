@@ -46,6 +46,7 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final ContainerMemberRepository containerMemberRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +55,7 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           ContainerMemberRepository containerMemberRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,6 +63,7 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.containerMemberRepository = containerMemberRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -105,6 +108,7 @@ public class EvidenceService {
         }
         requireSealIntact(evidence);
         requireCustodian(evidence, actorId);
+        requireNotBoxed(evidenceKey);
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("证物已存在待接收交接: " + evidenceKey);
         }
@@ -238,6 +242,7 @@ public class EvidenceService {
             throw ApiException.badRequest("借用人不能与当前保管人相同");
         }
         requireCustodian(evidence, actorId);
+        requireNotBoxed(evidenceKey);
         if (evidence.status() == EvidenceStatus.SEAL_BROKEN) {
             throw ApiException.unprocessable("封条已异常，禁止借出: " + evidenceKey);
         }
@@ -365,6 +370,15 @@ public class EvidenceService {
     private void requireCustodian(Evidence evidence, String actorId) {
         if (!evidence.custodianId().equals(actorId)) {
             throw ApiException.conflict("操作人不是当前保管人: " + actorId);
+        }
+    }
+
+    /**
+     * 箱内证物禁止单件交接与借出（须先拆出）；封条核验不受此限。
+     */
+    private void requireNotBoxed(String evidenceKey) {
+        if (containerMemberRepository.findParentKey(MemberType.EVIDENCE, evidenceKey).isPresent()) {
+            throw ApiException.conflict("证物在封存箱内，禁止单件交接或借出，请先拆箱: " + evidenceKey);
         }
     }
 
