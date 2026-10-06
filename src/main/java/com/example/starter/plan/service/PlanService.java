@@ -5,8 +5,10 @@ import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.model.SectionConfig;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
+import com.example.starter.plan.repo.SectionConfigRepository;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
 import com.example.starter.plan.web.dto.OccupancyRequest;
@@ -33,6 +35,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeSet;
+import java.util.stream.Collectors;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -60,13 +63,19 @@ public class PlanService {
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
+    private final SectionConfigRepository configRepo;
+    private final SectionClearanceValidator clearanceValidator;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+                       SectionConfigRepository configRepo,
+                       SectionClearanceValidator clearanceValidator,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
+        this.configRepo = configRepo;
+        this.clearanceValidator = clearanceValidator;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
     }
@@ -111,6 +120,11 @@ public class PlanService {
         }
         try {
             return tx.execute(status -> {
+                // 行锁内重放：并发下同键首个事务提交后，后续事务在此命中首次结果
+                Optional<PlanResponse> inTx = replayIfPresent(OP_UPDATE, req.requestKey(), hash);
+                if (inTx.isPresent()) {
+                    return inTx.get();
+                }
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.DRAFT) {
@@ -135,8 +149,9 @@ public class PlanService {
     }
 
     /**
-     * 发布计划：全局发布锁内原子校验本计划列车重叠与跨计划区段重叠，
-     * 任一冲突则整张计划保持草稿并抛出 422（携带冲突区段与计划）。
+     * 发布计划：全局发布锁内原子校验本计划列车重叠、跨计划区段重叠与单线换向间隔，
+     * 任一冲突则整张计划保持草稿并抛出 422（携带冲突区段与计划）；
+     * 成功时冻结各占用所属区段的当前配置版本。
      */
     public PlanResponse publish(String scheduleKey, String requestKey) {
         String hash = hashAction(OP_PUBLISH, scheduleKey);
@@ -147,6 +162,10 @@ public class PlanService {
         try {
             return tx.execute(status -> {
                 planRepo.acquirePublishLock();
+                Optional<PlanResponse> inTx = replayIfPresent(OP_PUBLISH, requestKey, hash);
+                if (inTx.isPresent()) {
+                    return inTx.get();
+                }
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.DRAFT) {
@@ -154,15 +173,20 @@ public class PlanService {
                             "仅草稿可发布，当前状态: " + plan.status());
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(plan.id());
+                Map<String, SectionConfig> configs = loadConfigs(occupancies);
                 List<Map<String, Object>> conflicts = new ArrayList<>();
                 conflicts.addAll(findTrainOverlaps(scheduleKey, occupancies));
-                conflicts.addAll(findSectionConflicts(plan, occupancies, List.of(plan.id())));
+                conflicts.addAll(findSectionConflicts(plan, unconfigured(occupancies, configs),
+                        List.of(plan.id())));
+                conflicts.addAll(clearanceValidator.validateCandidate(plan, occupancies, configs,
+                        List.of(plan.id())));
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                planRepo.freezeConfigVersions(plan.id(), configVersions(configs));
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
                 return response;
@@ -174,6 +198,7 @@ public class PlanService {
 
     /**
      * 取消已发布计划：时隙立即释放，历史计划与占用保留不改写。
+     * 与发布、改签、配置更新经同一全局发布锁串行裁决。
      */
     public PlanResponse cancel(String scheduleKey, String requestKey) {
         String hash = hashAction(OP_CANCEL, scheduleKey);
@@ -183,6 +208,11 @@ public class PlanService {
         }
         try {
             return tx.execute(status -> {
+                planRepo.acquirePublishLock();
+                Optional<PlanResponse> inTx = replayIfPresent(OP_CANCEL, requestKey, hash);
+                if (inTx.isPresent()) {
+                    return inTx.get();
+                }
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.PUBLISHED) {
@@ -218,6 +248,12 @@ public class PlanService {
         try {
             return tx.execute(status -> {
                 planRepo.acquirePublishLock();
+                Optional<RescheduleResponse> inTx =
+                        replayIfPresent(OP_RESCHEDULE, req.requestKey(), hash,
+                                RescheduleResponse.class);
+                if (inTx.isPresent()) {
+                    return inTx.get();
+                }
                 DayPlan oldPlan = planRepo.findByKeyForUpdate(oldScheduleKey)
                         .orElseThrow(() -> notFound(oldScheduleKey));
                 DayPlan newPlan = planRepo.findByKeyForUpdate(req.newScheduleKey())
@@ -251,10 +287,14 @@ public class PlanService {
                     throw conflict("LINK_CONFLICT", "新计划已存在直接前驱: " + req.newScheduleKey());
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(newPlan.id());
+                Map<String, SectionConfig> configs = loadConfigs(occupancies);
                 List<Map<String, Object>> conflicts = new ArrayList<>();
                 conflicts.addAll(findTrainOverlaps(req.newScheduleKey(), occupancies));
-                // 仅排除旧计划与自身占用，第三方已发布计划照常参与冲突裁决
-                conflicts.addAll(findSectionConflicts(newPlan, occupancies,
+                // 仅排除旧计划与自身占用，第三方已发布计划照常参与冲突裁决；
+                // 移除旧计划后按区段合并排序，验证改签后全部相邻对而非仅新增对
+                conflicts.addAll(findSectionConflicts(newPlan, unconfigured(occupancies, configs),
+                        List.of(newPlan.id(), oldPlan.id())));
+                conflicts.addAll(clearanceValidator.validateCandidate(newPlan, occupancies, configs,
                         List.of(newPlan.id(), oldPlan.id())));
                 if (!conflicts.isEmpty()) {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
@@ -263,6 +303,7 @@ public class PlanService {
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
+                planRepo.freezeConfigVersions(newPlan.id(), configVersions(configs));
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
@@ -329,7 +370,7 @@ public class PlanService {
     public List<PublishedSlotView> getPublishedSlots(LocalDate opDate, String sectionId) {
         return planRepo.findPublishedSlots(opDate, List.of(sectionId), List.of(-1L)).stream()
                 .map(s -> new PublishedSlotView(s.scheduleKey(), s.trainNo(), s.sectionId(),
-                        s.startUtc(), s.endUtc()))
+                        s.startUtc(), s.endUtc(), s.direction()))
                 .toList();
     }
 
@@ -339,7 +380,8 @@ public class PlanService {
         DayPlan plan = planRepo.findByKey(scheduleKey)
                 .orElseThrow(() -> notFound(scheduleKey));
         List<OccupancyView> views = planRepo.findOccupancies(plan.id()).stream()
-                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
+                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc(),
+                        o.direction(), o.appliedConfigVersion()))
                 .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
                 plan.status().name(), views);
@@ -349,9 +391,40 @@ public class PlanService {
         List<Occupancy> result = new ArrayList<>(requests.size());
         for (int i = 0; i < requests.size(); i++) {
             OccupancyRequest r = requests.get(i);
-            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.startUtc(), r.endUtc()));
+            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.startUtc(),
+                    r.endUtc(), r.direction(), null));
         }
         return result;
+    }
+
+    /**
+     * 加载候选占用涉及区段的单线配置，按区段 ID 索引。
+     */
+    private Map<String, SectionConfig> loadConfigs(List<Occupancy> occupancies) {
+        List<String> sectionIds = occupancies.stream()
+                .map(Occupancy::sectionId)
+                .collect(Collectors.toCollection(TreeSet::new))
+                .stream().toList();
+        return configRepo.findBySectionIds(sectionIds).stream()
+                .collect(Collectors.toMap(SectionConfig::sectionId, c -> c));
+    }
+
+    /**
+     * 过滤出无单线配置区段的占用（仍按原互斥规则校验）。
+     */
+    private List<Occupancy> unconfigured(List<Occupancy> occupancies,
+                                         Map<String, SectionConfig> configs) {
+        return occupancies.stream()
+                .filter(o -> !configs.containsKey(o.sectionId()))
+                .toList();
+    }
+
+    /**
+     * 提取区段 → 当前配置版本映射，用于发布成功时冻结到占用。
+     */
+    private Map<String, Integer> configVersions(Map<String, SectionConfig> configs) {
+        return configs.values().stream()
+                .collect(Collectors.toMap(SectionConfig::sectionId, SectionConfig::version));
     }
 
     /**
@@ -416,7 +489,8 @@ public class PlanService {
     }
 
     /**
-     * 与其他已发布计划在同日期、同区段上的重叠检测（左闭右开，相邻合法）。
+     * 与其他已发布计划在同日期、无单线配置区段上的重叠检测（左闭右开，相邻合法）。
+     * 已配置区段由 {@link SectionClearanceValidator} 按合并相邻对统一校验。
      *
      * @param excludePlanIds 检测时排除的计划 id（发布为自身；改签为新旧两个计划）
      */
@@ -507,7 +581,8 @@ public class PlanService {
     private void appendOccupancies(StringBuilder sb, List<OccupancyRequest> occupancies) {
         for (OccupancyRequest o : occupancies) {
             sb.append('\n').append(o.trainNo()).append('|').append(o.sectionId()).append('|')
-                    .append(o.startUtc().toEpochMilli()).append('|').append(o.endUtc().toEpochMilli());
+                    .append(o.startUtc().toEpochMilli()).append('|').append(o.endUtc().toEpochMilli())
+                    .append('|').append(o.direction() == null ? "" : o.direction());
         }
     }
 

@@ -5,6 +5,7 @@ import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.model.SectionSlot;
 import java.sql.Date;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
@@ -13,6 +14,7 @@ import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.StringJoiner;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -41,7 +43,9 @@ public class PlanRepository {
             rs.getString("train_no"),
             rs.getString("section_id"),
             Instant.ofEpochMilli(rs.getLong("start_utc")),
-            Instant.ofEpochMilli(rs.getLong("end_utc")));
+            Instant.ofEpochMilli(rs.getLong("end_utc")),
+            rs.getString("direction"),
+            (Integer) rs.getObject("applied_config_version"));
 
     private static final RowMapper<RescheduleLink> LINK_MAPPER = (rs, n) -> new RescheduleLink(
             rs.getLong("id"),
@@ -115,8 +119,8 @@ public class PlanRepository {
      */
     public void insertOccupancies(long planId, List<Occupancy> occupancies) {
         jdbc.batchUpdate(
-                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, start_utc, end_utc)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, start_utc,"
+                        + " end_utc, direction) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 occupancies, occupancies.size(),
                 (ps, o) -> {
                     ps.setLong(1, planId);
@@ -125,6 +129,7 @@ public class PlanRepository {
                     ps.setString(4, o.sectionId());
                     ps.setLong(5, o.startUtc().toEpochMilli());
                     ps.setLong(6, o.endUtc().toEpochMilli());
+                    ps.setString(7, o.direction());
                 });
     }
 
@@ -132,9 +137,31 @@ public class PlanRepository {
      * 查询计划占用，按计划内序号升序。
      */
     public List<Occupancy> findOccupancies(long planId) {
-        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc"
+        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc,"
+                        + " direction, applied_config_version"
                         + " FROM rail_plan_occupancy WHERE plan_id = ? ORDER BY seq",
                 OCCUPANCY_MAPPER, planId);
+    }
+
+    /**
+     * 发布成功时冻结占用所属区段的当前配置版本；仅更新有配置区段的占用，取消不改写。
+     *
+     * @param sectionVersions 区段 ID → 当前配置版本
+     */
+    public void freezeConfigVersions(long planId, Map<String, Integer> sectionVersions) {
+        if (sectionVersions.isEmpty()) {
+            return;
+        }
+        List<Map.Entry<String, Integer>> entries = List.copyOf(sectionVersions.entrySet());
+        jdbc.batchUpdate(
+                "UPDATE rail_plan_occupancy SET applied_config_version = ?"
+                        + " WHERE plan_id = ? AND section_id = ?",
+                entries, entries.size(),
+                (ps, e) -> {
+                    ps.setInt(1, e.getValue());
+                    ps.setLong(2, planId);
+                    ps.setString(3, e.getKey());
+                });
     }
 
     /**
@@ -164,7 +191,7 @@ public class PlanRepository {
         StringJoiner sectionPlaceholders = new StringJoiner(", ");
         sectionIds.forEach(s -> sectionPlaceholders.add("?"));
         StringBuilder sql = new StringBuilder(
-                "SELECT p.schedule_key, o.train_no, o.section_id, o.start_utc, o.end_utc"
+                "SELECT p.schedule_key, o.train_no, o.section_id, o.start_utc, o.end_utc, o.direction"
                         + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
                         + " WHERE p.status = 'PUBLISHED' AND p.op_date = ?");
         List<Object> args = new ArrayList<>();
@@ -183,7 +210,27 @@ public class PlanRepository {
                 rs.getString("train_no"),
                 rs.getString("section_id"),
                 Instant.ofEpochMilli(rs.getLong("start_utc")),
-                Instant.ofEpochMilli(rs.getLong("end_utc"))), args.toArray());
+                Instant.ofEpochMilli(rs.getLong("end_utc")),
+                rs.getString("direction")), args.toArray());
+    }
+
+    /**
+     * 查询指定区段上全部已发布占用（不限运营日），用于单线配置创建/更新时验证已发布集合。
+     */
+    public List<SectionSlot> findPublishedSlotsBySection(String sectionId) {
+        return jdbc.query(
+                "SELECT p.schedule_key, o.train_no, p.op_date, o.start_utc, o.end_utc, o.direction"
+                        + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND o.section_id = ?"
+                        + " ORDER BY p.op_date, o.start_utc",
+                (rs, n) -> new SectionSlot(
+                        rs.getString("schedule_key"),
+                        rs.getString("train_no"),
+                        rs.getObject("op_date", LocalDate.class),
+                        Instant.ofEpochMilli(rs.getLong("start_utc")),
+                        Instant.ofEpochMilli(rs.getLong("end_utc")),
+                        rs.getString("direction")),
+                sectionId);
     }
 
     /**

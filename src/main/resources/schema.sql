@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS rail_plan_occupancy (
     section_id VARCHAR(64) NOT NULL,
     start_utc BIGINT NOT NULL,
     end_utc BIGINT NOT NULL,
+    direction VARCHAR(32) NULL,
+    applied_config_version INT NULL,
     PRIMARY KEY (id)
 );
 COMMENT ON TABLE rail_plan_occupancy IS '计划区段占用明细，区间左闭右开；取消计划后历史占用保留不删除';
@@ -39,6 +41,30 @@ COMMENT ON COLUMN rail_plan_occupancy.train_no IS '列车编号';
 COMMENT ON COLUMN rail_plan_occupancy.section_id IS '区段 ID';
 COMMENT ON COLUMN rail_plan_occupancy.start_utc IS '占用开始时刻（含），UTC 毫秒';
 COMMENT ON COLUMN rail_plan_occupancy.end_utc IS '占用结束时刻（不含），UTC 毫秒，必须大于 start_utc';
+COMMENT ON COLUMN rail_plan_occupancy.direction IS '行车方向标识，须为所属区段单线配置的正/反方向之一；区段无配置时为空，不参与换向间隔检查';
+COMMENT ON COLUMN rail_plan_occupancy.applied_config_version IS '发布成功时冻结的区段单线配置版本；草稿或区段无配置时为空，取消不改写，历史查询保持原值';
+
+CREATE TABLE IF NOT EXISTS rail_section_config (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    section_id VARCHAR(64) NOT NULL,
+    direction_forward VARCHAR(32) NOT NULL,
+    direction_backward VARCHAR(32) NOT NULL,
+    clearance_seconds INT NOT NULL,
+    version INT NOT NULL,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_rail_section_config_section UNIQUE (section_id)
+);
+COMMENT ON TABLE rail_section_config IS '单线区段换向配置：相邻反向占用须满足清空间隔，同向仅遵守互斥';
+COMMENT ON COLUMN rail_section_config.id IS '主键';
+COMMENT ON COLUMN rail_section_config.section_id IS '区段 ID，全局唯一，一个区段最多一条配置';
+COMMENT ON COLUMN rail_section_config.direction_forward IS '正向行车方向标识，须与反向不同';
+COMMENT ON COLUMN rail_section_config.direction_backward IS '反向行车方向标识，须与正向不同';
+COMMENT ON COLUMN rail_section_config.clearance_seconds IS '换向清空间隔，整秒，范围 1 至 600；相邻反向占用后者开始减前者结束不得小于该值';
+COMMENT ON COLUMN rail_section_config.version IS '配置版本，从 1 起，每次更新加一；发布成功时冻结到占用';
+COMMENT ON COLUMN rail_section_config.created_at IS '创建时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_section_config.updated_at IS '最近变更时刻，UTC 毫秒';
 CREATE INDEX IF NOT EXISTS idx_rail_plan_occupancy_plan ON rail_plan_occupancy (plan_id);
 CREATE INDEX IF NOT EXISTS idx_rail_plan_occupancy_section ON rail_plan_occupancy (section_id, start_utc, end_utc);
 
@@ -54,7 +80,7 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
 );
 COMMENT ON TABLE idempotency_record IS '写操作幂等记录，仅缓存成功结果，失败不缓存可重试';
 COMMENT ON COLUMN idempotency_record.id IS '主键';
-COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE';
+COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE / CONFIG_CREATE / CONFIG_UPDATE';
 COMMENT ON COLUMN idempotency_record.request_key IS '客户端幂等键，同一操作类型内唯一';
 COMMENT ON COLUMN idempotency_record.request_hash IS '请求参数规范化后的 SHA-256，同键不同参判定 409';
 COMMENT ON COLUMN idempotency_record.response_json IS '首次成功响应快照（JSON），重放原样返回';
