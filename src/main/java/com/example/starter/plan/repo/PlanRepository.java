@@ -4,6 +4,7 @@ import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
+import com.example.starter.plan.model.PublishedSpeedSlot;
 import com.example.starter.plan.model.RescheduleLink;
 import java.sql.Date;
 import java.sql.PreparedStatement;
@@ -41,13 +42,21 @@ public class PlanRepository {
             rs.getString("train_no"),
             rs.getString("section_id"),
             Instant.ofEpochMilli(rs.getLong("start_utc")),
-            Instant.ofEpochMilli(rs.getLong("end_utc")));
+            Instant.ofEpochMilli(rs.getLong("end_utc")),
+            rs.getBigDecimal("speed_mps"));
 
     private static final RowMapper<RescheduleLink> LINK_MAPPER = (rs, n) -> new RescheduleLink(
             rs.getLong("id"),
             rs.getLong("predecessor_plan_id"),
             rs.getLong("successor_plan_id"),
             rs.getLong("created_at"));
+
+    private static final RowMapper<PublishedSpeedSlot> SPEED_SLOT_MAPPER = (rs, n) ->
+            new PublishedSpeedSlot(
+                    rs.getString("schedule_key"),
+                    rs.getString("train_no"),
+                    rs.getString("section_id"),
+                    rs.getBigDecimal("speed_mps"));
 
     private final JdbcTemplate jdbc;
 
@@ -115,8 +124,8 @@ public class PlanRepository {
      */
     public void insertOccupancies(long planId, List<Occupancy> occupancies) {
         jdbc.batchUpdate(
-                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, start_utc, end_utc)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO rail_plan_occupancy (plan_id, seq, train_no, section_id, start_utc, end_utc,"
+                        + " speed_mps) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 occupancies, occupancies.size(),
                 (ps, o) -> {
                     ps.setLong(1, planId);
@@ -125,6 +134,7 @@ public class PlanRepository {
                     ps.setString(4, o.sectionId());
                     ps.setLong(5, o.startUtc().toEpochMilli());
                     ps.setLong(6, o.endUtc().toEpochMilli());
+                    ps.setBigDecimal(7, o.speedMps());
                 });
     }
 
@@ -132,7 +142,7 @@ public class PlanRepository {
      * 查询计划占用，按计划内序号升序。
      */
     public List<Occupancy> findOccupancies(long planId) {
-        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc"
+        return jdbc.query("SELECT id, plan_id, seq, train_no, section_id, start_utc, end_utc, speed_mps"
                         + " FROM rail_plan_occupancy WHERE plan_id = ? ORDER BY seq",
                 OCCUPANCY_MAPPER, planId);
     }
@@ -218,5 +228,27 @@ public class PlanRepository {
      */
     public void acquirePublishLock() {
         jdbc.queryForObject("SELECT id FROM publish_lock WHERE id = 1 FOR UPDATE", Integer.class);
+    }
+
+    /**
+     * 查询所有已发布计划中指定列车的带速度占用（档案变更后态校验候选集合）。
+     */
+    public List<PublishedSpeedSlot> findPublishedSpeedSlotsByTrain(String trainNo) {
+        return jdbc.query("SELECT p.schedule_key, o.train_no, o.section_id, o.speed_mps"
+                        + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND o.speed_mps IS NOT NULL"
+                        + " AND o.train_no = ? ORDER BY p.schedule_key, o.seq",
+                SPEED_SLOT_MAPPER, trainNo);
+    }
+
+    /**
+     * 查询所有已发布计划中指定区段的带速度占用（档案变更后态校验候选集合）。
+     */
+    public List<PublishedSpeedSlot> findPublishedSpeedSlotsBySection(String sectionId) {
+        return jdbc.query("SELECT p.schedule_key, o.train_no, o.section_id, o.speed_mps"
+                        + " FROM rail_plan_occupancy o JOIN rail_day_plan p ON p.id = o.plan_id"
+                        + " WHERE p.status = 'PUBLISHED' AND o.speed_mps IS NOT NULL"
+                        + " AND o.section_id = ? ORDER BY p.schedule_key, o.seq",
+                SPEED_SLOT_MAPPER, sectionId);
     }
 }

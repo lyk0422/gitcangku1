@@ -1,14 +1,20 @@
 package com.example.starter.plan.service;
 
 import com.example.starter.plan.model.DayPlan;
+import com.example.starter.plan.model.EnvelopeSnapshot;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.model.SectionProfile;
+import com.example.starter.plan.model.TrainProfile;
+import com.example.starter.plan.repo.EnvelopeSnapshotRepository;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
+import com.example.starter.plan.repo.ProfileRepository;
 import com.example.starter.plan.web.ApiException;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
+import com.example.starter.plan.web.dto.EnvelopeSnapshotView;
 import com.example.starter.plan.web.dto.OccupancyRequest;
 import com.example.starter.plan.web.dto.OccupancyView;
 import com.example.starter.plan.web.dto.PlanResponse;
@@ -60,13 +66,18 @@ public class PlanService {
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
+    private final ProfileRepository profileRepo;
+    private final EnvelopeSnapshotRepository snapshotRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+                       ProfileRepository profileRepo, EnvelopeSnapshotRepository snapshotRepo,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
+        this.profileRepo = profileRepo;
+        this.snapshotRepo = snapshotRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
     }
@@ -161,14 +172,19 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
+                List<EnvelopeSnapshot> snapshots = validateEnvelope(plan, occupancies);
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                snapshotRepo.insertAll(snapshots, now);
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
                 return response;
             });
         } catch (DuplicateKeyException e) {
             return resolveDuplicate(OP_PUBLISH, requestKey, hash);
+        } catch (ApiException e) {
+            // 并发下同键请求在锁后读到已发布状态时，以已提交的幂等记录重放首次结果
+            return replayAfterConflict(OP_PUBLISH, requestKey, hash, e, PlanResponse.class);
         }
     }
 
@@ -197,6 +213,8 @@ public class PlanService {
             });
         } catch (DuplicateKeyException e) {
             return resolveDuplicate(OP_CANCEL, requestKey, hash);
+        } catch (ApiException e) {
+            return replayAfterConflict(OP_CANCEL, requestKey, hash, e, PlanResponse.class);
         }
     }
 
@@ -260,10 +278,12 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "新草稿存在时隙冲突，改签未生效", conflicts);
                 }
+                List<EnvelopeSnapshot> snapshots = validateEnvelope(newPlan, occupancies);
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+                snapshotRepo.insertAll(snapshots, now);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
                 idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
@@ -272,6 +292,9 @@ public class PlanService {
         } catch (DuplicateKeyException e) {
             return replayIfPresent(OP_RESCHEDULE, req.requestKey(), hash, RescheduleResponse.class)
                     .orElseThrow(() -> conflict("LINK_CONFLICT", "改签前后继关联冲突"));
+        } catch (ApiException e) {
+            return replayAfterConflict(OP_RESCHEDULE, req.requestKey(), hash, e,
+                    RescheduleResponse.class);
         }
     }
 
@@ -339,7 +362,8 @@ public class PlanService {
         DayPlan plan = planRepo.findByKey(scheduleKey)
                 .orElseThrow(() -> notFound(scheduleKey));
         List<OccupancyView> views = planRepo.findOccupancies(plan.id()).stream()
-                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc()))
+                .map(o -> new OccupancyView(o.trainNo(), o.sectionId(), o.startUtc(), o.endUtc(),
+                        o.speedMps()))
                 .toList();
         return new PlanResponse(plan.scheduleKey(), plan.opDate(), plan.version(),
                 plan.status().name(), views);
@@ -349,7 +373,8 @@ public class PlanService {
         List<Occupancy> result = new ArrayList<>(requests.size());
         for (int i = 0; i < requests.size(); i++) {
             OccupancyRequest r = requests.get(i);
-            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.startUtc(), r.endUtc()));
+            result.add(new Occupancy(0L, planId, i, r.trainNo(), r.sectionId(), r.startUtc(),
+                    r.endUtc(), r.speed()));
         }
         return result;
     }
@@ -481,6 +506,21 @@ public class PlanService {
                 .orElseThrow(() -> conflict("SCHEDULE_KEY_EXISTS", "scheduleKey 已存在"));
     }
 
+    /**
+     * 并发竞态裁决：本请求因状态/版本冲突失败时，若同键同参请求已在其间提交，
+     * 重放首次成功结果；否则原样抛出。仅对 409 业务冲突生效，其余异常直接抛出。
+     */
+    private <T> T replayAfterConflict(String opType, String requestKey, String hash,
+                                      ApiException failure, Class<T> type) {
+        if (failure.status() == HttpStatus.CONFLICT) {
+            Optional<T> replayed = replayIfPresent(opType, requestKey, hash, type);
+            if (replayed.isPresent()) {
+                return replayed.get();
+            }
+        }
+        throw failure;
+    }
+
     private String hashCreate(CreatePlanRequest req) {
         StringBuilder sb = new StringBuilder(OP_CREATE).append('\n')
                 .append(req.scheduleKey()).append('\n').append(req.opDate());
@@ -553,5 +593,66 @@ public class PlanService {
 
     private ApiException conflict(String code, String message) {
         return new ApiException(HttpStatus.CONFLICT, code, message);
+    }
+
+    /**
+     * 查询计划发布/改签成功时冻结的应急制动包络判定快照；计划不存在返回 404。
+     */
+    public List<EnvelopeSnapshotView> getEnvelopeSnapshots(String scheduleKey) {
+        DayPlan plan = planRepo.findByKey(scheduleKey)
+                .orElseThrow(() -> notFound(scheduleKey));
+        return snapshotRepo.findByPlan(plan.id()).stream()
+                .map(s -> new EnvelopeSnapshotView(scheduleKey, s.occupancySeq(), s.trainNo(),
+                        s.sectionId(), s.speedMps(), s.reactionTimeS(), s.baseDeceleration(),
+                        s.protectionDistanceM(), s.trainProfileVersion(), s.sectionProfileVersion(),
+                        s.lhsScaled(), s.rhsScaled()))
+                .toList();
+    }
+
+    /**
+     * 应急制动包络校验：仅对带速度的新占用逐项判定，原无速度占用（speed 为 null）不适用、直接跳过。
+     * 缺列车或区段档案抛 404；制动距离 v*t + v^2/(2a) 按精确交叉乘积
+     * 2*a*v*t + v^2 &lt;= 2*a*d 判定，任一占用越限抛 422（携带列车及区段），整次发布/改签不写占用。
+     * 全部通过时返回待冻结的判定快照（速度、参数与精确判定依据）。
+     */
+    private List<EnvelopeSnapshot> validateEnvelope(DayPlan plan, List<Occupancy> occupancies) {
+        List<EnvelopeSnapshot> snapshots = new ArrayList<>();
+        List<Map<String, Object>> violations = new ArrayList<>();
+        for (Occupancy o : occupancies) {
+            if (o.speedMps() == null) {
+                continue;
+            }
+            TrainProfile train = profileRepo.findTrain(o.trainNo())
+                    .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                            "TRAIN_PROFILE_NOT_FOUND", "列车档案不存在: " + o.trainNo()));
+            SectionProfile section = profileRepo.findSection(o.sectionId())
+                    .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                            "SECTION_PROFILE_NOT_FOUND", "区段档案不存在: " + o.sectionId()));
+            java.math.BigDecimal lhs = EnvelopeMath.lhs(o.speedMps(), train.reactionTimeS(),
+                    train.baseDeceleration());
+            java.math.BigDecimal rhs = EnvelopeMath.rhs(train.baseDeceleration(),
+                    section.protectionDistanceM());
+            if (lhs.compareTo(rhs) > 0) {
+                Map<String, Object> detail = new LinkedHashMap<>();
+                detail.put("type", "ENVELOPE_EXCEEDED");
+                detail.put("scheduleKey", plan.scheduleKey());
+                detail.put("trainNo", o.trainNo());
+                detail.put("sectionId", o.sectionId());
+                detail.put("speed", o.speedMps().toPlainString());
+                detail.put("lhsScaled", lhs.toPlainString());
+                detail.put("rhsScaled", rhs.toPlainString());
+                violations.add(detail);
+            } else {
+                snapshots.add(new EnvelopeSnapshot(plan.id(), o.seq(), o.trainNo(), o.sectionId(),
+                        o.speedMps(), train.reactionTimeS(), train.baseDeceleration(),
+                        section.protectionDistanceM(), train.version(), section.version(),
+                        lhs, rhs));
+            }
+        }
+        if (!violations.isEmpty()) {
+            throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ENVELOPE_EXCEEDED",
+                    "存在应急制动包络越限占用，计划保持草稿", violations);
+        }
+        return snapshots;
     }
 }

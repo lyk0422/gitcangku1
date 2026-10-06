@@ -2,6 +2,7 @@ package com.example.starter.plan.web;
 
 import com.example.starter.plan.service.PlanService;
 import com.example.starter.plan.web.dto.CreatePlanRequest;
+import com.example.starter.plan.web.dto.EnvelopeSnapshotView;
 import com.example.starter.plan.web.dto.PlanActionRequest;
 import com.example.starter.plan.web.dto.PlanResponse;
 import com.example.starter.plan.web.dto.PublishedSlotView;
@@ -112,5 +113,13 @@ public class PlanController {
             @RequestParam @NotNull @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
             @RequestParam @NotBlank String sectionId) {
         return service.getPublishedSlots(date, sectionId);
+    }
+
+    /**
+     * 查询计划发布/改签成功时冻结的应急制动包络判定快照。
+     */
+    @GetMapping("/plans/{scheduleKey}/envelope-snapshots")
+    public List<EnvelopeSnapshotView> getEnvelopeSnapshots(@PathVariable String scheduleKey) {
+        return service.getEnvelopeSnapshots(scheduleKey);
     }
 }

@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS rail_plan_occupancy (
     section_id VARCHAR(64) NOT NULL,
     start_utc BIGINT NOT NULL,
     end_utc BIGINT NOT NULL,
+    speed_mps DECIMAL(9,3) NULL,
     PRIMARY KEY (id)
 );
 COMMENT ON TABLE rail_plan_occupancy IS '计划区段占用明细，区间左闭右开；取消计划后历史占用保留不删除';
@@ -39,6 +40,7 @@ COMMENT ON COLUMN rail_plan_occupancy.train_no IS '列车编号';
 COMMENT ON COLUMN rail_plan_occupancy.section_id IS '区段 ID';
 COMMENT ON COLUMN rail_plan_occupancy.start_utc IS '占用开始时刻（含），UTC 毫秒';
 COMMENT ON COLUMN rail_plan_occupancy.end_utc IS '占用结束时刻（不含），UTC 毫秒，必须大于 start_utc';
+COMMENT ON COLUMN rail_plan_occupancy.speed_mps IS '占用速度，米每秒，非负、最多3位小数；NULL 表示原无速度占用，不适用应急制动包络判定';
 CREATE INDEX IF NOT EXISTS idx_rail_plan_occupancy_plan ON rail_plan_occupancy (plan_id);
 CREATE INDEX IF NOT EXISTS idx_rail_plan_occupancy_section ON rail_plan_occupancy (section_id, start_utc, end_utc);
 
@@ -74,6 +76,78 @@ COMMENT ON COLUMN rail_plan_reschedule_link.id IS '主键';
 COMMENT ON COLUMN rail_plan_reschedule_link.predecessor_plan_id IS '直接前驱（被改签取消的旧计划）id，关联 rail_day_plan.id，全表唯一';
 COMMENT ON COLUMN rail_plan_reschedule_link.successor_plan_id IS '直接后继（改签发布的新计划）id，关联 rail_day_plan.id，全表唯一';
 COMMENT ON COLUMN rail_plan_reschedule_link.created_at IS '关联创建时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_train_profile (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    train_no VARCHAR(64) NOT NULL,
+    reaction_time_s DECIMAL(9,3) NOT NULL,
+    base_deceleration_mps2 DECIMAL(9,3) NOT NULL,
+    version INT NOT NULL,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_rail_train_profile_train_no UNIQUE (train_no)
+);
+COMMENT ON TABLE rail_train_profile IS '列车应急制动档案：反应时间与基础减速度，版本从 1 递增';
+COMMENT ON COLUMN rail_train_profile.id IS '主键';
+COMMENT ON COLUMN rail_train_profile.train_no IS '列车编号，全局唯一';
+COMMENT ON COLUMN rail_train_profile.reaction_time_s IS '列车反应时间 t，秒，正十进制、最多3位小数';
+COMMENT ON COLUMN rail_train_profile.base_deceleration_mps2 IS '基础减速度 a，米每平方秒，正十进制、最多3位小数';
+COMMENT ON COLUMN rail_train_profile.version IS '档案版本，从 1 开始，每次修改加一';
+COMMENT ON COLUMN rail_train_profile.created_at IS '创建时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_train_profile.updated_at IS '最近变更时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_section_profile (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    section_id VARCHAR(64) NOT NULL,
+    protection_distance_m DECIMAL(12,3) NOT NULL,
+    version INT NOT NULL,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (id),
+    CONSTRAINT uk_rail_section_profile_section_id UNIQUE (section_id)
+);
+COMMENT ON TABLE rail_section_profile IS '区段防护档案：防护距离，版本从 1 递增';
+COMMENT ON COLUMN rail_section_profile.id IS '主键';
+COMMENT ON COLUMN rail_section_profile.section_id IS '区段 ID，全局唯一';
+COMMENT ON COLUMN rail_section_profile.protection_distance_m IS '区段防护距离 d，米，正十进制、最多3位小数';
+COMMENT ON COLUMN rail_section_profile.version IS '档案版本，从 1 开始，每次修改加一';
+COMMENT ON COLUMN rail_section_profile.created_at IS '创建时刻，UTC 毫秒';
+COMMENT ON COLUMN rail_section_profile.updated_at IS '最近变更时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_plan_envelope_snapshot (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    plan_id BIGINT NOT NULL,
+    occupancy_seq INT NOT NULL,
+    train_no VARCHAR(64) NOT NULL,
+    section_id VARCHAR(64) NOT NULL,
+    speed_mps DECIMAL(9,3) NOT NULL,
+    reaction_time_s DECIMAL(9,3) NOT NULL,
+    base_deceleration_mps2 DECIMAL(9,3) NOT NULL,
+    protection_distance_m DECIMAL(12,3) NOT NULL,
+    train_profile_version INT NOT NULL,
+    section_profile_version INT NOT NULL,
+    lhs_scaled DECIMAL(30,9) NOT NULL,
+    rhs_scaled DECIMAL(30,9) NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_plan_envelope_snapshot IS '发布/改签成功时冻结的应急制动包络判定快照，追加后不可变，后续档案修改不改写历史';
+COMMENT ON COLUMN rail_plan_envelope_snapshot.id IS '主键';
+COMMENT ON COLUMN rail_plan_envelope_snapshot.plan_id IS '所属计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_plan_envelope_snapshot.occupancy_seq IS '占用在计划内的序号，关联 rail_plan_occupancy.seq';
+COMMENT ON COLUMN rail_plan_envelope_snapshot.train_no IS '列车编号（冻结值）';
+COMMENT ON COLUMN rail_plan_envelope_snapshot.section_id IS '区段 ID（冻结值）';
+COMMENT ON COLUMN rail_plan_envelope_snapshot.speed_mps IS '占用速度 v，米每秒（冻结值）';
+COMMENT ON COLUMN rail_plan_envelope_snapshot.reaction_time_s IS '列车反应时间 t，秒（冻结值）';
+COMMENT ON COLUMN rail_plan_envelope_snapshot.base_deceleration_mps2 IS '基础减速度 a，米每平方秒（冻结值）';
+COMMENT ON COLUMN rail_plan_envelope_snapshot.protection_distance_m IS '区段防护距离 d，米（冻结值）';
+COMMENT ON COLUMN rail_plan_envelope_snapshot.train_profile_version IS '判定时列车档案版本（冻结值）';
+COMMENT ON COLUMN rail_plan_envelope_snapshot.section_profile_version IS '判定时区段档案版本（冻结值）';
+COMMENT ON COLUMN rail_plan_envelope_snapshot.lhs_scaled IS '精确判定依据左侧：2*a*v*t + v^2，未舍入精确值';
+COMMENT ON COLUMN rail_plan_envelope_snapshot.rhs_scaled IS '精确判定依据右侧：2*a*d，未舍入精确值；lhs <= rhs 判定为不越限';
+COMMENT ON COLUMN rail_plan_envelope_snapshot.created_at IS '快照创建时刻，UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_rail_plan_envelope_snapshot_plan ON rail_plan_envelope_snapshot (plan_id);
 
 CREATE TABLE IF NOT EXISTS publish_lock (
     id INT NOT NULL,
