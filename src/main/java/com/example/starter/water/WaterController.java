@@ -3,14 +3,20 @@ package com.example.starter.water;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CommandRequest;
+import com.example.starter.water.dto.Dtos.CreateSegmentRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.HydraulicAllocationResponse;
+import com.example.starter.water.dto.Dtos.HydraulicDetailResponse;
+import com.example.starter.water.dto.Dtos.SegmentResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
+import com.example.starter.water.dto.Dtos.SubmitHydraulicRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
 import com.example.starter.water.dto.Dtos.TransferResponse;
+import com.example.starter.water.dto.Dtos.UpdateResistanceRequest;
 import com.example.starter.water.dto.Dtos.WindowResponse;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -102,5 +108,36 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 创建渠段（简化水力模型，合成参数）。 */
+    @PostMapping("/segments")
+    public SegmentResponse createSegment(@RequestBody CreateSegmentRequest request,
+                                         @RequestHeader("X-Actor-Id") String actor) {
+        return service.createSegment(request.requestId(), request.segmentKey(), request.resistance(), actor);
+    }
+
+    /** 修改渠段阻力（携带 expectedVersion，越限或版本不一致返回 409）。 */
+    @PostMapping("/segments/{segmentKey}/resistance")
+    public SegmentResponse updateResistance(@PathVariable String segmentKey,
+                                            @RequestBody UpdateResistanceRequest request,
+                                            @RequestHeader("X-Actor-Id") String actor) {
+        return service.updateSegmentResistance(request.requestId(), segmentKey, request.resistance(),
+                request.expectedVersion(), actor);
+    }
+
+    /** 提交水力型配水申请（路径 + 恒定流量 + 整分钟时段 + 可用水头）。 */
+    @PostMapping("/allocations/hydraulic")
+    public HydraulicAllocationResponse submitHydraulic(@RequestBody SubmitHydraulicRequest request,
+                                                       @RequestHeader("X-Actor-Id") String actor) {
+        return service.submitHydraulicAllocation(request.requestId(), request.allocationKey(),
+                request.windowId(), request.userId(), request.path(), request.flowRate(),
+                request.supplyStartUtc(), request.supplyEndUtc(), request.availableHead(), actor);
+    }
+
+    /** 查询水力型申请明细（冻结路径与时片快照）。 */
+    @GetMapping("/allocations/{allocationKey}/hydraulic")
+    public HydraulicDetailResponse getHydraulicDetail(@PathVariable String allocationKey) {
+        return service.getHydraulicDetail(allocationKey);
     }
 }

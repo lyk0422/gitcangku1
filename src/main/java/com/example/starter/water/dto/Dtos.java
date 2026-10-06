@@ -77,4 +77,46 @@ public final class Dtos {
     /** 统一错误响应体。 */
     public record ErrorResponse(String code, String message) {
     }
+
+    /** 创建渠段命令；操作人由 X-Actor-Id 请求头提供，resistance 为正整数。 */
+    public record CreateSegmentRequest(String requestId, String segmentKey, Long resistance) {
+    }
+
+    /** 渠段视图；version 从 1 起，每次成功修改阻力 +1。 */
+    public record SegmentResponse(String segmentKey, long resistance, int version,
+                                  String createdUtc, String updatedUtc) {
+    }
+
+    /** 修改渠段阻力命令；expectedVersion 为期望的当前版本，不一致返回 409。 */
+    public record UpdateResistanceRequest(String requestId, Long resistance, Integer expectedVersion) {
+    }
+
+    /**
+     * 提交水力型配水申请命令；操作人由 X-Actor-Id 请求头提供。
+     * path 为 1 至 5 段有序无重复渠段业务键；flowRate 为恒定正整数流量（立方米/分钟）；
+     * 供水时段为 UTC 整分钟左闭右开区间；availableHead 为正整数可用水头。
+     * 原申请水量 = flowRate × 时段分钟数。
+     */
+    public record SubmitHydraulicRequest(String requestId, String allocationKey, Long windowId, String userId,
+                                         List<String> path, Long flowRate, String supplyStartUtc,
+                                         String supplyEndUtc, Long availableHead) {
+    }
+
+    /** 水力型申请视图；amount 为派生的原申请水量（流量 × 分钟数）。 */
+    public record HydraulicAllocationResponse(String allocationKey, long windowId, String userId, String amount,
+                                              List<String> path, long flowRate, String supplyStartUtc,
+                                              String supplyEndUtc, long availableHead, String requester,
+                                              String status, String createdUtc) {
+    }
+
+    /** 冻结时片视图：某渠段在某时片的同时总流量、核算阻力参数与段损失。 */
+    public record SliceView(String segmentKey, String sliceStartUtc, String sliceEndUtc, long totalFlow,
+                            long resistance, int resistanceVersion, long loss) {
+    }
+
+    /** 水力型申请明细：冻结路径、恒定流量曲线、可用水头与审批冻结的时片快照。 */
+    public record HydraulicDetailResponse(String allocationKey, List<String> path, long flowRate,
+                                          String supplyStartUtc, String supplyEndUtc, long availableHead,
+                                          String status, List<SliceView> slices) {
+    }
 }

@@ -1,14 +1,25 @@
 package com.example.starter.water;
 
+import com.example.starter.water.HydraulicCalculator.HeadExceededException;
+import com.example.starter.water.HydraulicCalculator.Request;
+import com.example.starter.water.HydraulicCalculator.Segment;
+import com.example.starter.water.HydraulicCalculator.SliceFact;
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.PathRow;
+import com.example.starter.water.WaterRepository.SegmentRow;
+import com.example.starter.water.WaterRepository.SliceRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.HydraulicAllocationResponse;
+import com.example.starter.water.dto.Dtos.HydraulicDetailResponse;
+import com.example.starter.water.dto.Dtos.SegmentResponse;
+import com.example.starter.water.dto.Dtos.SliceView;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
 import com.example.starter.water.dto.Dtos.WindowResponse;
@@ -21,6 +32,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
@@ -134,6 +147,17 @@ public class WaterService {
                 throw ApiException.quotaExceeded("批准后将超过当前可用总量 " + fmt(available));
             }
             repository.updateAllocationStatus(allocation.id(), STATUS_APPROVED, nowNanos());
+            if (allocation.flowRate() != null) {
+                // 水力型申请：全局锁内把全部已批曲线按起止切片重算，本单或任一旧单水头不足都整体回滚
+                repository.lockHydraulic();
+                try {
+                    refreshSnapshots(checkHydraulicSet());
+                } catch (HeadExceededException e) {
+                    throw headInsufficient(e);
+                } catch (ArithmeticException e) {
+                    throw ApiException.unprocessable("HYDRAULIC_OVERFLOW", "水力核算超出精确整数范围");
+                }
+            }
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
@@ -159,6 +183,11 @@ public class WaterService {
                 throw ApiException.conflict("ALLOCATION_ALREADY_CANCELLED", "申请已取消，不能重复取消");
             }
             repository.updateAllocationStatus(allocation.id(), STATUS_CANCELLED, nowNanos());
+            if (allocation.flowRate() != null) {
+                // 水力型申请取消：移出最终集合并清理其冻结时片（只减少流量，不会使他人越限）
+                repository.lockHydraulic();
+                repository.deleteSlices(allocation.id());
+            }
             return toAllocationResponse(repository.findAllocationByKey(allocationKey));
         });
     }
@@ -217,6 +246,32 @@ public class WaterService {
                         + " 不足，无法转让 " + fmt(amount));
             }
             long now = nowNanos();
+            boolean sourceHydraulic = lockedSource.flowRate() != null;
+            boolean targetHydraulic = lockedTarget.flowRate() != null;
+            if (sourceHydraulic || targetHydraulic) {
+                repository.lockHydraulic();
+            }
+            if (sourceHydraulic) {
+                // 源为水力型：转让水量必须能按源时段折算为恒定正整数流量，目标继承原路径/时段/水头
+                long minutes = HydraulicCalculator.minutesBetween(lockedSource.supplyStartNanos(),
+                        lockedSource.supplyEndNanos());
+                BigDecimal[] quotient = amount.divideAndRemainder(BigDecimal.valueOf(minutes));
+                if (quotient[1].signum() != 0 || quotient[0].signum() <= 0) {
+                    throw ApiException.unprocessable("FLOW_VOLUME_MISMATCH",
+                            "转让水量 " + fmt(amount) + " 无法按源供水时段 " + minutes
+                                    + " 分钟折算为恒定正整数流量");
+                }
+                long targetFlow = quotient[0].longValueExact();
+                BigDecimal heldAfter = lockedSource.heldAmount().subtract(amount);
+                long sourceFlowAfter = heldAfter.divide(BigDecimal.valueOf(minutes)).longValueExact();
+                if (!targetHydraulic) {
+                    repository.setAllocationHydraulic(lockedTarget.id(), targetFlow,
+                            lockedSource.supplyStartNanos(), lockedSource.supplyEndNanos(),
+                            lockedSource.availableHead(), now);
+                    repository.copyPath(lockedSource.id(), lockedTarget.id());
+                }
+                repository.updateAllocationFlow(lockedSource.id(), sourceFlowAfter, now);
+            }
             repository.decrementHeldAmount(lockedSource.id(), amount, now);
             repository.updateAllocationStatus(lockedTarget.id(), STATUS_APPROVED, now);
             try {
@@ -225,6 +280,16 @@ public class WaterService {
             } catch (DuplicateKeyException e) {
                 // 并发复用同一 transferKey（换 commandKey）：事务回滚，额度无变化
                 throw ApiException.conflict("TRANSFER_KEY_REUSED", "transferKey 已被使用: " + transferKey);
+            }
+            if (sourceHydraulic || targetHydraulic) {
+                // 继承/自有路径的目标加入最终集合后重算（含候选内部共用段流量聚合），越限整体回滚
+                try {
+                    refreshSnapshots(checkHydraulicSet());
+                } catch (HeadExceededException e) {
+                    throw headInsufficient(e);
+                } catch (ArithmeticException e) {
+                    throw ApiException.unprocessable("HYDRAULIC_OVERFLOW", "水力核算超出精确整数范围");
+                }
             }
             return toTransferResponse(repository.findTransferByKey(transferKey));
         });
@@ -313,6 +378,216 @@ public class WaterService {
         List<CurtailmentResponse> curtailments = repository.listCurtailments(windowId).stream()
                 .map(this::toCurtailmentResponse).toList();
         return new HistoryResponse(toWindowResponse(window, active), allocations, curtailments);
+    }
+
+    // ------------------------------------------------------------------
+    // 简化水力模型（合成参数）
+    // ------------------------------------------------------------------
+
+    /** 创建渠段：阻力 k 为正整数，版本从 1 起。 */
+    public SegmentResponse createSegment(String requestId, String segmentKey, Long resistance, String actor) {
+        requireKey("requestId", requestId);
+        requireKey("segmentKey", segmentKey);
+        requireKey("X-Actor-Id", actor);
+        long k = requirePositive("resistance", resistance);
+        String params = "SEGMENT_CREATE|" + segmentKey + "|" + k + "|" + actor;
+        return runCommand("SEGMENT_CREATE", requestId, params, SegmentResponse.class, () -> {
+            if (repository.findSegmentByKey(segmentKey) != null) {
+                throw ApiException.conflict("SEGMENT_EXISTS", "渠段已存在: " + segmentKey);
+            }
+            long id = repository.insertSegment(segmentKey, k, nowNanos());
+            return toSegmentResponse(repository.findSegmentById(id));
+        });
+    }
+
+    /**
+     * 修改渠段阻力：携带 expectedVersion，与当前版本不一致返回 409；
+     * 修改后任一现存已批申请水头不足同样返回 409，阻力与版本均不变。
+     */
+    public SegmentResponse updateSegmentResistance(String requestId, String segmentKey, Long resistance,
+                                                   Integer expectedVersion, String actor) {
+        requireKey("requestId", requestId);
+        requireKey("segmentKey", segmentKey);
+        requireKey("X-Actor-Id", actor);
+        long k = requirePositive("resistance", resistance);
+        if (expectedVersion == null || expectedVersion < 1) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "expectedVersion 必须为不小于 1 的整数");
+        }
+        String params = "SEGMENT_RESISTANCE|" + segmentKey + "|" + k + "|" + expectedVersion + "|" + actor;
+        return runCommand("SEGMENT_RESISTANCE", requestId, params, SegmentResponse.class, () -> {
+            repository.lockHydraulic();
+            SegmentRow segment = repository.lockSegmentByKey(segmentKey);
+            if (segment == null) {
+                throw ApiException.notFound("SEGMENT_NOT_FOUND", "渠段不存在: " + segmentKey);
+            }
+            if (segment.version() != expectedVersion) {
+                throw ApiException.conflict("VERSION_CONFLICT",
+                        "渠段当前版本 " + segment.version() + " 与期望版本 " + expectedVersion + " 不一致");
+            }
+            repository.updateSegmentResistance(segment.id(), k, segment.version() + 1, nowNanos());
+            try {
+                refreshSnapshots(checkHydraulicSet());
+            } catch (HeadExceededException e) {
+                throw ApiException.conflict("RESISTANCE_CONFLICT",
+                        "修改后申请 " + e.allocationKey() + " 时片 " + toIso(e.sliceStartNanos())
+                                + " 路径损失 " + e.loss() + " 超过可用水头 " + e.availableHead() + "，拒绝修改");
+            } catch (ArithmeticException e) {
+                throw ApiException.conflict("RESISTANCE_CONFLICT", "修改后水力核算超出精确整数范围，拒绝修改");
+            }
+            return toSegmentResponse(repository.findSegmentById(segment.id()));
+        });
+    }
+
+    /**
+     * 提交水力型配水申请：1 至 5 段有序无重复渠段、恒定正整数流量、UTC 整分钟左闭右开时段、
+     * 正整数可用水头；原申请水量 = 流量 × 时段分钟数。
+     */
+    public HydraulicAllocationResponse submitHydraulicAllocation(String requestId, String allocationKey,
+                                                                 Long windowId, String userId, List<String> path,
+                                                                 Long flowRate, String supplyStartUtc,
+                                                                 String supplyEndUtc, Long availableHead,
+                                                                 String actor) {
+        requireKey("requestId", requestId);
+        requireKey("allocationKey", allocationKey);
+        requireKey("userId", userId);
+        requireKey("X-Actor-Id", actor);
+        if (windowId == null) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "windowId 不能为空");
+        }
+        if (path == null || path.isEmpty() || path.size() > 5) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "path 必须为 1 至 5 段有序渠段");
+        }
+        List<String> segmentKeys = new ArrayList<>(path.size());
+        for (String segmentKey : path) {
+            requireKey("path 元素", segmentKey);
+            segmentKeys.add(segmentKey);
+        }
+        if (new LinkedHashSet<>(segmentKeys).size() != segmentKeys.size()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "path 内渠段不得重复");
+        }
+        long flow = requirePositive("flowRate", flowRate);
+        long head = requirePositive("availableHead", availableHead);
+        long startNanos = parseInstant("supplyStartUtc", supplyStartUtc);
+        long endNanos = parseInstant("supplyEndUtc", supplyEndUtc);
+        if (!HydraulicCalculator.isMinuteAligned(startNanos) || !HydraulicCalculator.isMinuteAligned(endNanos)) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "供水时段必须按 UTC 整分钟对齐");
+        }
+        if (startNanos >= endNanos) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "supplyStartUtc 必须早于 supplyEndUtc");
+        }
+        long minutes = HydraulicCalculator.minutesBetween(startNanos, endNanos);
+        long amount;
+        try {
+            amount = Math.multiplyExact(flow, minutes);
+        } catch (ArithmeticException e) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "流量 × 分钟数超出可表示范围");
+        }
+        if (amount > 999_999_999_999_999L) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "原申请水量超出 DECIMAL(19,3) 可表示范围");
+        }
+        String params = "HYDRAULIC_SUBMIT|" + allocationKey + "|" + windowId + "|" + userId + "|" + flow + "|"
+                + startNanos + "|" + endNanos + "|" + head + "|" + String.join(",", segmentKeys) + "|" + actor;
+        return runCommand("HYDRAULIC_SUBMIT", requestId, params, HydraulicAllocationResponse.class, () -> {
+            WindowRow window = repository.lockWindowById(windowId);
+            if (window == null) {
+                throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+            }
+            List<SegmentRow> segments = new ArrayList<>(segmentKeys.size());
+            for (String segmentKey : segmentKeys) {
+                SegmentRow segment = repository.findSegmentByKey(segmentKey);
+                if (segment == null) {
+                    throw ApiException.notFound("SEGMENT_NOT_FOUND", "渠段不存在: " + segmentKey);
+                }
+                segments.add(segment);
+            }
+            long id = repository.insertHydraulicAllocation(allocationKey, windowId, userId,
+                    BigDecimal.valueOf(amount), actor, flow, startNanos, endNanos, head, nowNanos());
+            for (int i = 0; i < segments.size(); i++) {
+                repository.insertPathSegment(id, i + 1, segments.get(i).id());
+            }
+            return toHydraulicAllocationResponse(repository.findAllocationByKey(allocationKey));
+        });
+    }
+
+    /** 查询水力型申请明细：冻结路径、流量曲线与审批冻结的时片快照。 */
+    public HydraulicDetailResponse getHydraulicDetail(String allocationKey) {
+        AllocationRow allocation = repository.findAllocationByKey(allocationKey);
+        if (allocation == null) {
+            throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+        }
+        if (allocation.flowRate() == null) {
+            throw ApiException.notFound("NOT_HYDRAULIC", "申请不参与水力模型: " + allocationKey);
+        }
+        List<String> path = repository.listPath(allocation.id()).stream().map(PathRow::segmentKey).toList();
+        List<SliceView> slices = repository.listSlices(allocation.id()).stream()
+                .map(this::toSliceView).toList();
+        return new HydraulicDetailResponse(allocation.allocationKey(), path, allocation.flowRate(),
+                toIso(allocation.supplyStartNanos()), toIso(allocation.supplyEndNanos()),
+                allocation.availableHead(), allocation.status(), slices);
+    }
+
+    /** 汇总当前全部 APPROVED 水力型申请并重算时片事实；越限抛 HeadExceededException。 */
+    private List<SliceFact> checkHydraulicSet() {
+        List<AllocationRow> approved = repository.listApprovedHydraulic();
+        List<Request> requests = new ArrayList<>(approved.size());
+        for (AllocationRow allocation : approved) {
+            List<Segment> segments = new ArrayList<>();
+            for (PathRow pathRow : repository.listPath(allocation.id())) {
+                SegmentRow segment = repository.findSegmentById(pathRow.segmentId());
+                segments.add(new Segment(segment.id(), segment.segmentKey(), segment.resistance(),
+                        segment.version()));
+            }
+            requests.add(new Request(allocation.id(), allocation.allocationKey(), allocation.flowRate(),
+                    allocation.supplyStartNanos(), allocation.supplyEndNanos(), allocation.availableHead(),
+                    segments));
+        }
+        return HydraulicCalculator.recompute(requests);
+    }
+
+    /** 用最新核算事实替换参与集合的冻结时片快照（同事务）。 */
+    private void refreshSnapshots(List<SliceFact> facts) {
+        List<Long> allocationIds = facts.stream().map(SliceFact::allocationId).distinct().toList();
+        for (Long allocationId : allocationIds) {
+            repository.deleteSlices(allocationId);
+        }
+        long now = nowNanos();
+        for (SliceFact fact : facts) {
+            repository.insertSlice(fact.allocationId(), fact.segmentId(), fact.sliceStartNanos(),
+                    fact.sliceEndNanos(), fact.totalFlow(), fact.resistance(), fact.resistanceVersion(),
+                    fact.loss(), now);
+        }
+    }
+
+    private static ApiException headInsufficient(HeadExceededException e) {
+        return ApiException.unprocessable("HEAD_INSUFFICIENT",
+                "申请 " + e.allocationKey() + " 时片 " + toIso(e.sliceStartNanos()) + " 路径损失 " + e.loss()
+                        + " 超过可用水头 " + e.availableHead());
+    }
+
+    private SegmentResponse toSegmentResponse(SegmentRow row) {
+        return new SegmentResponse(row.segmentKey(), row.resistance(), row.version(),
+                toIso(row.createdNanos()), toIso(row.updatedNanos()));
+    }
+
+    private HydraulicAllocationResponse toHydraulicAllocationResponse(AllocationRow row) {
+        List<String> path = repository.listPath(row.id()).stream().map(PathRow::segmentKey).toList();
+        return new HydraulicAllocationResponse(row.allocationKey(), row.windowId(), row.userId(),
+                fmt(row.amount()), path, row.flowRate(), toIso(row.supplyStartNanos()),
+                toIso(row.supplyEndNanos()), row.availableHead(), row.requester(), row.status(),
+                toIso(row.createdNanos()));
+    }
+
+    private SliceView toSliceView(SliceRow row) {
+        return new SliceView(row.segmentKey(), toIso(row.sliceStartNanos()), toIso(row.sliceEndNanos()),
+                row.totalFlow(), row.resistance(), (int) row.resistanceVersion(), row.loss());
+    }
+
+    /** 校验正整数参数（JSON 数值），非法抛 400。 */
+    static long requirePositive(String field, Long value) {
+        if (value == null || value < 1) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 必须为正整数");
+        }
+        return value;
     }
 
     // ------------------------------------------------------------------

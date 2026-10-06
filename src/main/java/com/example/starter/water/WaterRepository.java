@@ -25,10 +25,12 @@ public class WaterRepository {
                             BigDecimal plannedVolume, long createdNanos) {
     }
 
-    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
+    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。
+     *  flowRate/supplyStartNanos/supplyEndNanos/availableHead 仅水力型申请非空。 */
     public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
                                 BigDecimal heldAmount, String requester, String status,
-                                long createdNanos, long updatedNanos) {
+                                long createdNanos, long updatedNanos, Long flowRate, Long supplyStartNanos,
+                                Long supplyEndNanos, Long availableHead) {
     }
 
     /** 转让流水行，创建后不可变。 */
@@ -46,6 +48,20 @@ public class WaterRepository {
                              long createdNanos) {
     }
 
+    /** 渠段阻力参数行；version 从 1 起，每次成功修改 +1。 */
+    public record SegmentRow(long id, String segmentKey, long resistance, int version,
+                             long createdNanos, long updatedNanos) {
+    }
+
+    /** 申请路径上的一段（按 seq 升序）。 */
+    public record PathRow(int seq, long segmentId, String segmentKey) {
+    }
+
+    /** 审批冻结的时片快照行。 */
+    public record SliceRow(long segmentId, String segmentKey, long sliceStartNanos, long sliceEndNanos,
+                           long totalFlow, long resistance, long resistanceVersion, long loss) {
+    }
+
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
@@ -55,11 +71,16 @@ public class WaterRepository {
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
             rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"),
             rs.getString("requester"), rs.getString("status"),
-            rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
+            rs.getLong("created_nanos"), rs.getLong("updated_nanos"),
+            rs.getObject("flow_rate") == null ? null : rs.getLong("flow_rate"),
+            rs.getObject("supply_start_nanos") == null ? null : rs.getLong("supply_start_nanos"),
+            rs.getObject("supply_end_nanos") == null ? null : rs.getLong("supply_end_nanos"),
+            rs.getObject("available_head") == null ? null : rs.getLong("available_head"));
 
     private static final String ALLOCATION_SELECT =
             "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status,"
-                    + " created_nanos, updated_nanos";
+                    + " created_nanos, updated_nanos, flow_rate, supply_start_nanos, supply_end_nanos,"
+                    + " available_head";
 
     private static final RowMapper<TransferRow> TRANSFER_MAPPER = (rs, n) -> new TransferRow(
             rs.getLong("id"), rs.getString("transfer_key"), rs.getLong("window_id"),
@@ -74,6 +95,21 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<SegmentRow> SEGMENT_MAPPER = (rs, n) -> new SegmentRow(
+            rs.getLong("id"), rs.getString("segment_key"), rs.getLong("resistance"),
+            rs.getInt("version"), rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
+
+    private static final String SEGMENT_SELECT =
+            "SELECT id, segment_key, resistance, version, created_nanos, updated_nanos";
+
+    private static final RowMapper<PathRow> PATH_MAPPER = (rs, n) -> new PathRow(
+            rs.getInt("seq"), rs.getLong("segment_id"), rs.getString("segment_key"));
+
+    private static final RowMapper<SliceRow> SLICE_MAPPER = (rs, n) -> new SliceRow(
+            rs.getLong("segment_id"), rs.getString("segment_key"), rs.getLong("slice_start_nanos"),
+            rs.getLong("slice_end_nanos"), rs.getLong("total_flow"), rs.getLong("resistance"),
+            rs.getInt("resistance_version"), rs.getLong("loss"));
 
     private final JdbcTemplate jdbc;
 
@@ -303,5 +339,160 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 简化水力模型
+    // ------------------------------------------------------------------
+
+    /** 插入渠段（阻力版本从 1 起）并返回主键。 */
+    public long insertSegment(String segmentKey, long resistance, long nowNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO channel_segment (segment_key, resistance, version, created_nanos, updated_nanos)"
+                            + " VALUES (?, ?, 1, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, segmentKey);
+            ps.setLong(2, resistance);
+            ps.setLong(3, nowNanos);
+            ps.setLong(4, nowNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询渠段，不存在返回 null。 */
+    public SegmentRow findSegmentByKey(String segmentKey) {
+        try {
+            return jdbc.queryForObject(SEGMENT_SELECT + " FROM channel_segment WHERE segment_key = ?",
+                    SEGMENT_MAPPER, segmentKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按主键查询渠段，不存在返回 null。 */
+    public SegmentRow findSegmentById(long id) {
+        try {
+            return jdbc.queryForObject(SEGMENT_SELECT + " FROM channel_segment WHERE id = ?",
+                    SEGMENT_MAPPER, id);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 按业务键锁定渠段行（FOR UPDATE），用于阻力修改的版本校验，不存在返回 null。 */
+    public SegmentRow lockSegmentByKey(String segmentKey) {
+        try {
+            return jdbc.queryForObject(SEGMENT_SELECT + " FROM channel_segment WHERE segment_key = ? FOR UPDATE",
+                    SEGMENT_MAPPER, segmentKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 更新渠段阻力并递增版本。 */
+    public void updateSegmentResistance(long id, long resistance, long newVersion, long updatedNanos) {
+        jdbc.update("UPDATE channel_segment SET resistance = ?, version = ?, updated_nanos = ? WHERE id = ?",
+                resistance, newVersion, updatedNanos, id);
+    }
+
+    /** 插入水力型申请（初始 REQUESTED，持有额度 0）并返回主键。 */
+    public long insertHydraulicAllocation(String allocationKey, long windowId, String userId, BigDecimal amount,
+                                          String requester, long flowRate, long supplyStartNanos,
+                                          long supplyEndNanos, long availableHead, long nowNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, held_amount, requester,"
+                            + " status, created_nanos, updated_nanos, flow_rate, supply_start_nanos,"
+                            + " supply_end_nanos, available_head)"
+                            + " VALUES (?, ?, ?, ?, 0, ?, 'REQUESTED', ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, allocationKey);
+            ps.setLong(2, windowId);
+            ps.setString(3, userId);
+            ps.setBigDecimal(4, amount);
+            ps.setString(5, requester);
+            ps.setLong(6, nowNanos);
+            ps.setLong(7, nowNanos);
+            ps.setLong(8, flowRate);
+            ps.setLong(9, supplyStartNanos);
+            ps.setLong(10, supplyEndNanos);
+            ps.setLong(11, availableHead);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 追加申请路径的一段（seq 从 1 起）。 */
+    public void insertPathSegment(long allocationId, int seq, long segmentId) {
+        jdbc.update("INSERT INTO allocation_path (allocation_id, seq, segment_id) VALUES (?, ?, ?)",
+                allocationId, seq, segmentId);
+    }
+
+    /** 把源申请的路径整体复制给目标申请（转让继承原路径）。 */
+    public void copyPath(long sourceAllocationId, long targetAllocationId) {
+        jdbc.update("INSERT INTO allocation_path (allocation_id, seq, segment_id)"
+                        + " SELECT ?, seq, segment_id FROM allocation_path WHERE allocation_id = ? ORDER BY seq",
+                targetAllocationId, sourceAllocationId);
+    }
+
+    /** 申请路径（按 seq 升序），含渠段业务键。 */
+    public List<PathRow> listPath(long allocationId) {
+        return jdbc.query("SELECT p.seq, p.segment_id, s.segment_key FROM allocation_path p"
+                        + " JOIN channel_segment s ON s.id = p.segment_id"
+                        + " WHERE p.allocation_id = ? ORDER BY p.seq", PATH_MAPPER, allocationId);
+    }
+
+    /** 全部 APPROVED 且参与水力模型的申请（flow_rate 非空），按主键升序。 */
+    public List<AllocationRow> listApprovedHydraulic() {
+        return jdbc.query(ALLOCATION_SELECT
+                        + " FROM allocation WHERE status = 'APPROVED' AND flow_rate IS NOT NULL ORDER BY id",
+                ALLOCATION_MAPPER);
+    }
+
+    /** 更新水力型申请的当前流量（转让扣减后同步），并记录变更时间。 */
+    public void updateAllocationFlow(long id, long flowRate, long updatedNanos) {
+        jdbc.update("UPDATE allocation SET flow_rate = ?, updated_nanos = ? WHERE id = ?",
+                flowRate, updatedNanos, id);
+    }
+
+    /** 为转让目标写入继承的水力参数（流量、时段、可用水头），并记录变更时间。 */
+    public void setAllocationHydraulic(long id, long flowRate, long supplyStartNanos, long supplyEndNanos,
+                                       long availableHead, long updatedNanos) {
+        jdbc.update("UPDATE allocation SET flow_rate = ?, supply_start_nanos = ?, supply_end_nanos = ?,"
+                        + " available_head = ?, updated_nanos = ? WHERE id = ?",
+                flowRate, supplyStartNanos, supplyEndNanos, availableHead, updatedNanos, id);
+    }
+
+    /** 删除申请全部已冻结时片快照（重算前清理）。 */
+    public void deleteSlices(long allocationId) {
+        jdbc.update("DELETE FROM allocation_slice WHERE allocation_id = ?", allocationId);
+    }
+
+    /** 写入一条冻结时片快照。 */
+    public void insertSlice(long allocationId, long segmentId, long sliceStartNanos, long sliceEndNanos,
+                            long totalFlow, long resistance, long resistanceVersion, long loss,
+                            long createdNanos) {
+        jdbc.update("INSERT INTO allocation_slice (allocation_id, segment_id, slice_start_nanos,"
+                        + " slice_end_nanos, total_flow, resistance, resistance_version, loss, created_nanos)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                allocationId, segmentId, sliceStartNanos, sliceEndNanos, totalFlow, resistance,
+                resistanceVersion, loss, createdNanos);
+    }
+
+    /** 申请全部冻结时片快照（含渠段业务键），按渠段与时片起点升序。 */
+    public List<SliceRow> listSlices(long allocationId) {
+        return jdbc.query("SELECT s.segment_id, seg.segment_key, s.slice_start_nanos, s.slice_end_nanos,"
+                        + " s.total_flow, s.resistance, s.resistance_version, s.loss"
+                        + " FROM allocation_slice s JOIN channel_segment seg ON seg.id = s.segment_id"
+                        + " WHERE s.allocation_id = ? ORDER BY s.segment_id, s.slice_start_nanos",
+                SLICE_MAPPER, allocationId);
+    }
+
+    /** 获取水力模型全局串行锁（SELECT FOR UPDATE 单行）。 */
+    public void lockHydraulic() {
+        jdbc.queryForObject("SELECT id FROM hydraulic_lock WHERE id = 1 FOR UPDATE", Integer.class);
     }
 }
