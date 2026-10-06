@@ -53,11 +53,12 @@ public class TaskService {
     }
 
     /**
-     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
+     * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例、发布单 ACTIVE
+     * 且目标安全索引不低于设备当前底线（旧发布未填索引则不适用）时创建，创建时冻结目标索引。
      * PAUSED 时不创建新任务，已有任务仍可查看与回执。
      */
     public PullResponse pull(String deviceId, String requestId) {
-        String fingerprint = String.join("|", "task.pull", deviceId);
+        String fingerprint = Fingerprints.of("task.pull", deviceId);
         return idempotency.execute(requestId, "task.pull", fingerprint, () -> {
             Device device = deviceService.findDevice(deviceId);
             var activeOrder = releaseRepository.findActiveByModel(device.model());
@@ -72,12 +73,13 @@ public class TaskService {
             }
             if (order.status() != ReleaseStatus.ACTIVE
                     || !device.currentVersion().equals(order.fromVersion())
-                    || device.bucketNo() >= order.ratio()) {
+                    || device.bucketNo() >= order.ratio()
+                    || belowFloor(device, order.targetSecurityIndex())) {
                 return new PullResponse(null);
             }
             long taskId;
             try {
-                taskId = taskRepository.insert(order.id(), deviceId);
+                taskId = taskRepository.insert(order.id(), deviceId, order.targetSecurityIndex());
             } catch (DuplicateKeyException e) {
                 RolloutTask task = taskRepository.findByReleaseAndDevice(order.id(), deviceId)
                         .orElseThrow(() -> new IllegalStateException("任务唯一约束冲突后未找到任务"));
@@ -93,9 +95,12 @@ public class TaskService {
      * 回执：首次回执终结任务并计入完成时所在监控轮次，仅 SUCCESS 更新设备当前版本；
      * 同结果重复成功（不重复计数），改结果 409；已取消任务的后到回执 409 且不更新设备版本。
      * 样本达到下限且失败率越限时，同事务将仍为 ACTIVE 的发布单原子转为 PAUSED 并落暂停记录。
+     * 安全索引联合裁决：任务冻结目标索引时，SUCCESS 必须携带同一索引；安装提交前重查设备实际底线，
+     * 底线已高于冻结索引则 409，不更新版本与监控样本，也不伪造失败；FAILED 不推进底线。
      */
     public TaskView receipt(long taskId, ReceiptRequest request) {
-        String fingerprint = String.join("|", "task.receipt", String.valueOf(taskId), request.result().name());
+        String fingerprint = Fingerprints.of("task.receipt", String.valueOf(taskId), request.result().name(),
+                request.securityIndex() == null ? null : String.valueOf(request.securityIndex()));
         return idempotency.execute(request.requestId(), "task.receipt", fingerprint, () -> {
             RolloutTask snapshot = taskRepository.findById(taskId)
                     .orElseThrow(() -> ApiException.notFound("TASK_NOT_FOUND", "任务不存在: " + taskId));
@@ -105,16 +110,37 @@ public class TaskService {
                     .orElseThrow(() -> ApiException.notFound("TASK_NOT_FOUND", "任务不存在: " + taskId));
             return switch (task.status()) {
                 case PENDING -> {
-                    taskRepository.complete(taskId, request.result());
+                    Integer target = task.targetSecurityIndex();
+                    Device device = null;
+                    if (target != null || request.result() == ReceiptResult.SUCCESS) {
+                        device = deviceRepository.findByIdForUpdate(task.deviceId())
+                                .orElseThrow(() -> ApiException.notFound("DEVICE_NOT_FOUND",
+                                        "设备不存在: " + task.deviceId()));
+                    }
+                    if (target != null) {
+                        rejectIndexMismatch(task, request);
+                        if (device.securityFloor() > target) {
+                            throw ApiException.conflict("SECURITY_FLOOR_CONFLICT",
+                                    "设备安全底线 " + device.securityFloor() + " 已高于任务目标索引 " + target
+                                            + "，回执拒绝");
+                        }
+                    }
+                    taskRepository.complete(taskId, request.result(), request.securityIndex());
                     releaseRepository.incrementRoundStats(snapshot.releaseId(), request.result());
                     if (request.result() == ReceiptResult.SUCCESS) {
-                        deviceRepository.updateCurrentVersion(task.deviceId(), lockedOrder.toVersion());
+                        if (target != null) {
+                            deviceRepository.completeInstall(task.deviceId(), lockedOrder.toVersion(),
+                                    Math.max(device.securityFloor(), target));
+                        } else {
+                            deviceRepository.updateCurrentVersion(task.deviceId(), lockedOrder.toVersion());
+                        }
                     }
                     ReleaseOrder updated = releaseRepository.findById(snapshot.releaseId()).orElseThrow();
                     pauseIfThresholdReached(updated, taskId);
                     yield TaskView.of(taskRepository.findById(taskId).orElseThrow(), updated);
                 }
                 case SUCCESS, FAILED -> {
+                    rejectIndexMismatch(task, request);
                     if (task.firstResult() == request.result()) {
                         yield TaskView.of(task, lockedOrder);
                     }
@@ -124,6 +150,35 @@ public class TaskService {
                 case CANCELLED -> throw ApiException.conflict("TASK_CANCELLED", "任务已取消，回执不再受理");
             };
         }, TaskView.class);
+    }
+
+    /**
+     * 设备底线高于发布目标索引（旧发布索引为 null 时不适用）。
+     */
+    private boolean belowFloor(Device device, Integer targetSecurityIndex) {
+        return targetSecurityIndex != null && device.securityFloor() > targetSecurityIndex;
+    }
+
+    /**
+     * 证明索引校验：任务冻结了目标索引时，SUCCESS 必须携带同一索引；
+     * 携带了不同索引的回执（含终态任务的新键回执）一律 409。
+     */
+    private void rejectIndexMismatch(RolloutTask task, ReceiptRequest request) {
+        Integer target = task.targetSecurityIndex();
+        if (target == null) {
+            return;
+        }
+        if (request.securityIndex() == null) {
+            if (task.status() == TaskStatus.PENDING && request.result() == ReceiptResult.SUCCESS) {
+                throw ApiException.conflict("SECURITY_INDEX_MISMATCH",
+                        "SUCCESS 回执必须携带任务目标索引 " + target);
+            }
+            return;
+        }
+        if (!request.securityIndex().equals(target)) {
+            throw ApiException.conflict("SECURITY_INDEX_MISMATCH",
+                    "证明索引 " + request.securityIndex() + " 与任务目标索引 " + target + " 不一致");
+        }
     }
 
     /**

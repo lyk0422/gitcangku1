@@ -5,6 +5,8 @@ CREATE TABLE IF NOT EXISTS device (
   model VARCHAR(64) NOT NULL COMMENT '设备型号，登记后不可修改',
   current_version VARCHAR(64) NOT NULL COMMENT '设备当前固件版本',
   bucket_no INT NOT NULL COMMENT '灰度分桶号，取值0~99，登记后不可修改',
+  security_floor INT NOT NULL DEFAULT 0 COMMENT '安全底线（非负整数，单调不降）：登记时首次设定，维护只能提升，成功安装取两者最大',
+  security_profile_version INT NOT NULL DEFAULT 1 COMMENT '安全档案版本，从1开始，维护与首次成功安装各加一',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
   PRIMARY KEY (device_id)
 ) COMMENT='设备登记表';
@@ -15,6 +17,7 @@ CREATE TABLE IF NOT EXISTS release_order (
   model VARCHAR(64) NOT NULL COMMENT '目标设备型号',
   from_version VARCHAR(64) NOT NULL COMMENT '来源固件版本',
   to_version VARCHAR(64) NOT NULL COMMENT '目标固件版本，必须与来源版本不同',
+  target_security_index INT NULL COMMENT '目标安全索引（非负整数）；NULL表示旧发布未填写，索引约束不适用',
   ratio INT NOT NULL COMMENT '投放比例，取值0~100，只增不减',
   status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE投放中，PAUSED失败率自动暂停，CANCELLED已取消（终态）',
   sample_floor INT NOT NULL COMMENT '失败率统计样本下限，取值2~100；本轮样本数达到下限才评估暂停',
@@ -36,6 +39,8 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  target_security_index INT NULL COMMENT '任务创建时冻结的目标安全索引，此后不随发布单或设备底线变化',
+  receipt_security_index INT NULL COMMENT '首次回执携带的证明索引（安装证据），未回执或未提供为NULL',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),

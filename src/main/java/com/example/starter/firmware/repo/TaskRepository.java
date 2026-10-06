@@ -23,10 +23,13 @@ public class TaskRepository {
         String firstResult = rs.getString("first_result");
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                rs.getObject("target_security_index", Integer.class),
+                rs.getObject("receipt_security_index", Integer.class));
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result,"
+            + " target_security_index, receipt_security_index";
 
     private final JdbcTemplate jdbc;
 
@@ -34,14 +37,23 @@ public class TaskRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(long releaseId, String deviceId) {
+    /**
+     * 创建任务并冻结发布单当前目标安全索引（可为 null，表示旧发布不适用）。
+     */
+    public long insert(long releaseId, String deviceId, Integer targetSecurityIndex) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rollout_task (release_id, device_id, status) VALUES (?, ?, 'PENDING')",
+                    "INSERT INTO rollout_task (release_id, device_id, status, target_security_index)"
+                            + " VALUES (?, ?, 'PENDING', ?)",
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            if (targetSecurityIndex == null) {
+                ps.setNull(3, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(3, targetSecurityIndex);
+            }
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -62,9 +74,24 @@ public class TaskRepository {
                 MAPPER, releaseId, deviceId).stream().findFirst();
     }
 
-    public void complete(long id, ReceiptResult result) {
-        jdbc.update("UPDATE rollout_task SET status = ?, first_result = ?, updated_at = CURRENT_TIMESTAMP"
-                + " WHERE id = ?", result.name(), result.name(), id);
+    /**
+     * 首次回执终结任务并冻结安装证据（证明索引，可为 null）。
+     */
+    public void complete(long id, ReceiptResult result, Integer receiptSecurityIndex) {
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "UPDATE rollout_task SET status = ?, first_result = ?, receipt_security_index = ?,"
+                            + " updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+            ps.setString(1, result.name());
+            ps.setString(2, result.name());
+            if (receiptSecurityIndex == null) {
+                ps.setNull(3, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(3, receiptSecurityIndex);
+            }
+            ps.setLong(4, id);
+            return ps;
+        });
     }
 
     public int cancelPendingByRelease(long releaseId) {

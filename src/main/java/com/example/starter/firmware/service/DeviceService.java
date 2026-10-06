@@ -1,6 +1,7 @@
 package com.example.starter.firmware.service;
 
 import com.example.starter.firmware.api.DeviceView;
+import com.example.starter.firmware.api.MaintenanceRequest;
 import com.example.starter.firmware.api.RegisterDeviceRequest;
 import com.example.starter.firmware.domain.Device;
 import com.example.starter.firmware.error.ApiException;
@@ -9,7 +10,8 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
 /**
- * 设备登记与查询。型号与分桶号登记后不可修改。
+ * 设备登记、查询与安全维护。型号与分桶号登记后不可修改；
+ * 安全底线单调不降，维护只能提升，成功维护使安全档案版本加一。
  */
 @Service
 public class DeviceService {
@@ -23,17 +25,41 @@ public class DeviceService {
     }
 
     public DeviceView register(RegisterDeviceRequest request) {
-        String fingerprint = String.join("|", "device.register", request.deviceId(), request.model(),
-                request.currentVersion(), String.valueOf(request.bucketNo()));
+        String fingerprint = Fingerprints.of("device.register", request.deviceId(), request.model(),
+                request.currentVersion(), String.valueOf(request.bucketNo()),
+                String.valueOf(request.effectiveSecurityFloor()));
         return idempotency.execute(request.requestId(), "device.register", fingerprint, () -> {
             try {
                 deviceRepository.insert(new Device(request.deviceId(), request.model(),
-                        request.currentVersion(), request.bucketNo()));
+                        request.currentVersion(), request.bucketNo(), request.effectiveSecurityFloor(), 1));
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("DEVICE_EXISTS", "设备已登记: " + request.deviceId());
             }
-            return new DeviceView(request.deviceId(), request.model(), request.currentVersion(),
-                    request.bucketNo());
+            return DeviceView.of(findDevice(request.deviceId()));
+        }, DeviceView.class);
+    }
+
+    /**
+     * 维护入口：提升设备安全底线。expectedDeviceVersion 必须等于当前安全档案版本，成功加一；
+     * 底线下降拒绝（400）。与回执并发时共用设备行锁，安装提交时按实际底线裁决。
+     */
+    public DeviceView maintain(String deviceId, MaintenanceRequest request) {
+        String fingerprint = Fingerprints.of("device.maintenance", request.operator(), deviceId,
+                String.valueOf(request.expectedDeviceVersion()), String.valueOf(request.securityFloor()));
+        return idempotency.execute(request.requestId(), "device.maintenance", fingerprint, () -> {
+            Device device = deviceRepository.findByIdForUpdate(deviceId)
+                    .orElseThrow(() -> ApiException.notFound("DEVICE_NOT_FOUND", "设备不存在: " + deviceId));
+            if (device.securityProfileVersion() != request.expectedDeviceVersion()) {
+                throw ApiException.conflict("DEVICE_VERSION_CONFLICT",
+                        "expectedDeviceVersion 与当前安全档案版本不一致: " + device.securityProfileVersion());
+            }
+            if (request.securityFloor() < device.securityFloor()) {
+                throw ApiException.badRequest("SECURITY_FLOOR_DECREASE",
+                        "安全底线只能提升，当前: " + device.securityFloor());
+            }
+            deviceRepository.raiseSecurityFloor(deviceId, request.expectedDeviceVersion(),
+                    request.securityFloor());
+            return DeviceView.of(findDevice(deviceId));
         }, DeviceView.class);
     }
 
