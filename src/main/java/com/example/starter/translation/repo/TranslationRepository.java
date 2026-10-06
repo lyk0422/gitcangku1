@@ -2,9 +2,11 @@ package com.example.starter.translation.repo;
 
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
+import com.example.starter.translation.domain.Rows.NumericTokenRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
+import com.example.starter.translation.domain.Rows.TranslationNumericTokenRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
@@ -45,6 +47,14 @@ public class TranslationRepository {
 
     private static final RowMapper<TermRuleRow> TERM_RULE_MAPPER = (rs, n) -> new TermRuleRow(
             rs.getString("source_term"), rs.getString("language"), rs.getString("required_translation"));
+
+    private static final RowMapper<NumericTokenRow> NUMERIC_TOKEN_MAPPER = (rs, n) -> new NumericTokenRow(
+            rs.getString("token_key"), rs.getString("source_value"), rs.getString("unit"));
+
+    private static final RowMapper<TranslationNumericTokenRow> TRANSLATION_NUMERIC_TOKEN_MAPPER =
+            (rs, n) -> new TranslationNumericTokenRow(
+                    rs.getString("token_key"), rs.getString("target_value"), rs.getString("unit"),
+                    rs.getInt("start_offset"), rs.getInt("end_offset"));
 
     private final JdbcTemplate jdbc;
 
@@ -240,5 +250,50 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    /** 插入一个源段数值词元（冻结精确十进制原值文本与单位）。 */
+    public void insertNumericToken(long documentId, String segmentId, NumericTokenRow token) {
+        jdbc.update("INSERT INTO segment_numeric_token (document_id, segment_id, token_key, source_value, unit) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                documentId, segmentId, token.tokenKey(), token.sourceValue(), token.unit());
+    }
+
+    /** 删除源段全部数值词元（源文修订时整体替换词元集）。 */
+    public void deleteNumericTokens(long documentId, String segmentId) {
+        jdbc.update("DELETE FROM segment_numeric_token WHERE document_id = ? AND segment_id = ?",
+                documentId, segmentId);
+    }
+
+    /** 查询源段当前全部数值词元，按 tokenKey 排序保证稳定输出。 */
+    public List<NumericTokenRow> listNumericTokens(long documentId, String segmentId) {
+        return jdbc.query(
+                "SELECT token_key, source_value, unit FROM segment_numeric_token "
+                        + "WHERE document_id = ? AND segment_id = ? ORDER BY token_key",
+                NUMERIC_TOKEN_MAPPER, documentId, segmentId);
+    }
+
+    /** 替换某语言译文的全部数值词元：先删后插，与译文 upsert 同一事务。 */
+    public void replaceTranslationNumericTokens(long documentId, String segmentId, String language,
+                                                List<TranslationNumericTokenRow> tokens) {
+        jdbc.update("DELETE FROM translation_numeric_token "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ?",
+                documentId, segmentId, language);
+        for (TranslationNumericTokenRow token : tokens) {
+            jdbc.update("INSERT INTO translation_numeric_token (document_id, segment_id, language, token_key, "
+                            + "target_value, unit, start_offset, end_offset) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    documentId, segmentId, language, token.tokenKey(), token.targetValue(), token.unit(),
+                    token.startOffset(), token.endOffset());
+        }
+    }
+
+    /** 查询某语言译文已冻结的数值词元，按 tokenKey 排序。 */
+    public List<TranslationNumericTokenRow> listTranslationNumericTokens(long documentId, String segmentId,
+                                                                         String language) {
+        return jdbc.query(
+                "SELECT token_key, target_value, unit, start_offset, end_offset "
+                        + "FROM translation_numeric_token "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ? ORDER BY token_key",
+                TRANSLATION_NUMERIC_TOKEN_MAPPER, documentId, segmentId, language);
     }
 }

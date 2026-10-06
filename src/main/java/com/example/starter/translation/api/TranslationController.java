@@ -3,7 +3,9 @@ package com.example.starter.translation.api;
 import com.example.starter.translation.service.TranslationService;
 import com.example.starter.translation.service.WriteExecutor;
 import com.example.starter.translation.service.WriteResult;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.validation.Valid;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -16,6 +18,7 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -141,7 +144,7 @@ public class TranslationController {
         try {
             StringBuilder canonical = new StringBuilder(operation);
             for (Object part : parts) {
-                canonical.append('\n').append(objectMapper.writeValueAsString(part));
+                canonical.append('\n').append(objectMapper.writeValueAsString(canonicalize(part)));
             }
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             return HexFormat.of().formatHex(digest.digest(canonical.toString().getBytes(StandardCharsets.UTF_8)));
@@ -149,6 +152,41 @@ public class TranslationController {
             throw new IllegalStateException("SHA-256 不可用", e);
         } catch (Exception e) {
             throw new IllegalArgumentException("请求序列化失败", e);
+        }
+    }
+
+    /**
+     * 请求参数规范化：结构化防碰撞，数值词元的十进制原值按值归一（如 1234.5 与 1234.50 同参），
+     * 目标数值字符串与其余文本原样保留。
+     */
+    private JsonNode canonicalize(Object part) {
+        JsonNode node = objectMapper.valueToTree(part);
+        normalizeDecimals(node);
+        return node;
+    }
+
+    private void normalizeDecimals(JsonNode node) {
+        if (node.isObject()) {
+            JsonNode tokens = node.get("numericTokens");
+            if (tokens != null && tokens.isArray()) {
+                for (JsonNode token : tokens) {
+                    JsonNode value = token.get("value");
+                    if (value != null && value.isTextual()) {
+                        ((ObjectNode) token).put("value", canonicalDecimal(value.asText()));
+                    }
+                }
+            }
+            node.properties().forEach(entry -> normalizeDecimals(entry.getValue()));
+        } else if (node.isArray()) {
+            node.forEach(this::normalizeDecimals);
+        }
+    }
+
+    private static String canonicalDecimal(String text) {
+        try {
+            return new BigDecimal(text).stripTrailingZeros().toPlainString();
+        } catch (NumberFormatException e) {
+            return text;
         }
     }
 }

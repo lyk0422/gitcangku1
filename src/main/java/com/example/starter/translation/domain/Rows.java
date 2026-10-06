@@ -72,6 +72,29 @@ public final class Rows {
     }
 
     /**
+     * 源段数值词元：新类型源段登记 0~5 个数值词元，按 tokenKey 唯一，冻结精确十进制原值与单位。
+     *
+     * @param tokenKey    段内唯一词元键，译文按同键回传目标数值
+     * @param sourceValue 精确十进制原值文本（无指数、无分组符），按值比较，原样冻结
+     * @param unit        数值单位，译文单位须与此完全一致
+     */
+    public record NumericTokenRow(String tokenKey, String sourceValue, String unit) {
+    }
+
+    /**
+     * 译文数值词元：按段落+语言+tokenKey 唯一，冻结目标数值字符串、单位及正文码点区间。
+     *
+     * @param tokenKey    与源词元同键
+     * @param targetValue 目标数值字符串，固定格式：逗号小数点、点三位分组符，原样冻结
+     * @param unit        目标数值单位，须等于源词元单位
+     * @param startOffset 正文码点区间起点，从 0 起左闭，补充字符计 1 个码点
+     * @param endOffset   正文码点区间终点，右开；区间文字须与 targetValue 一致且区间互不重叠
+     */
+    public record TranslationNumericTokenRow(String tokenKey, String targetValue, String unit,
+                                             int startOffset, int endOffset) {
+    }
+
+    /**
      * 写操作幂等去重记录：全局唯一 requestId，仅记录成功结果，与业务变更原子提交。
      *
      * @param requestId      全局唯一请求 ID

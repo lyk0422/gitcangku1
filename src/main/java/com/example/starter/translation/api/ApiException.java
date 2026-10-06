@@ -38,6 +38,11 @@ public class ApiException extends RuntimeException {
         return violations;
     }
 
+    /** 400：请求格式非法（如目标数值格式不合法）。 */
+    public static ApiException badRequest(String message) {
+        return new ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST", message);
+    }
+
     /** 404：资源不存在。 */
     public static ApiException notFound(String message) {
         return new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", message);

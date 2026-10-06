@@ -111,6 +111,42 @@ COMMENT ON COLUMN term_rule.source_term IS '源文术语，Unicode 原文、区�
 COMMENT ON COLUMN term_rule.language IS '目标语言码，小写';
 COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
 
+CREATE TABLE IF NOT EXISTS segment_numeric_token (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    token_key VARCHAR(64) NOT NULL,
+    source_value VARCHAR(64) NOT NULL,
+    unit VARCHAR(32) NOT NULL,
+    PRIMARY KEY (document_id, segment_id, token_key)
+);
+COMMENT ON TABLE segment_numeric_token IS '源段数值词元：新类型源段登记 0~5 个数值词元，按 tokenKey 唯一，冻结精确十进制原值与单位';
+COMMENT ON COLUMN segment_numeric_token.document_id IS '所属文档 ID';
+COMMENT ON COLUMN segment_numeric_token.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN segment_numeric_token.token_key IS '段内唯一词元键，译文按同键回传目标数值';
+COMMENT ON COLUMN segment_numeric_token.source_value IS '精确十进制原值文本（无指数、无分组符），按值比较，原样冻结';
+COMMENT ON COLUMN segment_numeric_token.unit IS '数值单位，译文单位须与此完全一致';
+
+CREATE TABLE IF NOT EXISTS translation_numeric_token (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    token_key VARCHAR(64) NOT NULL,
+    target_value VARCHAR(64) NOT NULL,
+    unit VARCHAR(32) NOT NULL,
+    start_offset INT NOT NULL,
+    end_offset INT NOT NULL,
+    PRIMARY KEY (document_id, segment_id, language, token_key)
+);
+COMMENT ON TABLE translation_numeric_token IS '译文数值词元：按段落+语言+tokenKey 唯一，冻结目标数值字符串、单位及正文码点区间';
+COMMENT ON COLUMN translation_numeric_token.document_id IS '所属文档 ID';
+COMMENT ON COLUMN translation_numeric_token.segment_id IS '所属段落 ID';
+COMMENT ON COLUMN translation_numeric_token.language IS '目标语言码，小写';
+COMMENT ON COLUMN translation_numeric_token.token_key IS '与源词元同键';
+COMMENT ON COLUMN translation_numeric_token.target_value IS '目标数值字符串，固定格式：逗号小数点、点三位分组符，原样冻结';
+COMMENT ON COLUMN translation_numeric_token.unit IS '目标数值单位，须等于源词元单位';
+COMMENT ON COLUMN translation_numeric_token.start_offset IS '正文码点区间起点，从 0 起左闭，补充字符计 1 个码点';
+COMMENT ON COLUMN translation_numeric_token.end_offset IS '正文码点区间终点，右开；区间文字须与 target_value 一致且区间互不重叠';
+
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,

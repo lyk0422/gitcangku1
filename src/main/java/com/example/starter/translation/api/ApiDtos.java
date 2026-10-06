@@ -18,10 +18,27 @@ public final class ApiDtos {
     private ApiDtos() {
     }
 
-    /** 初始段落输入。 */
+    /** 源段数值词元输入：tokenKey 段内唯一，value 为精确十进制原值文本，unit 为单位。 */
+    public record NumericTokenInput(
+            @NotBlank(message = "tokenKey 不能为空") @Size(max = 64) String tokenKey,
+            @NotBlank(message = "value 不能为空") @Size(max = 64) String value,
+            @NotBlank(message = "unit 不能为空") @Size(max = 32) String unit) {
+    }
+
+    /** 译文数值词元输入：与源词元同键，携带目标数值字符串、单位及正文码点区间（左闭右开）。 */
+    public record TargetNumericTokenInput(
+            @NotBlank(message = "tokenKey 不能为空") @Size(max = 64) String tokenKey,
+            @NotBlank(message = "targetValue 不能为空") @Size(max = 64) String targetValue,
+            @NotBlank(message = "unit 不能为空") @Size(max = 32) String unit,
+            @PositiveOrZero(message = "start 不能为负数") int start,
+            @PositiveOrZero(message = "end 不能为负数") int end) {
+    }
+
+    /** 初始段落输入；numericTokens 可空，空表示普通无词元源段，最多 5 个。 */
     public record SegmentInput(
             @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
-            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            @Size(max = 5, message = "数值词元最多 5 个") List<@Valid NumericTokenInput> numericTokens) {
     }
 
     /** 建文档请求：1~5 种目标语言，可携带初始段落。 */
@@ -32,24 +49,27 @@ public final class ApiDtos {
             @NotNull(message = "segments 不能为空") List<@Valid SegmentInput> segments) {
     }
 
-    /** 增加段落请求。 */
+    /** 增加段落请求；numericTokens 可空，空表示普通无词元源段，最多 5 个。 */
     public record AddSegmentRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
-            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            @Size(max = 5, message = "数值词元最多 5 个") List<@Valid NumericTokenInput> numericTokens) {
     }
 
-    /** 源文修订请求。 */
+    /** 源文修订请求；numericTokens 可空，提供时整体替换当前词元集（0~5 个）。 */
     public record ReviseSourceRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
-            @NotBlank(message = "sourceText 不能为空") String sourceText) {
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            @Size(max = 5, message = "数值词元最多 5 个") List<@Valid NumericTokenInput> numericTokens) {
     }
 
-    /** 译文提交请求；作者取 X-Actor-Id 请求头。 */
+    /** 译文提交请求；作者取 X-Actor-Id 请求头。numericTokens 与源段词元同键回传，可空表示无词元。 */
     public record SubmitTranslationRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @NotBlank(message = "content 不能为空") String content,
-            @Positive(message = "sourceVersion 必须为正数") int sourceVersion) {
+            @Positive(message = "sourceVersion 必须为正数") int sourceVersion,
+            @Size(max = 5, message = "数值词元最多 5 个") List<@Valid TargetNumericTokenInput> numericTokens) {
     }
 
     /** 译文批准请求；审核人取 X-Actor-Id 请求头。 */
