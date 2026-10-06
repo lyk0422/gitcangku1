@@ -1,6 +1,9 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.MutationResponse;
+import com.example.starter.api.dto.ObstacleCreateRequest;
+import com.example.starter.api.dto.ObstacleReviseRequest;
+import com.example.starter.api.dto.ObstacleRevokeRequest;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
 import com.example.starter.api.dto.RouteCreateRequest;
@@ -41,6 +44,24 @@ public class AirspaceReviewController {
     @PostMapping("/zones/revoke")
     public ResponseEntity<MutationResponse> revokeZone(@Valid @RequestBody ZoneRevokeRequest request) {
         return ResponseEntity.ok(service.revokeZone(request));
+    }
+
+    /** 登记圆形障碍（初始版本 1）。 */
+    @PostMapping("/obstacles")
+    public ResponseEntity<MutationResponse> createObstacle(@Valid @RequestBody ObstacleCreateRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(service.createObstacle(request));
+    }
+
+    /** 修订圆形障碍几何（圆心/半径），版本加一。 */
+    @PostMapping("/obstacles/revise")
+    public ResponseEntity<MutationResponse> reviseObstacle(@Valid @RequestBody ObstacleReviseRequest request) {
+        return ResponseEntity.ok(service.reviseObstacle(request));
+    }
+
+    /** 撤销圆形障碍，版本加一。 */
+    @PostMapping("/obstacles/revoke")
+    public ResponseEntity<MutationResponse> revokeObstacle(@Valid @RequestBody ObstacleRevokeRequest request) {
+        return ResponseEntity.ok(service.revokeObstacle(request));
     }
 
     /** 创建航线。 */

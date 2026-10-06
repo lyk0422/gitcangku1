@@ -1,5 +1,6 @@
 package com.example.starter.repo;
 
+import com.example.starter.domain.EnvelopeHit;
 import com.example.starter.domain.Point;
 
 import java.util.List;
@@ -12,12 +13,15 @@ import java.util.List;
  * @param routeVersion    审核时的航线版本
  * @param airspaceVersion 审核时的空域版本
  * @param conclusion      CLEAR / BLOCKED
- * @param hitZoneIds      命中 zoneId（字典序去重）
+ * @param hitZoneIds      原几何禁飞命中 zoneId（字典序去重）
  * @param pointsSnapshot  审核时航点不可变快照
+ * @param envelopeRadius  审核时航线登记的水平包络半径（米）
+ * @param envelopeHits    包络命中明细（命中线段、障碍版本及包络值）
  * @param requestId       提交审核的请求标识
  * @param createdAt       创建时间（epoch 毫秒）
  */
 public record ReviewPo(String reviewId, String routeId, int routeVersion, long airspaceVersion,
                        String conclusion, List<String> hitZoneIds, List<Point> pointsSnapshot,
+                       int envelopeRadius, List<EnvelopeHit> envelopeHits,
                        String requestId, long createdAt) {
 }

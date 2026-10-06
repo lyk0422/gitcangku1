@@ -19,27 +19,27 @@ public class RouteRepository {
         this.jdbc = jdbc;
     }
 
-    /** 按 routeId 查询航线（含当前版本点列），不存在返回 null。 */
+    /** 按 routeId 查询航线（含当前版本点列与包络半径），不存在返回 null。 */
     public RoutePo findRoute(String routeId) {
         Integer version;
+        Integer envelopeRadius;
         try {
-            version = jdbc.queryForObject(
-                    "SELECT version FROM route WHERE route_id = ?", Integer.class, routeId);
+            var row = jdbc.queryForMap(
+                    "SELECT version, envelope_radius FROM route WHERE route_id = ?", routeId);
+            version = ((Number) row.get("version")).intValue();
+            envelopeRadius = ((Number) row.get("envelope_radius")).intValue();
         } catch (EmptyResultDataAccessException ex) {
             return null;
         }
-        if (version == null) {
-            return null;
-        }
         List<Point> points = findPoints(routeId);
-        return new RoutePo(routeId, version, points);
+        return new RoutePo(routeId, version, envelopeRadius, points);
     }
 
     /**
      * 在当前事务内对航线行做真实更新（touch 加一）取得行级排他锁，并读取航线（含点列）。
      *
      * <p>更新为不同的值确保 H2/MySQL 不跳过加锁；与替换操作的行更新互斥，
-     * 保证审核读到的航线版本与点列来自一致状态。</p>
+     * 保证审核读到的航线版本、包络半径与点列来自一致状态。</p>
      *
      * @return 航线当前状态；航线不存在返回 null（更新 0 行）
      */
@@ -49,13 +49,12 @@ public class RouteRepository {
         if (locked == 0) {
             return null;
         }
-        Integer version = jdbc.queryForObject(
-                "SELECT version FROM route WHERE route_id = ?", Integer.class, routeId);
-        if (version == null) {
-            return null;
-        }
+        var row = jdbc.queryForMap(
+                "SELECT version, envelope_radius FROM route WHERE route_id = ?", routeId);
+        int version = ((Number) row.get("version")).intValue();
+        int envelopeRadius = ((Number) row.get("envelope_radius")).intValue();
         List<Point> points = findPoints(routeId);
-        return new RoutePo(routeId, version, points);
+        return new RoutePo(routeId, version, envelopeRadius, points);
     }
 
     private List<Point> findPoints(String routeId) {
@@ -64,23 +63,24 @@ public class RouteRepository {
                 (rs, n) -> new Point(rs.getInt("x"), rs.getInt("y")), routeId);
     }
 
-    /** 创建航线（初始版本 1）并写入点列（调用方负责事务）。 */
-    public void insertRoute(String routeId, List<Point> points) {
-        jdbc.update("INSERT INTO route (route_id, version, touch) VALUES (?, 1, 0)", routeId);
+    /** 创建航线（初始版本 1）并写入点列与包络半径（调用方负责事务）。 */
+    public void insertRoute(String routeId, List<Point> points, int envelopeRadius) {
+        jdbc.update("INSERT INTO route (route_id, version, envelope_radius, touch) "
+                + "VALUES (?, 1, ?, 0)", routeId, envelopeRadius);
         insertPoints(routeId, points);
     }
 
     /**
-     * 条件更新航线版本：仅当当前版本等于 expectedVersion 时加一（同时推进 touch
-     * 以持有行写锁，与审核事务互斥）。
+     * 条件更新航线版本与包络半径：仅当当前版本等于 expectedVersion 时加一
+     * （同时推进 touch 以持有行写锁，与审核事务互斥）。
      *
      * @return 更新行数；0 表示版本不匹配
      */
-    public int compareAndIncrementVersion(String routeId, int expectedVersion) {
+    public int compareAndIncrementVersion(String routeId, int expectedVersion, int envelopeRadius) {
         return jdbc.update(
-                "UPDATE route SET version = version + 1, touch = touch + 1 "
+                "UPDATE route SET version = version + 1, envelope_radius = ?, touch = touch + 1 "
                         + "WHERE route_id = ? AND version = ?",
-                routeId, expectedVersion);
+                envelopeRadius, routeId, expectedVersion);
     }
 
     /** 删除航线旧点列（调用方负责事务）。 */

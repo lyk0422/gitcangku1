@@ -1,6 +1,10 @@
 package com.example.starter.repo;
 
+import com.example.starter.domain.EnvelopeHit;
 import com.example.starter.domain.Point;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -11,10 +15,20 @@ import java.util.List;
 
 /**
  * 审核结果与幂等去重数据访问。
- * 点快照以 "x,y;x,y" 文本保存，命中 zoneId 以逗号拼接，均为不可变内容。
+ * 点快照以 "x,y;x,y" 文本保存，命中 zoneId 以逗号拼接；
+ * 包络命中明细以 JSON 数组保存（结构化存储，避免分隔符碰撞），均为不可变内容。
  */
 @Repository
 public class ReviewRepository {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final TypeReference<List<EnvelopeHit>> HIT_LIST_TYPE = new TypeReference<>() {
+    };
+
+    private static final String REVIEW_COLUMNS =
+            "review_id, route_id, route_version, airspace_version, conclusion, "
+                    + "hit_zone_ids, points_snapshot, envelope_radius, envelope_hits, "
+                    + "request_id, created_at";
 
     private final JdbcTemplate jdbc;
 
@@ -30,24 +44,22 @@ public class ReviewRepository {
             rs.getString("conclusion"),
             decodeZoneIds(rs.getString("hit_zone_ids")),
             decodePoints(rs.getString("points_snapshot")),
+            rs.getInt("envelope_radius"),
+            decodeEnvelopeHits(rs.getString("envelope_hits")),
             rs.getString("request_id"),
             rs.getLong("created_at"));
 
     /** 按 reviewId 查询不可变审核记录，不存在返回 null。 */
     public ReviewPo findReview(String reviewId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE review_id = ?",
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE review_id = ?",
                 REVIEW_MAPPER, reviewId).stream().findFirst().orElse(null);
     }
 
     /** 查询某航线最新的一条审核记录（按创建时间、reviewId 倒序），没有返回 null。 */
     public ReviewPo findLatestReview(String routeId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE route_id = ? "
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE route_id = ? "
                         + "ORDER BY created_at DESC, review_id DESC LIMIT 1",
                 REVIEW_MAPPER, routeId).stream().findFirst().orElse(null);
     }
@@ -56,10 +68,12 @@ public class ReviewRepository {
     public void insertReview(ReviewPo po) {
         jdbc.update("INSERT INTO review "
                         + "(review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "hit_zone_ids, points_snapshot, envelope_radius, envelope_hits, "
+                        + "request_id, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 po.reviewId(), po.routeId(), po.routeVersion(), po.airspaceVersion(),
                 po.conclusion(), encodeZoneIds(po.hitZoneIds()), encodePoints(po.pointsSnapshot()),
+                po.envelopeRadius(), encodeEnvelopeHits(po.envelopeHits()),
                 po.requestId(), po.createdAt());
     }
 
@@ -117,5 +131,26 @@ public class ReviewRepository {
             return new ArrayList<>();
         }
         return new ArrayList<>(Arrays.asList(text.split(",")));
+    }
+
+    /** 包络命中明细编码为 JSON 数组（结构化存储，避免分隔符碰撞）。 */
+    public static String encodeEnvelopeHits(List<EnvelopeHit> hits) {
+        try {
+            return MAPPER.writeValueAsString(hits);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("包络命中明细序列化失败", ex);
+        }
+    }
+
+    /** 包络命中明细解码；空串或空数组返回空列表。 */
+    public static List<EnvelopeHit> decodeEnvelopeHits(String json) {
+        if (json == null || json.isEmpty()) {
+            return new ArrayList<>();
+        }
+        try {
+            return MAPPER.readValue(json, HIT_LIST_TYPE);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("包络命中明细反序列化失败", ex);
+        }
     }
 }

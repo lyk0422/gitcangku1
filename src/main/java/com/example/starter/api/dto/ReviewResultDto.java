@@ -1,5 +1,7 @@
 package com.example.starter.api.dto;
 
+import com.example.starter.domain.EnvelopeHit;
+
 import java.util.List;
 
 /**
@@ -10,8 +12,10 @@ import java.util.List;
  * @param routeVersion    审核时的航线版本
  * @param airspaceVersion 审核时的空域版本
  * @param conclusion      CLEAR / BLOCKED / STALE
- * @param hitZoneIds      BLOCKED 时命中的全部 zoneId（字典序去重），否则为空列表
+ * @param hitZoneIds      BLOCKED 时原几何禁飞命中的全部 zoneId（字典序去重），否则为空列表
  * @param pointsSnapshot  审核时不可变的航点快照
+ * @param envelopeRadius  审核时航线登记的水平包络半径（米）
+ * @param envelopeHits    包络命中明细（命中线段、障碍版本及包络值），无命中为空列表
  * @param current         仅当前查询返回：当前航线/空域是否仍与审核版本匹配
  */
 public record ReviewResultDto(
@@ -22,5 +26,7 @@ public record ReviewResultDto(
         String conclusion,
         List<String> hitZoneIds,
         List<RoutePointDto> pointsSnapshot,
+        Integer envelopeRadius,
+        List<EnvelopeHit> envelopeHits,
         Boolean current) {
 }

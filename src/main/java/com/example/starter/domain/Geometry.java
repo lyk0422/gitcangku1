@@ -1,10 +1,12 @@
 package com.example.starter.domain;
 
+import java.math.BigInteger;
 import java.util.List;
 
 /**
  * 二维平面几何判定。本题只模拟二维平面，不用于真实飞行。
  * 禁飞区为非退化轴对齐闭矩形，边界接触也算命中。
+ * 水平包络审查使用精确平方距离比较（接触即阻断），不做开根取整。
  */
 public final class Geometry {
 
@@ -99,5 +101,52 @@ public final class Geometry {
     public static boolean inRectangle(long x, long y,
                                       int xMin, int yMin, int xMax, int yMax) {
         return x >= xMin && x <= xMax && y >= yMin && y <= yMax;
+    }
+
+    /**
+     * 判断线段（含端点）到点的最小距离是否不超过 radius（接触也算命中）。
+     *
+     * <p>覆盖线段内部投影与两个端点；全程使用精确平方距离比较，
+     * 不做开根或取整。坐标范围 ±100000 时，内部投影的叉积平方最大约 6.4e21，
+     * 超出 long 范围，故内部投影分支用 BigInteger 做精确比较。</p>
+     *
+     * @param ax     端点 A 的 X（米）
+     * @param ay     端点 A 的 Y（米）
+     * @param bx     端点 B 的 X（米）
+     * @param by     端点 B 的 Y（米）
+     * @param px     点（圆心）的 X（米）
+     * @param py     点（圆心）的 Y（米）
+     * @param radius 距离上限（米），等于障碍半径与航线包络半径之和，非负
+     * @return true 表示最小距离 ≤ radius（含恰好接触）
+     */
+    public static boolean segmentWithinDistance(long ax, long ay, long bx, long by,
+                                                long px, long py, long radius) {
+        long vx = bx - ax;
+        long vy = by - ay;
+        long wx = px - ax;
+        long wy = py - ay;
+        long len2 = vx * vx + vy * vy;
+        long rr = radius * radius;
+        if (len2 == 0L) {
+            // 零长度线段（重复航点）：退化为点到点距离
+            return wx * wx + wy * wy <= rr;
+        }
+        long dot = vx * wx + vy * wy;
+        if (dot <= 0L) {
+            // 最近点为端点 A
+            return wx * wx + wy * wy <= rr;
+        }
+        if (dot >= len2) {
+            // 最近点为端点 B
+            long ex = px - bx;
+            long ey = py - by;
+            return ex * ex + ey * ey <= rr;
+        }
+        // 最近点在线段内部：距离² = cross² / len2，其中 cross = v × w。
+        // 精确比较 cross² <= rr * len2，避免除法与开根；cross² 可能超出 long，用 BigInteger。
+        long cross = vx * wy - vy * wx;
+        BigInteger lhs = BigInteger.valueOf(cross).multiply(BigInteger.valueOf(cross));
+        BigInteger rhs = BigInteger.valueOf(rr).multiply(BigInteger.valueOf(len2));
+        return lhs.compareTo(rhs) <= 0;
     }
 }
