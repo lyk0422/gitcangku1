@@ -4,11 +4,12 @@ spring:
   config:
     import: "optional:configtree:/run/secrets/"
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
+    url: ${DB_URL:jdbc:h2:mem:consent-local;MODE=MySQL;DB_CLOSE_DELAY=-1}
+    username: ${DB_USER:sa}
   sql:
     init:
       mode: always
+      data-locations: classpath:seed-data.sql
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1
