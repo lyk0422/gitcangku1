@@ -36,6 +36,11 @@ CREATE TABLE IF NOT EXISTS measurement (
     computed_value DECIMAL(38,12) NOT NULL COMMENT '未舍入计算值 a×读数+b，最多 12 位小数',
     passed BOOLEAN NOT NULL COMMENT '是否合格；基于未舍入值判定且包含上下限端点',
     status VARCHAR(16) NOT NULL COMMENT '状态：PENDING=待放行，RELEASED=已放行',
+    resolution_version INT NULL COMMENT '提交时冻结的分辨率配置版本；未配置仪器为 NULL',
+    grid_origin DECIMAL(38,6) NULL COMMENT '提交时冻结的格点原点 o，最多 6 位小数；未配置为 NULL',
+    grid_step DECIMAL(38,6) NULL COMMENT '提交时冻结的格点步长 s（正数），最多 6 位小数；未配置为 NULL',
+    grid_k DECIMAL(38,0) NULL COMMENT '提交时冻结的格点整数 k=(x-o)/s 最近整数（半格取偶）；未配置为 NULL',
+    quantized_value DECIMAL(38,12) NULL COMMENT '量化值 o+k×s；未配置仪器为 NULL',
     created_at DATETIME(6) NOT NULL COMMENT '提交时间（UTC）',
     CONSTRAINT uk_measurement_key UNIQUE (measurement_key),
     KEY idx_measurement_instrument (instrument_id),
@@ -51,3 +56,25 @@ CREATE TABLE IF NOT EXISTS release_record (
     released_at DATETIME(6) NOT NULL COMMENT '放行时间（UTC）',
     KEY idx_release_measurement (measurement_id)
 ) COMMENT='放行历史';
+
+-- 仪器分辨率格点配置：每台仪器最多一条当前配置；版本从 1 起，更新携带 expectedVersion 乐观并发。
+CREATE TABLE IF NOT EXISTS instrument_resolution (
+    instrument_id VARCHAR(64) NOT NULL PRIMARY KEY COMMENT '仪器 ID',
+    version INT NOT NULL COMMENT '配置版本，从 1 起，每次成功更新加 1',
+    grid_origin DECIMAL(38,6) NOT NULL COMMENT '格点原点 o，十进制，最多 6 位小数，可为负',
+    grid_step DECIMAL(38,6) NOT NULL COMMENT '格点步长 s，正数，十进制，最多 6 位小数',
+    updated_by VARCHAR(64) NOT NULL COMMENT '最近一次配置操作人（X-Actor-Id）',
+    updated_at DATETIME(6) NOT NULL COMMENT '最近一次配置时间（UTC）'
+) COMMENT='仪器分辨率格点配置';
+
+-- 幂等去重记录：新增写入按 requestId 去重；身份要素分列存储并结构化比较，避免分隔符碰撞。
+CREATE TABLE IF NOT EXISTS idempotency_record (
+    request_id VARCHAR(64) NOT NULL PRIMARY KEY COMMENT '客户端请求 ID（幂等键）',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型，如 UPSERT_RESOLUTION',
+    actor VARCHAR(64) NOT NULL COMMENT '操作者（X-Actor-Id）',
+    resource VARCHAR(128) NOT NULL COMMENT '资源标识，如仪器 ID',
+    params_json VARCHAR(2048) NOT NULL COMMENT '全部参数与期望版本的 JSON（结构化比较）',
+    response_json VARCHAR(4096) NOT NULL COMMENT '首次成功的完整响应体 JSON，用于重放',
+    http_status INT NOT NULL COMMENT '首次响应的 HTTP 状态码，用于重放',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间（UTC）'
+) COMMENT='幂等去重记录';

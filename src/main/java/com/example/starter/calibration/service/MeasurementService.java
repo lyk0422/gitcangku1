@@ -14,9 +14,11 @@ import com.example.starter.calibration.api.dto.SubmitMeasurementRequest;
 import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
+import com.example.starter.calibration.model.ResolutionConfig;
 import com.example.starter.calibration.repo.CertificateRepository;
 import com.example.starter.calibration.repo.MeasurementRepository;
 import com.example.starter.calibration.repo.ReleaseRepository;
+import com.example.starter.calibration.repo.ResolutionRepository;
 
 /**
  * 测量服务：提交（匹配唯一有效证书并固化计算结果）、历史明细、当前可用结果查询。
@@ -27,18 +29,23 @@ public class MeasurementService {
     private final MeasurementRepository measurements;
     private final CertificateRepository certificates;
     private final ReleaseRepository releases;
+    private final ResolutionRepository resolutions;
 
     public MeasurementService(MeasurementRepository measurements,
                               CertificateRepository certificates,
-                              ReleaseRepository releases) {
+                              ReleaseRepository releases,
+                              ResolutionRepository resolutions) {
         this.measurements = measurements;
         this.certificates = certificates;
         this.releases = releases;
+        this.resolutions = resolutions;
     }
 
     /**
      * 提交测量。按测量时刻匹配唯一有效证书，无匹配返回 422；
      * 使用 BigDecimal 精确计算 a×读数+b，合格判断基于未舍入值且包含端点。
+     * 仪器已配置分辨率格点时，加锁读取当前配置并冻结版本、原点、步长、k 与量化值，
+     * 合格要求精确值与量化值均落在合格闭区间；未配置仪器沿用原规则。
      * measurementKey 重复返回 409（幂等键冲突）。
      */
     @Transactional
@@ -59,11 +66,28 @@ public class MeasurementService {
                         "测量时刻无匹配的有效证书: instrument=" + instrumentId));
 
         BigDecimal computed = cert.a().multiply(reading).add(cert.b());
+
+        // 与配置更新串行化：行锁内读取当前格点配置，看到一致值
+        ResolutionConfig config = resolutions.findByInstrumentForUpdate(instrumentId).orElse(null);
+        Integer resolutionVersion = null;
+        BigDecimal gridOrigin = null;
+        BigDecimal gridStep = null;
+        BigDecimal gridK = null;
+        BigDecimal quantized = null;
         boolean passed = computed.compareTo(lower) >= 0 && computed.compareTo(upper) <= 0;
+        if (config != null) {
+            resolutionVersion = config.version();
+            gridOrigin = config.origin();
+            gridStep = config.step();
+            gridK = config.quantizeK(computed);
+            quantized = config.quantize(gridK);
+            passed = passed && quantized.compareTo(lower) >= 0 && quantized.compareTo(upper) <= 0;
+        }
 
         Measurement measurement = new Measurement(
                 0L, key, instrumentId, measuredAt, reading, lower, upper, submittedBy,
-                cert.id(), computed, passed, MeasurementStatus.PENDING, Instant.now());
+                cert.id(), computed, passed, MeasurementStatus.PENDING,
+                resolutionVersion, gridOrigin, gridStep, gridK, quantized, Instant.now());
         try {
             measurements.insert(measurement);
         } catch (DuplicateKeyException ex) {

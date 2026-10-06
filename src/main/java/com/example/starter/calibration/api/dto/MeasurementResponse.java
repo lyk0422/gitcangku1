@@ -18,9 +18,12 @@ import java.util.List;
  * @param certificateId  匹配到的证书 ID
  * @param computedValue  未舍入计算值（十进制字符串）
  * @param displayValue   显示值，HALF_UP 4 位小数（十进制字符串）
- * @param passed         是否合格（基于未舍入值，含端点）
+ * @param passed         是否合格（基于未舍入值，含端点；已配置格点时精确值与量化值均须在区间内）
  * @param status         状态：PENDING / RELEASED
  * @param usable         当前是否可用（已放行且证书未撤销）
+ * @param resolutionVersion 提交时冻结的分辨率配置版本；未配置仪器为 null
+ * @param gridK          提交时冻结的格点整数 k（十进制字符串）；未配置仪器为 null
+ * @param quantizedValue 量化值 o+k×s（十进制字符串）；未配置仪器为 null
  * @param createdAt      提交时间（UTC）
  * @param releases       放行历史
  */
@@ -39,6 +42,9 @@ public record MeasurementResponse(
         boolean passed,
         String status,
         boolean usable,
+        Integer resolutionVersion,
+        String gridK,
+        String quantizedValue,
         Instant createdAt,
         List<ReleaseRecordResponse> releases) {
 }

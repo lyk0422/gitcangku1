@@ -60,6 +60,7 @@ public class ReleaseService {
 
         List<ItemFailure> failures = new ArrayList<>();
         List<Measurement> approved = new ArrayList<>();
+        boolean quantizedNotPassed = false;
         for (String key : orderedKeys.stream().sorted().toList()) {
             var locked = measurements.findByKeyForUpdate(key);
             if (locked.isEmpty()) {
@@ -75,6 +76,10 @@ public class ReleaseService {
             }
             if (!measurement.passed()) {
                 reasons.add("NOT_PASSED");
+                // 已配置格点的测量不合格：保存待审但放行按 422 拒绝
+                if (measurement.resolutionVersion() != null) {
+                    quantizedNotPassed = true;
+                }
             }
             Certificate cert = certificates.findByIdForUpdate(measurement.certificateId())
                     .orElseThrow(() -> ApiException.conflict("CERTIFICATE_MISSING",
@@ -93,7 +98,9 @@ public class ReleaseService {
         }
 
         if (!failures.isEmpty()) {
-            throw new BatchRejectedException(failures);
+            throw new BatchRejectedException(failures,
+                    quantizedNotPassed ? org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY
+                            : org.springframework.http.HttpStatus.CONFLICT);
         }
 
         String batchId = UUID.randomUUID().toString();

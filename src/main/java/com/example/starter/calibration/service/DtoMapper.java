@@ -6,10 +6,12 @@ import java.util.List;
 import com.example.starter.calibration.api.dto.CertificateResponse;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRecordResponse;
+import com.example.starter.calibration.api.dto.ResolutionResponse;
 import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.model.ReleaseRecord;
+import com.example.starter.calibration.model.ResolutionConfig;
 
 /**
  * 领域模型到响应 DTO 的映射。
@@ -19,8 +21,11 @@ final class DtoMapper {
     private DtoMapper() {
     }
 
-    /** 十进制输出：去掉多余尾零，零统一输出 "0"。 */
+    /** 十进制输出：去掉多余尾零，零统一输出 "0"；null 原样返回。 */
     static String format(BigDecimal value) {
+        if (value == null) {
+            return null;
+        }
         BigDecimal stripped = value.stripTrailingZeros();
         if (stripped.compareTo(BigDecimal.ZERO) == 0) {
             return "0";
@@ -41,6 +46,16 @@ final class DtoMapper {
                 cert.createdAt());
     }
 
+    static ResolutionResponse toResponse(ResolutionConfig config) {
+        return new ResolutionResponse(
+                config.instrumentId(),
+                config.version(),
+                format(config.origin()),
+                format(config.step()),
+                config.updatedBy(),
+                config.updatedAt());
+    }
+
     static MeasurementResponse toResponse(Measurement m, boolean certificateRevoked,
                                           List<ReleaseRecord> releases) {
         boolean usable = m.status() == MeasurementStatus.RELEASED && !certificateRevoked;
@@ -59,6 +74,9 @@ final class DtoMapper {
                 m.passed(),
                 m.status().name(),
                 usable,
+                m.resolutionVersion(),
+                format(m.gridK()),
+                format(m.quantizedValue()),
                 m.createdAt(),
                 releases.stream().map(DtoMapper::toResponse).toList());
     }

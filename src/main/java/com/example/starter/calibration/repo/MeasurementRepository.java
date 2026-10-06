@@ -17,6 +17,7 @@ import com.example.starter.calibration.model.MeasurementStatus;
 
 /**
  * 测量记录持久化。measurement_key 全局唯一作为幂等键；状态流转由放行事务在行锁内完成。
+ * 已配置分辨率格点的仪器在提交时冻结配置版本、原点、步长、k 与量化值。
  */
 @Repository
 public class MeasurementRepository {
@@ -34,6 +35,11 @@ public class MeasurementRepository {
             rs.getBigDecimal("computed_value"),
             rs.getBoolean("passed"),
             MeasurementStatus.valueOf(rs.getString("status")),
+            (Integer) rs.getObject("resolution_version"),
+            rs.getBigDecimal("grid_origin"),
+            rs.getBigDecimal("grid_step"),
+            rs.getBigDecimal("grid_k"),
+            rs.getBigDecimal("quantized_value"),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
 
     private final JdbcTemplate jdbc;
@@ -51,8 +57,9 @@ public class MeasurementRepository {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO measurement "
                             + "(measurement_key, instrument_id, measured_at, raw_reading, lower_limit, upper_limit, "
-                            + "submitted_by, certificate_id, computed_value, passed, status, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            + "submitted_by, certificate_id, computed_value, passed, status, "
+                            + "resolution_version, grid_origin, grid_step, grid_k, quantized_value, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, measurement.measurementKey());
             ps.setString(2, measurement.instrumentId());
@@ -65,7 +72,16 @@ public class MeasurementRepository {
             ps.setBigDecimal(9, measurement.computedValue());
             ps.setBoolean(10, measurement.passed());
             ps.setString(11, measurement.status().name());
-            ps.setObject(12, JdbcTimes.toDb(measurement.createdAt()));
+            if (measurement.resolutionVersion() == null) {
+                ps.setNull(12, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(12, measurement.resolutionVersion());
+            }
+            ps.setBigDecimal(13, measurement.gridOrigin());
+            ps.setBigDecimal(14, measurement.gridStep());
+            ps.setBigDecimal(15, measurement.gridK());
+            ps.setBigDecimal(16, measurement.quantizedValue());
+            ps.setObject(17, JdbcTimes.toDb(measurement.createdAt()));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
