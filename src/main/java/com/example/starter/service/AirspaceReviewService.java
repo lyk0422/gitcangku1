@@ -1,7 +1,10 @@
 package com.example.starter.service;
 
 import com.example.starter.api.ApiException;
+import com.example.starter.api.dto.EnergyCheckDto;
+import com.example.starter.api.dto.EnergyProfileDto;
 import com.example.starter.api.dto.MutationResponse;
+import com.example.starter.api.dto.PointEnergyDto;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
 import com.example.starter.api.dto.RouteCreateRequest;
@@ -11,12 +14,17 @@ import com.example.starter.api.dto.RouteResult;
 import com.example.starter.api.dto.ZoneCreateRequest;
 import com.example.starter.api.dto.ZoneResult;
 import com.example.starter.api.dto.ZoneRevokeRequest;
+import com.example.starter.domain.EnergyCheckResult;
+import com.example.starter.domain.EnergyEvaluator;
+import com.example.starter.domain.EnergyProfile;
 import com.example.starter.domain.Geometry;
 import com.example.starter.domain.Point;
+import com.example.starter.domain.PointEnergy;
 import com.example.starter.domain.ReviewConclusion;
 import com.example.starter.domain.ZoneStatus;
 import com.example.starter.repo.AirspaceRepository;
 import com.example.starter.repo.DedupPo;
+import com.example.starter.repo.EnergyProfileRepository;
 import com.example.starter.repo.ReviewPo;
 import com.example.starter.repo.ReviewRepository;
 import com.example.starter.repo.RoutePo;
@@ -68,6 +76,7 @@ public class AirspaceReviewService {
     private final AirspaceRepository airspaceRepo;
     private final RouteRepository routeRepo;
     private final ReviewRepository reviewRepo;
+    private final EnergyProfileRepository energyRepo;
     private final ObjectMapper objectMapper;
     private final Clock clock;
     private final TransactionTemplate txTemplate;
@@ -75,12 +84,14 @@ public class AirspaceReviewService {
     public AirspaceReviewService(AirspaceRepository airspaceRepo,
                                  RouteRepository routeRepo,
                                  ReviewRepository reviewRepo,
+                                 EnergyProfileRepository energyRepo,
                                  ObjectMapper objectMapper,
                                  Clock clock,
                                  PlatformTransactionManager transactionManager) {
         this.airspaceRepo = airspaceRepo;
         this.routeRepo = routeRepo;
         this.reviewRepo = reviewRepo;
+        this.energyRepo = energyRepo;
         this.objectMapper = objectMapper;
         this.clock = clock;
         this.txTemplate = new TransactionTemplate(transactionManager);
@@ -128,26 +139,33 @@ public class AirspaceReviewService {
 
     // ============================ 航线 ============================
 
-    /** 创建航线（初始版本 1）。 */
+    /** 创建航线（初始版本 1）；携带能量档案时为版本 1 登记档案。 */
     public MutationResponse createRoute(RouteCreateRequest request) {
         return withIdempotency(request.requestId(), KIND_ROUTE_CREATE, canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
+            EnergyProfile profile = toEnergyProfile(
+                    request.energyProfile(), points.size(), request.operator());
             if (routeRepo.findRoute(request.routeId()) != null) {
                 throw new ApiException(HttpStatus.CONFLICT, "ROUTE_ALREADY_EXISTS",
                         "航线已存在: " + request.routeId());
             }
             routeRepo.insertRoute(request.routeId(), points);
+            if (profile != null) {
+                energyRepo.insertProfile(request.routeId(), 1, profile, request.operator().trim());
+            }
             return new MutationResponse(request.requestId(), false,
                     new RouteResult(request.routeId(), 1));
         });
     }
 
-    /** 替换航线点列，expectedVersion 不匹配返回 409；成功版本加一。 */
+    /** 替换航线点列，expectedVersion 不匹配返回 409；成功版本加一，档案随新版本整体替换。 */
     public MutationResponse replaceRoute(RouteReplaceRequest request) {
         return withIdempotency(request.requestId(), KIND_ROUTE_REPLACE, canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
+            EnergyProfile profile = toEnergyProfile(
+                    request.energyProfile(), points.size(), request.operator());
             RoutePo route = routeRepo.findRoute(request.routeId());
             if (route == null) {
                 throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
@@ -167,6 +185,12 @@ public class AirspaceReviewService {
             }
             routeRepo.deletePoints(request.routeId());
             routeRepo.insertPoints(request.routeId(), points);
+            // 档案随航线修订生成新版本：旧版本档案整体替换，历史审核快照不受影响
+            energyRepo.deleteProfiles(request.routeId());
+            if (profile != null) {
+                energyRepo.insertProfile(request.routeId(), request.expectedVersion() + 1,
+                        profile, request.operator().trim());
+            }
             return new MutationResponse(request.requestId(), false,
                     new RouteResult(request.routeId(), request.expectedVersion() + 1));
         });
@@ -174,7 +198,13 @@ public class AirspaceReviewService {
 
     // ============================ 审核 ============================
 
-    /** 提交审核：任一指定版本不是当前版本返回 409；结果不可变。 */
+    /**
+     * 提交审核：任一指定版本不是当前版本返回 409；结果不可变。
+     *
+     * <p>审核只按航线版本已登记的路径、能量档案与当前空域判定，调用方不能在
+     * 审查时替换路径、耗能或备降列表。能量不足结论为 ENERGY_BLOCKED（给出首个
+     * 不足点号与缺口，几何命中仍保留）；能量合格不覆盖几何 BLOCKED。</p>
+     */
     public MutationResponse review(ReviewRequest request) {
         return withIdempotency(request.requestId(), KIND_REVIEW, canonicalHash(request), () -> {
             // 先锁空域版本行：与任何区域创建/撤销事务互斥
@@ -204,13 +234,21 @@ public class AirspaceReviewService {
                     hits.add(zone.zoneId());
                 }
             }
-            String conclusion = hits.isEmpty()
-                    ? ReviewConclusion.CLEAR.name()
-                    : ReviewConclusion.BLOCKED.name();
+            // 同一持锁事务内读取该航线版本已登记的能量档案，与点列同属一致状态
+            EnergyProfile profile = energyRepo.findProfile(request.routeId(), route.version());
+            EnergyCheckResult energy = profile != null ? EnergyEvaluator.evaluate(profile) : null;
+            String conclusion;
+            if (energy != null && !energy.sufficient()) {
+                conclusion = ReviewConclusion.ENERGY_BLOCKED.name();
+            } else if (!hits.isEmpty()) {
+                conclusion = ReviewConclusion.BLOCKED.name();
+            } else {
+                conclusion = ReviewConclusion.CLEAR.name();
+            }
             String reviewId = "rv_" + UUID.randomUUID();
             ReviewPo po = new ReviewPo(reviewId, request.routeId(), route.version(), globalVersion,
                     conclusion, new ArrayList<>(hits), List.copyOf(route.points()),
-                    request.requestId(), nowMillis());
+                    energy, request.requestId(), nowMillis());
             reviewRepo.insertReview(po);
             return new MutationResponse(request.requestId(), false, toDto(po, conclusion, true));
         });
@@ -346,7 +384,89 @@ public class AirspaceReviewService {
             snapshot.add(new RoutePointDto(p.x(), p.y()));
         }
         return new ReviewResultDto(po.reviewId(), po.routeId(), po.routeVersion(),
-                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()), snapshot, current);
+                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()), snapshot,
+                toEnergyDto(po.energyCheck()), current);
+    }
+
+    private static EnergyCheckDto toEnergyDto(EnergyCheckResult energy) {
+        if (energy == null) {
+            return null;
+        }
+        List<PointEnergyDto> points = new ArrayList<>(energy.points().size());
+        for (PointEnergy p : energy.points()) {
+            points.add(new PointEnergyDto(p.seq(), p.cumulativeEnergy(), p.alternateEnergy(),
+                    p.requiredEnergy(), p.sufficient()));
+        }
+        return new EnergyCheckDto(energy.departureEnergy(), energy.reserveEnergy(),
+                List.copyOf(points), energy.sufficient(),
+                energy.blockedPointSeq(), energy.deficit());
+    }
+
+    /**
+     * 校验并转换合成能量档案；无档案（旧契约）返回 null。
+     *
+     * <p>新类型缺项（段耗能/备降列表缺失或条数与坐标段数、航点数不匹配、
+     * 非正段耗能、负备降、缺操作者）一律 400；累计求和用精确溢出检查。</p>
+     */
+    private static EnergyProfile toEnergyProfile(EnergyProfileDto dto, int pointCount,
+                                                 String operator) {
+        if (dto == null) {
+            return null;
+        }
+        if (operator == null || operator.isBlank()) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "ENERGY_OPERATOR_REQUIRED",
+                    "登记能量档案必须提供非空操作者");
+        }
+        if (dto.departureEnergy() == null || dto.reserveEnergy() == null
+                || dto.segmentEnergies() == null || dto.alternateEnergies() == null) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "ENERGY_PROFILE_INCOMPLETE",
+                    "能量档案缺项：出发能量、必留余量、段耗能与备降列表均为必填");
+        }
+        int segments = pointCount - 1;
+        if (dto.segmentEnergies().size() != segments) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "ENERGY_SEGMENT_COUNT_MISMATCH",
+                    "段耗能条数须匹配已登记坐标段数：segments=" + segments
+                            + ", provided=" + dto.segmentEnergies().size());
+        }
+        if (segments > 10) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "ENERGY_TOO_MANY_SEGMENTS",
+                    "能量档案最多支持 10 段，当前坐标段数: " + segments);
+        }
+        if (dto.alternateEnergies().size() != pointCount) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "ENERGY_ALTERNATE_COUNT_MISMATCH",
+                    "备降耗能必须覆盖全部航点：points=" + pointCount
+                            + ", provided=" + dto.alternateEnergies().size());
+        }
+        if (dto.departureEnergy() < 0 || dto.reserveEnergy() < 0) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "ENERGY_NEGATIVE",
+                    "出发可用能量与必留余量必须为非负整数");
+        }
+        List<Long> segmentEnergies = new ArrayList<>(dto.segmentEnergies().size());
+        for (Long energy : dto.segmentEnergies()) {
+            if (energy == null || energy < 1) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "ENERGY_SEGMENT_NOT_POSITIVE",
+                        "每段主航线耗能必须为正整数");
+            }
+            segmentEnergies.add(energy);
+        }
+        List<Long> alternateEnergies = new ArrayList<>(dto.alternateEnergies().size());
+        for (Long energy : dto.alternateEnergies()) {
+            if (energy == null || energy < 0) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "ENERGY_ALTERNATE_NEGATIVE",
+                        "每航点备降耗能必须为非负整数");
+            }
+            alternateEnergies.add(energy);
+        }
+        EnergyProfile profile = new EnergyProfile(dto.departureEnergy(), dto.reserveEnergy(),
+                List.copyOf(segmentEnergies), List.copyOf(alternateEnergies));
+        // 登记时即做精确求和溢出检查，保证审查时不会溢出
+        try {
+            EnergyEvaluator.evaluate(profile);
+        } catch (ArithmeticException overflow) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "ENERGY_OVERFLOW",
+                    "能量求和超出长整型范围，请缩小输入范围");
+        }
+        return profile;
     }
 
     private long nowMillis() {

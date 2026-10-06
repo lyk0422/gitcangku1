@@ -1,6 +1,9 @@
 package com.example.starter.repo;
 
+import com.example.starter.domain.EnergyCheckResult;
 import com.example.starter.domain.Point;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -11,10 +14,13 @@ import java.util.List;
 
 /**
  * 审核结果与幂等去重数据访问。
- * 点快照以 "x,y;x,y" 文本保存，命中 zoneId 以逗号拼接，均为不可变内容。
+ * 点快照以 "x,y;x,y" 文本保存，命中 zoneId 以逗号拼接，
+ * 能量审查快照以 JSON 保存，均为不可变内容。
  */
 @Repository
 public class ReviewRepository {
+
+    private static final ObjectMapper SNAPSHOT_MAPPER = new ObjectMapper();
 
     private final JdbcTemplate jdbc;
 
@@ -30,24 +36,25 @@ public class ReviewRepository {
             rs.getString("conclusion"),
             decodeZoneIds(rs.getString("hit_zone_ids")),
             decodePoints(rs.getString("points_snapshot")),
+            decodeEnergySnapshot(rs.getString("energy_snapshot")),
             rs.getString("request_id"),
             rs.getLong("created_at"));
+
+    private static final String REVIEW_COLUMNS =
+            "review_id, route_id, route_version, airspace_version, conclusion, "
+                    + "hit_zone_ids, points_snapshot, energy_snapshot, request_id, created_at";
 
     /** 按 reviewId 查询不可变审核记录，不存在返回 null。 */
     public ReviewPo findReview(String reviewId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE review_id = ?",
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE review_id = ?",
                 REVIEW_MAPPER, reviewId).stream().findFirst().orElse(null);
     }
 
     /** 查询某航线最新的一条审核记录（按创建时间、reviewId 倒序），没有返回 null。 */
     public ReviewPo findLatestReview(String routeId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE route_id = ? "
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE route_id = ? "
                         + "ORDER BY created_at DESC, review_id DESC LIMIT 1",
                 REVIEW_MAPPER, routeId).stream().findFirst().orElse(null);
     }
@@ -56,11 +63,11 @@ public class ReviewRepository {
     public void insertReview(ReviewPo po) {
         jdbc.update("INSERT INTO review "
                         + "(review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "hit_zone_ids, points_snapshot, energy_snapshot, request_id, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 po.reviewId(), po.routeId(), po.routeVersion(), po.airspaceVersion(),
                 po.conclusion(), encodeZoneIds(po.hitZoneIds()), encodePoints(po.pointsSnapshot()),
-                po.requestId(), po.createdAt());
+                encodeEnergySnapshot(po.energyCheck()), po.requestId(), po.createdAt());
     }
 
     /** 查询幂等去重记录，不存在返回 null。 */
@@ -117,5 +124,29 @@ public class ReviewRepository {
             return new ArrayList<>();
         }
         return new ArrayList<>(Arrays.asList(text.split(",")));
+    }
+
+    /** 能量审查快照编码为 JSON；null 快照（无能量档案）编码为 null。 */
+    public static String encodeEnergySnapshot(EnergyCheckResult energyCheck) {
+        if (energyCheck == null) {
+            return null;
+        }
+        try {
+            return SNAPSHOT_MAPPER.writeValueAsString(energyCheck);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("能量快照序列化失败", ex);
+        }
+    }
+
+    /** 能量审查快照 JSON 解码；null 或空串返回 null。 */
+    public static EnergyCheckResult decodeEnergySnapshot(String json) {
+        if (json == null || json.isEmpty()) {
+            return null;
+        }
+        try {
+            return SNAPSHOT_MAPPER.readValue(json, EnergyCheckResult.class);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("能量快照反序列化失败", ex);
+        }
     }
 }

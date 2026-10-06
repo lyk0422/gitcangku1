@@ -37,6 +37,9 @@ class AirspaceReviewControllerIT {
     void cleanup() {
         jdbc.update("DELETE FROM review");
         jdbc.update("DELETE FROM request_dedup");
+        jdbc.update("DELETE FROM route_segment_energy");
+        jdbc.update("DELETE FROM route_alternate_energy");
+        jdbc.update("DELETE FROM route_energy_profile");
         jdbc.update("DELETE FROM route_point");
         jdbc.update("DELETE FROM route");
         jdbc.update("DELETE FROM no_fly_zone");
@@ -201,6 +204,57 @@ class AirspaceReviewControllerIT {
                                  "requestId":"idem-fail"}"""))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.replayed").value(false));
+    }
+
+    @Test
+    @DisplayName("能量档案：登记后审查给出 ENERGY_BLOCKED，缺操作者 400，缺项 400")
+    void energyProfileOverHttp() throws Exception {
+        // 登记能量档案：出发100、保留10、两段各30、终点备降40 → 终点需要110
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"e1","requestId":"req-e-route","operator":"tester",
+                                 "points":[{"x":0,"y":0},{"x":50,"y":0},{"x":100,"y":0}],
+                                 "energyProfile":{"departureEnergy":100,"reserveEnergy":10,
+                                   "segmentEnergies":[30,30],"alternateEnergies":[0,0,40]}}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.version").value(1));
+
+        // 审查 → ENERGY_BLOCKED，首个不足点号 2，缺口 10
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"e1","routeVersion":1,"airspaceVersion":0,
+                                 "requestId":"req-e-review"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.conclusion").value("ENERGY_BLOCKED"))
+                .andExpect(jsonPath("$.data.energyCheck.sufficient").value(false))
+                .andExpect(jsonPath("$.data.energyCheck.blockedPointSeq").value(2))
+                .andExpect(jsonPath("$.data.energyCheck.deficit").value(10))
+                .andExpect(jsonPath("$.data.energyCheck.points[2].cumulativeEnergy").value(60))
+                .andExpect(jsonPath("$.data.energyCheck.points[2].requiredEnergy").value(110));
+
+        // 缺操作者 → 400
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"e2","requestId":"req-e-noop",
+                                 "points":[{"x":0,"y":0},{"x":100,"y":0}],
+                                 "energyProfile":{"departureEnergy":100,"reserveEnergy":10,
+                                   "segmentEnergies":[30],"alternateEnergies":[0,0]}}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("ENERGY_OPERATOR_REQUIRED"));
+
+        // 段耗能条数不匹配 → 400
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"e3","requestId":"req-e-mismatch","operator":"tester",
+                                 "points":[{"x":0,"y":0},{"x":50,"y":0},{"x":100,"y":0}],
+                                 "energyProfile":{"departureEnergy":100,"reserveEnergy":10,
+                                   "segmentEnergies":[30],"alternateEnergies":[0,0,0]}}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("ENERGY_SEGMENT_COUNT_MISMATCH"));
     }
 
     @Test

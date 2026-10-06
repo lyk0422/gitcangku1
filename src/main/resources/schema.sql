@@ -44,15 +44,45 @@ CREATE TABLE IF NOT EXISTS route_point (
     PRIMARY KEY (route_id, seq)
 ) COMMENT = '航线当前版本有序航点';
 
+-- 航线版本合成能量档案（表头）：随航线创建/修订登记，绑定具体航线版本；
+-- 修订航线生成新版本时旧版本档案被替换，历史审核不受影响（其快照已冻结在 review 中）
+CREATE TABLE IF NOT EXISTS route_energy_profile (
+    route_id         VARCHAR(64) NOT NULL COMMENT '所属航线标识',
+    route_version    INT NOT NULL COMMENT '档案生效的航线版本（与 route.version 一致）',
+    departure_energy BIGINT NOT NULL COMMENT '出发可用能量，非负整数，单位与段耗能一致',
+    reserve_energy   BIGINT NOT NULL COMMENT '必留余量，非负整数；审查要求每点 累计主航线耗能+该点备降耗能+余量 <= 出发能量',
+    operator         VARCHAR(64) NOT NULL COMMENT '登记该档案的操作者，非空',
+    PRIMARY KEY (route_id, route_version)
+) COMMENT = '航线版本合成能量档案（表头）';
+
+-- 每段主航线耗能：段 seq 连接航点 seq 与 seq+1，条数须等于坐标段数且最多 10 段
+CREATE TABLE IF NOT EXISTS route_segment_energy (
+    route_id       VARCHAR(64) NOT NULL COMMENT '所属航线标识',
+    route_version  INT NOT NULL COMMENT '档案生效的航线版本',
+    seq            INT NOT NULL COMMENT '段序号，从 0 开始，连接航点 seq 与 seq+1',
+    energy         BIGINT NOT NULL COMMENT '该段主航线耗能，正整数',
+    PRIMARY KEY (route_id, route_version, seq)
+) COMMENT = '航线版本每段主航线耗能';
+
+-- 每航点备降选项的额外耗能：必须覆盖全部航点
+CREATE TABLE IF NOT EXISTS route_alternate_energy (
+    route_id       VARCHAR(64) NOT NULL COMMENT '所属航线标识',
+    route_version  INT NOT NULL COMMENT '档案生效的航线版本',
+    point_seq      INT NOT NULL COMMENT '航点序号，从 0 开始，与 route_point.seq 对应',
+    energy         BIGINT NOT NULL COMMENT '该航点备降选项的额外耗能，非负整数',
+    PRIMARY KEY (route_id, route_version, point_seq)
+) COMMENT = '航线版本每航点备降额外耗能';
+
 -- 审核不可变结果
 CREATE TABLE IF NOT EXISTS review (
     review_id         VARCHAR(64) PRIMARY KEY COMMENT '审核记录唯一标识（不可变）',
     route_id          VARCHAR(64) NOT NULL COMMENT '被审核航线标识',
     route_version     INT NOT NULL COMMENT '审核明确指定的航线版本',
     airspace_version  BIGINT NOT NULL COMMENT '审核明确指定的空域版本',
-    conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过或 BLOCKED 命中，永不改变',
-    hit_zone_ids      CLOB NOT NULL COMMENT '命中的全部 zoneId，字典序去重后逗号拼接；未命中为空串',
+    conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过、BLOCKED 几何命中或 ENERGY_BLOCKED 能量不足，永不改变',
+    hit_zone_ids      CLOB NOT NULL COMMENT '命中的全部 zoneId，字典序去重后逗号拼接；未命中为空串；ENERGY_BLOCKED 时仍保留几何命中',
     points_snapshot   VARCHAR(4000) NOT NULL COMMENT '审核时航点不可变快照，格式 x,y;x,y',
+    energy_snapshot   CLOB NULL COMMENT '能量审查不可变快照（JSON）：出发能量、必留余量、每点累计/备降/需求能量及首个不足点号与缺口；NULL 表示该航线版本无能量档案',
     request_id        VARCHAR(64) NOT NULL COMMENT '提交审核的写操作请求标识',
     created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
 ) COMMENT = '审核不可变结果';
