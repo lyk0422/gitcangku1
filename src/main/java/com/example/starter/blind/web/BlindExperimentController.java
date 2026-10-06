@@ -7,11 +7,14 @@ import com.example.starter.blind.RequestTokens;
 import com.example.starter.blind.dto.AllocationView;
 import com.example.starter.blind.dto.CreateExperimentRequest;
 import com.example.starter.blind.dto.ExperimentView;
+import com.example.starter.blind.dto.PhaseOperationRequest;
+import com.example.starter.blind.dto.PhaseView;
 import com.example.starter.blind.dto.UnblindApplyRequest;
 import com.example.starter.blind.dto.UnblindRequestView;
 import com.example.starter.blind.dto.UnblindResultView;
 import com.example.starter.blind.service.ExperimentService;
 import com.example.starter.blind.service.IdempotencyService;
+import com.example.starter.blind.service.PhaseService;
 import com.example.starter.blind.service.UnblindService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -24,6 +27,7 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.HashMap;
 import java.util.Map;
 
 /**
@@ -40,25 +44,32 @@ public class BlindExperimentController {
     static final String OP_ALLOCATION_WITHDRAW = "allocation.withdraw";
     static final String OP_UNBLIND_APPLY = "unblind.apply";
     static final String OP_UNBLIND_APPROVE = "unblind.approve";
+    static final String OP_PHASE_FIRST_START = "phase.first.start";
+    static final String OP_PHASE_FIRST_END = "phase.first.end";
+    static final String OP_PHASE_SECOND_START = "phase.second.start";
+    static final String OP_PHASE_SECOND_END = "phase.second.end";
 
     private final ExperimentService experimentService;
     private final UnblindService unblindService;
+    private final PhaseService phaseService;
     private final IdempotencyService idempotencyService;
     private final ActorContext actorContext;
 
     public BlindExperimentController(ExperimentService experimentService,
                                      UnblindService unblindService,
+                                     PhaseService phaseService,
                                      IdempotencyService idempotencyService,
                                      ActorContext actorContext) {
         this.experimentService = experimentService;
         this.unblindService = unblindService;
+        this.phaseService = phaseService;
         this.idempotencyService = idempotencyService;
         this.actorContext = actorContext;
     }
 
     // ---------------- 实验 ----------------
 
-    /** 创建实验（仅 COORDINATOR）；区组数量 2~8，创建后不可改。 */
+    /** 创建实验（仅 COORDINATOR）；区组数量 2~8，创建后不可改；交叉模式须给定 1~120 分钟洗脱时长。 */
     @PostMapping("/experiments/{experimentId}")
     public ResponseEntity<String> createExperiment(
             @PathVariable String experimentId,
@@ -67,11 +78,16 @@ public class BlindExperimentController {
         Actor actor = requireCoordinator();
         String expId = RequestTokens.requireId("experimentId", experimentId);
         String reqId = RequestTokens.requireRequestId(requestId);
-        String fingerprint = idempotencyService.fingerprint(OP_EXPERIMENT_CREATE,
-                Map.of("experimentId", expId, "blockCount", request.blockCount()));
+        Map<String, Object> params = new HashMap<>();
+        params.put("experimentId", expId);
+        params.put("blockCount", request.blockCount());
+        params.put("mode", request.mode());
+        params.put("washoutMinutes", request.washoutMinutes());
+        String fingerprint = idempotencyService.fingerprint(OP_EXPERIMENT_CREATE, params);
         return idempotencyService.runWrite(reqId, OP_EXPERIMENT_CREATE, fingerprint, actor,
                 () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
-                        experimentService.createExperiment(expId, request.blockCount())));
+                        experimentService.createExperiment(expId, request.blockCount(),
+                                request.mode(), request.washoutMinutes())));
     }
 
     /** 查询实验信息（COORDINATOR / REVIEWER 均可）。 */
@@ -140,6 +156,90 @@ public class BlindExperimentController {
         return experimentService.getAllocation(
                 RequestTokens.requireId("experimentId", experimentId),
                 RequestTokens.requireId("participantId", participantId));
+    }
+
+    // ---------------- 交叉实验阶段 ----------------
+
+    /** 第一阶段开始（仅 COORDINATOR）；响应只含盲码与阶段时刻，不含处理代码。 */
+    @PostMapping("/experiments/{experimentId}/participants/{participantId}/phases/first/start")
+    public ResponseEntity<String> startFirstPhase(
+            @PathVariable String experimentId,
+            @PathVariable String participantId,
+            @RequestBody(required = false) PhaseOperationRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        return runPhaseWrite(OP_PHASE_FIRST_START, experimentId, participantId, request, requestId);
+    }
+
+    /** 第一阶段结束并进入洗脱（仅 COORDINATOR）。 */
+    @PostMapping("/experiments/{experimentId}/participants/{participantId}/phases/first/end")
+    public ResponseEntity<String> endFirstPhase(
+            @PathVariable String experimentId,
+            @PathVariable String participantId,
+            @RequestBody(required = false) PhaseOperationRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        return runPhaseWrite(OP_PHASE_FIRST_END, experimentId, participantId, request, requestId);
+    }
+
+    /** 第二阶段开始（仅 COORDINATOR）；洗脱不足 422。 */
+    @PostMapping("/experiments/{experimentId}/participants/{participantId}/phases/second/start")
+    public ResponseEntity<String> startSecondPhase(
+            @PathVariable String experimentId,
+            @PathVariable String participantId,
+            @RequestBody(required = false) PhaseOperationRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        return runPhaseWrite(OP_PHASE_SECOND_START, experimentId, participantId, request, requestId);
+    }
+
+    /** 第二阶段结束并完成（仅 COORDINATOR）。 */
+    @PostMapping("/experiments/{experimentId}/participants/{participantId}/phases/second/end")
+    public ResponseEntity<String> endSecondPhase(
+            @PathVariable String experimentId,
+            @PathVariable String participantId,
+            @RequestBody(required = false) PhaseOperationRequest request,
+            @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
+        return runPhaseWrite(OP_PHASE_SECOND_END, experimentId, participantId, request, requestId);
+    }
+
+    /** 阶段状态与历史查询（两种角色均可）：只含盲码、状态与时刻，不含处理代码。 */
+    @GetMapping("/experiments/{experimentId}/participants/{participantId}/phases")
+    public PhaseView getPhases(@PathVariable String experimentId,
+                               @PathVariable String participantId) {
+        requireActor();
+        return phaseService.getPhases(
+                RequestTokens.requireId("experimentId", experimentId),
+                RequestTokens.requireId("participantId", participantId));
+    }
+
+    /**
+     * 阶段写操作公共编排：权限校验先于幂等回放；幂等身份含操作、操作者、资源与
+     * 全部参数（含期望版本）；同键同参重放首次完整响应（最初阶段与时刻），异参 409。
+     */
+    private ResponseEntity<String> runPhaseWrite(String operation, String experimentId,
+                                                 String participantId,
+                                                 PhaseOperationRequest request, String requestId) {
+        Actor actor = requireCoordinator();
+        String expId = RequestTokens.requireId("experimentId", experimentId);
+        String pid = RequestTokens.requireId("participantId", participantId);
+        String reqId = RequestTokens.requireRequestId(requestId);
+        Long expectedVersion = request == null ? null : request.expectedVersion();
+        Map<String, Object> params = new HashMap<>();
+        params.put("experimentId", expId);
+        params.put("participantId", pid);
+        params.put("expectedVersion", expectedVersion);
+        String fingerprint = idempotencyService.fingerprint(operation, params);
+        return idempotencyService.runWrite(reqId, operation, fingerprint, actor,
+                () -> IdempotencyService.WriteOutcome.of(HttpStatus.OK.value(),
+                        switch (operation) {
+                            case OP_PHASE_FIRST_START ->
+                                    phaseService.startFirst(expId, pid, expectedVersion);
+                            case OP_PHASE_FIRST_END ->
+                                    phaseService.endFirst(expId, pid, expectedVersion);
+                            case OP_PHASE_SECOND_START ->
+                                    phaseService.startSecond(expId, pid, expectedVersion);
+                            case OP_PHASE_SECOND_END ->
+                                    phaseService.endSecond(expId, pid, expectedVersion);
+                            default -> throw new IllegalStateException("未知阶段操作: " + operation);
+                        }));
     }
 
     // ---------------- 揭盲 ----------------

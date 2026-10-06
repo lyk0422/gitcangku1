@@ -44,8 +44,18 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.CONFLICT, message);
     }
 
+    /** 410 资源永久不可用：参与者已退组，拒绝新阶段操作。 */
+    public static ApiException gone(String message) {
+        return new ApiException(HttpStatus.GONE, message);
+    }
+
     /** 422 业务不可处理：实验满额，无空位可分配。 */
     public static ApiException full(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message);
+    }
+
+    /** 422 业务不可处理：如洗脱期未满，第二阶段暂不能开始。 */
+    public static ApiException unprocessable(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message);
     }
 }

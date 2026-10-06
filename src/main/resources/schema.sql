@@ -1,18 +1,26 @@
 -- 实验盲法分配表结构；运行于 H2 MySQL 兼容模式，数据仅在 JVM 生命周期内保留。
 
 CREATE TABLE IF NOT EXISTS experiment (
-    id          VARCHAR(64)  NOT NULL,
-    block_count INT          NOT NULL,
-    status      VARCHAR(16)  NOT NULL,
-    created_at  BIGINT       NOT NULL,
+    id              VARCHAR(64)  NOT NULL,
+    block_count     INT          NOT NULL,
+    status          VARCHAR(16)  NOT NULL,
+    mode            VARCHAR(16)  NOT NULL,
+    washout_minutes INT,
+    created_at      BIGINT       NOT NULL,
     CONSTRAINT pk_experiment PRIMARY KEY (id),
     CONSTRAINT ck_experiment_block_count CHECK (block_count BETWEEN 2 AND 8),
-    CONSTRAINT ck_experiment_status CHECK (status IN ('OPEN', 'CLOSED'))
+    CONSTRAINT ck_experiment_status CHECK (status IN ('OPEN', 'CLOSED')),
+    CONSTRAINT ck_experiment_mode CHECK (mode IN ('STANDARD', 'CROSSOVER')),
+    CONSTRAINT ck_experiment_washout CHECK (
+        (mode = 'CROSSOVER' AND washout_minutes BETWEEN 1 AND 120)
+        OR (mode = 'STANDARD' AND washout_minutes IS NULL))
 );
-COMMENT ON TABLE  experiment IS '实验表，experimentId 全局唯一，创建后区组数量与席位内容不可修改';
+COMMENT ON TABLE  experiment IS '实验表，experimentId 全局唯一，创建后区组数量、席位内容与模式不可修改';
 COMMENT ON COLUMN experiment.id IS '实验编号，业务唯一，创建时由请求给定';
 COMMENT ON COLUMN experiment.block_count IS '区组数量，取值2~8，创建时固定，每组固定4个席位';
-COMMENT ON COLUMN experiment.status IS '实验状态：OPEN=开放登记；CLOSED=已关闭，关闭后拒绝新增分配';
+COMMENT ON COLUMN experiment.status IS '实验状态：OPEN=开放登记；CLOSED=已关闭，关闭后拒绝新增分配与新阶段开始';
+COMMENT ON COLUMN experiment.mode IS '实验模式：STANDARD=单阶段（默认）；CROSSOVER=交叉两阶段，创建时固定';
+COMMENT ON COLUMN experiment.washout_minutes IS '交叉实验洗脱时长，单位分钟，取值1~120，创建时固定；STANDARD 模式恒为 NULL';
 COMMENT ON COLUMN experiment.created_at IS '创建时间，Unix 毫秒，UTC';
 
 CREATE TABLE IF NOT EXISTS seat (
@@ -59,6 +67,32 @@ COMMENT ON COLUMN allocation.status IS '分配状态：ASSIGNED=在组；WITHDRA
 COMMENT ON COLUMN allocation.assigned_actor IS '执行登记的操作者编号（X-Actor-Id）';
 COMMENT ON COLUMN allocation.assigned_at IS '分配时间，Unix 毫秒，UTC';
 COMMENT ON COLUMN allocation.withdrawn_at IS '退组时间，Unix 毫秒，UTC；NULL 表示未退组';
+
+CREATE TABLE IF NOT EXISTS phase_state (
+    allocation_id     BIGINT       NOT NULL,
+    experiment_id     VARCHAR(64)  NOT NULL,
+    participant_id    VARCHAR(64)  NOT NULL,
+    status            VARCHAR(16)  NOT NULL,
+    version           INT          NOT NULL,
+    first_started_at  BIGINT,
+    first_ended_at    BIGINT,
+    second_started_at BIGINT,
+    second_ended_at   BIGINT,
+    CONSTRAINT pk_phase_state PRIMARY KEY (allocation_id),
+    CONSTRAINT uq_phase_state_participant UNIQUE (experiment_id, participant_id),
+    CONSTRAINT ck_phase_state_status CHECK (status IN
+        ('NOT_STARTED', 'FIRST_RUNNING', 'WASHOUT', 'SECOND_RUNNING', 'DONE'))
+);
+COMMENT ON TABLE  phase_state IS '交叉实验阶段状态表；每个分配一行，随登记创建；阶段操作、退组、关闭经实验行锁共同串行裁决';
+COMMENT ON COLUMN phase_state.allocation_id IS '对应分配主键，一对一';
+COMMENT ON COLUMN phase_state.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN phase_state.participant_id IS '合成参与者编号，非真实医疗数据';
+COMMENT ON COLUMN phase_state.status IS '阶段状态：NOT_STARTED=未开始；FIRST_RUNNING=第一阶段进行中；WASHOUT=洗脱中；SECOND_RUNNING=第二阶段进行中；DONE=两阶段完成';
+COMMENT ON COLUMN phase_state.version IS '乐观版本号，从0开始，每次阶段迁移加1；写操作可携带 expectedVersion 校验';
+COMMENT ON COLUMN phase_state.first_started_at IS '第一阶段开始时间，Unix 毫秒，UTC；NULL 表示未开始';
+COMMENT ON COLUMN phase_state.first_ended_at IS '第一阶段结束时间（洗脱起点），Unix 毫秒，UTC；NULL 表示未结束';
+COMMENT ON COLUMN phase_state.second_started_at IS '第二阶段开始时间，Unix 毫秒，UTC；须不早于 first_ended_at + 洗脱时长；NULL 表示未开始';
+COMMENT ON COLUMN phase_state.second_ended_at IS '第二阶段结束时间，Unix 毫秒，UTC；NULL 表示未结束';
 
 CREATE TABLE IF NOT EXISTS unblind_request (
     id                      VARCHAR(64)  NOT NULL,

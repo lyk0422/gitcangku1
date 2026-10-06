@@ -2,6 +2,7 @@ package com.example.starter.blind.service;
 
 import com.example.starter.blind.ApiException;
 import com.example.starter.blind.Clock;
+import com.example.starter.blind.PhaseStatus;
 import com.example.starter.blind.dto.AllocationView;
 import com.example.starter.blind.dto.ExperimentView;
 import com.example.starter.blind.repo.AllocationRepository;
@@ -10,6 +11,8 @@ import com.example.starter.blind.repo.AllocationRepository.VacantSeat;
 import com.example.starter.blind.repo.ExperimentRepository;
 import com.example.starter.blind.repo.ExperimentRepository.ExperimentRow;
 import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
+import com.example.starter.blind.repo.PhaseStateRepository;
+import com.example.starter.blind.repo.PhaseStateRepository.PhaseStateRow;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -21,42 +24,64 @@ import java.util.List;
  * 实验与分配核心业务：
  * 创建实验时固定区组与每区组两 A 两 B 的席位内容；分配按区组、席位顺序领取第一个空位；
  * 退组保留席位不重排；关闭后拒绝新增分配。普通视图不含席位号与处理代码。
+ * 交叉（CROSSOVER）模式在创建时固定 1~120 分钟洗脱时长，登记时为参与者建立阶段状态行。
  */
 @Service
 public class ExperimentService {
 
     static final int SEATS_PER_BLOCK = 4;
 
+    /** 单阶段模式（默认）。 */
+    public static final String MODE_STANDARD = "STANDARD";
+    /** 交叉两阶段模式。 */
+    public static final String MODE_CROSSOVER = "CROSSOVER";
+
     private final ExperimentRepository experimentRepository;
     private final AllocationRepository allocationRepository;
+    private final PhaseStateRepository phaseStateRepository;
     private final BlindCodeGenerator blindCodeGenerator;
     private final Clock clock;
 
     public ExperimentService(ExperimentRepository experimentRepository,
                              AllocationRepository allocationRepository,
+                             PhaseStateRepository phaseStateRepository,
                              BlindCodeGenerator blindCodeGenerator,
                              Clock clock) {
         this.experimentRepository = experimentRepository;
         this.allocationRepository = allocationRepository;
+        this.phaseStateRepository = phaseStateRepository;
         this.blindCodeGenerator = blindCodeGenerator;
         this.clock = clock;
     }
 
     /**
      * 创建实验并固定席位：每区组按席位顺序两个 A、两个 B。
-     * 不记录任何处理映射到日志。
+     * 交叉模式必须给定 1~120 分钟洗脱时长；不记录任何处理映射到日志。
      */
     @Transactional
-    public ExperimentView createExperiment(String experimentId, int blockCount) {
+    public ExperimentView createExperiment(String experimentId, int blockCount,
+                                           String mode, Integer washoutMinutes) {
         if (experimentId == null || experimentId.isBlank()) {
             throw ApiException.badRequest("experimentId 不能为空");
+        }
+        String normalizedMode = (mode == null || mode.isBlank()) ? MODE_STANDARD : mode.trim();
+        if (!MODE_STANDARD.equals(normalizedMode) && !MODE_CROSSOVER.equals(normalizedMode)) {
+            throw ApiException.badRequest("mode 仅允许 STANDARD 或 CROSSOVER");
+        }
+        if (MODE_CROSSOVER.equals(normalizedMode)) {
+            if (washoutMinutes == null) {
+                throw ApiException.badRequest("交叉实验必须指定 1~120 分钟的洗脱时长");
+            }
+        } else if (washoutMinutes != null) {
+            throw ApiException.badRequest("非交叉实验不得指定洗脱时长");
         }
         if (experimentRepository.findById(experimentId) != null) {
             throw ApiException.conflict("实验已存在: " + experimentId);
         }
         long now = clock.nowMillis();
         experimentRepository.insertExperiment(
-                new ExperimentRow(experimentId, blockCount, "OPEN", now));
+                new ExperimentRow(experimentId, blockCount, "OPEN", normalizedMode,
+                        MODE_CROSSOVER.equals(normalizedMode) ? washoutMinutes : null, now));
         List<SeatRow> seats = new ArrayList<>(blockCount * SEATS_PER_BLOCK);
         for (int blockNo = 1; blockNo <= blockCount; blockNo++) {
             for (int seatNo = 1; seatNo <= SEATS_PER_BLOCK; seatNo++) {
@@ -67,13 +92,15 @@ public class ExperimentService {
         }
         seats.forEach(experimentRepository::insertSeat);
         return new ExperimentView(experimentId, blockCount, SEATS_PER_BLOCK,
-                blockCount * SEATS_PER_BLOCK, "OPEN", now);
+                blockCount * SEATS_PER_BLOCK, "OPEN", normalizedMode,
+                MODE_CROSSOVER.equals(normalizedMode) ? washoutMinutes : null, now);
     }
 
     public ExperimentView getExperiment(String experimentId) {
         ExperimentRow row = mustFindExperiment(experimentId);
         return new ExperimentView(row.id(), row.blockCount(), SEATS_PER_BLOCK,
-                row.blockCount() * SEATS_PER_BLOCK, row.status(), row.createdAt());
+                row.blockCount() * SEATS_PER_BLOCK, row.status(), row.mode(),
+                row.washoutMinutes(), row.createdAt());
     }
 
     /**
@@ -104,6 +131,11 @@ public class ExperimentService {
         long now = clock.nowMillis();
         AllocationRow inserted = insertWithUniqueBlindCode(experimentId, participantId, actorId,
                 vacant, now);
+        if (MODE_CROSSOVER.equals(experiment.mode())) {
+            // 交叉实验：登记时建立阶段状态行（NOT_STARTED，版本 0），随分配同一事务提交。
+            phaseStateRepository.insert(new PhaseStateRow(inserted.id(), experimentId,
+                    participantId, PhaseStatus.NOT_STARTED.name(), 0, null, null, null, null));
+        }
         return toView(inserted);
     }
 
@@ -134,11 +166,20 @@ public class ExperimentService {
     }
 
     /**
-     * 退组：状态置为 WITHDRAWN 并记录时间；席位不释放、已有分配不重排。
+     * 退组：状态置为 WITHDRAWN 并记录时间；席位不释放、已有分配与两期次序不重排。
+     * 与阶段操作、关闭共用实验行锁串行裁决。
      */
     @Transactional
     public AllocationView withdraw(String experimentId, String participantId) {
-        AllocationRow allocation = mustFindAllocation(experimentId, participantId);
+        ExperimentRow experiment = experimentRepository.lockById(experimentId);
+        if (experiment == null) {
+            throw ApiException.notFound("实验不存在: " + experimentId);
+        }
+        AllocationRow allocation =
+                allocationRepository.findByExperimentAndParticipant(experimentId, participantId);
+        if (allocation == null) {
+            throw ApiException.notFound("参与者尚未在该实验登记");
+        }
         if ("WITHDRAWN".equals(allocation.status())) {
             throw ApiException.conflict("参与者已退组");
         }
@@ -150,6 +191,7 @@ public class ExperimentService {
 
     /**
      * 关闭实验；已关闭再次关闭返回 409。
+     * 关闭仅禁止新增分配与新阶段开始，不自动完成任何进行中的阶段。
      */
     @Transactional
     public ExperimentView close(String experimentId) {
@@ -162,7 +204,8 @@ public class ExperimentService {
         }
         experimentRepository.markClosed(experimentId);
         return new ExperimentView(experiment.id(), experiment.blockCount(), SEATS_PER_BLOCK,
-                experiment.blockCount() * SEATS_PER_BLOCK, "CLOSED", experiment.createdAt());
+                experiment.blockCount() * SEATS_PER_BLOCK, "CLOSED", experiment.mode(),
+                experiment.washoutMinutes(), experiment.createdAt());
     }
 
     /**
