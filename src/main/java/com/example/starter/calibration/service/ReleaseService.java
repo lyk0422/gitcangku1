@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -44,7 +45,10 @@ public class ReleaseService {
 
     /**
      * 原子批量放行。每条结果必须：处于待放行、判定合格、证书仍有效、放行人不同于提交人。
+     * 合格核验使用提交时冻结的精确值、k 与量化值（配置换版不回算旧结果）：
+     * 精确值与量化值（若已量化）均须落在原合格闭区间；越界待审（无冻结精确值）不可放行。
      * 行锁按测量键字典序获取，避免并发批次间死锁；证书行锁使撤销与放行按事务提交顺序生效。
+     * 任一失败整批无放行记录；含越界待审项时整批 422，其余校验失败整批 409。
      */
     @Transactional
     public ReleaseResponse release(List<String> keys, String actor) {
@@ -73,7 +77,10 @@ public class ReleaseService {
             } else if (measurement.status() != MeasurementStatus.PENDING) {
                 reasons.add("NOT_PENDING");
             }
-            if (!measurement.passed()) {
+            if (measurement.computedValue() == null) {
+                // 越界待审：无冻结精确值，不可放行
+                reasons.add("OUT_OF_RANGE");
+            } else if (!frozenValuesInInterval(measurement)) {
                 reasons.add("NOT_PASSED");
             }
             Certificate cert = certificates.findByIdForUpdate(measurement.certificateId())
@@ -93,7 +100,10 @@ public class ReleaseService {
         }
 
         if (!failures.isEmpty()) {
-            throw new BatchRejectedException(failures);
+            boolean outOfRange = failures.stream()
+                    .anyMatch(f -> f.reasons().contains("OUT_OF_RANGE"));
+            throw new BatchRejectedException(failures,
+                    outOfRange ? HttpStatus.UNPROCESSABLE_ENTITY : HttpStatus.CONFLICT);
         }
 
         String batchId = UUID.randomUUID().toString();
@@ -103,5 +113,22 @@ public class ReleaseService {
             releases.insert(batchId, measurement.id(), releaser, releasedAt);
         }
         return new ReleaseResponse(batchId, releaser, releasedAt, orderedKeys);
+    }
+
+    /**
+     * 用提交时冻结的值复核合格性：精确值落在原合格闭区间；若已量化（冻结了 k 与量化值），
+     * 量化值也须落在同一闭区间。配置换版不影响本复核，因为只读取测量上冻结的值。
+     */
+    private static boolean frozenValuesInInterval(Measurement measurement) {
+        boolean exactIn = measurement.computedValue().compareTo(measurement.lowerLimit()) >= 0
+                && measurement.computedValue().compareTo(measurement.upperLimit()) <= 0;
+        if (!exactIn) {
+            return false;
+        }
+        if (measurement.quantizedValue() == null) {
+            return true;
+        }
+        return measurement.quantizedValue().compareTo(measurement.lowerLimit()) >= 0
+                && measurement.quantizedValue().compareTo(measurement.upperLimit()) <= 0;
     }
 }

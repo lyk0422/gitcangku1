@@ -2,6 +2,7 @@ package com.example.starter.calibration.repo;
 
 import java.sql.PreparedStatement;
 import java.sql.Statement;
+import java.sql.Types;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
@@ -17,6 +18,7 @@ import com.example.starter.calibration.model.MeasurementStatus;
 
 /**
  * 测量记录持久化。measurement_key 全局唯一作为幂等键；状态流转由放行事务在行锁内完成。
+ * 已配置分辨率的仪器在提交时冻结配置版本、格点整数 k 与量化值，后续配置换版不回算。
  */
 @Repository
 public class MeasurementRepository {
@@ -32,6 +34,9 @@ public class MeasurementRepository {
             rs.getString("submitted_by"),
             rs.getLong("certificate_id"),
             rs.getBigDecimal("computed_value"),
+            rs.getObject("resolution_version", Integer.class),
+            rs.getBigDecimal("grid_k"),
+            rs.getBigDecimal("quantized_value"),
             rs.getBoolean("passed"),
             MeasurementStatus.valueOf(rs.getString("status")),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
@@ -51,8 +56,9 @@ public class MeasurementRepository {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO measurement "
                             + "(measurement_key, instrument_id, measured_at, raw_reading, lower_limit, upper_limit, "
-                            + "submitted_by, certificate_id, computed_value, passed, status, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            + "submitted_by, certificate_id, computed_value, resolution_version, grid_k, "
+                            + "quantized_value, passed, status, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, measurement.measurementKey());
             ps.setString(2, measurement.instrumentId());
@@ -63,9 +69,16 @@ public class MeasurementRepository {
             ps.setString(7, measurement.submittedBy());
             ps.setLong(8, measurement.certificateId());
             ps.setBigDecimal(9, measurement.computedValue());
-            ps.setBoolean(10, measurement.passed());
-            ps.setString(11, measurement.status().name());
-            ps.setObject(12, JdbcTimes.toDb(measurement.createdAt()));
+            if (measurement.resolutionVersion() == null) {
+                ps.setNull(10, Types.INTEGER);
+            } else {
+                ps.setInt(10, measurement.resolutionVersion());
+            }
+            ps.setBigDecimal(11, measurement.gridK());
+            ps.setBigDecimal(12, measurement.quantizedValue());
+            ps.setBoolean(13, measurement.passed());
+            ps.setString(14, measurement.status().name());
+            ps.setObject(15, JdbcTimes.toDb(measurement.createdAt()));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

@@ -6,10 +6,12 @@ import java.util.List;
 import com.example.starter.calibration.api.dto.CertificateResponse;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRecordResponse;
+import com.example.starter.calibration.api.dto.ResolutionConfigResponse;
 import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.model.ReleaseRecord;
+import com.example.starter.calibration.model.ResolutionConfig;
 
 /**
  * 领域模型到响应 DTO 的映射。
@@ -19,8 +21,11 @@ final class DtoMapper {
     private DtoMapper() {
     }
 
-    /** 十进制输出：去掉多余尾零，零统一输出 "0"。 */
+    /** 十进制输出：去掉多余尾零，零统一输出 "0"；null 原样返回（越界待审/未量化场景）。 */
     static String format(BigDecimal value) {
+        if (value == null) {
+            return null;
+        }
         BigDecimal stripped = value.stripTrailingZeros();
         if (stripped.compareTo(BigDecimal.ZERO) == 0) {
             return "0";
@@ -41,9 +46,20 @@ final class DtoMapper {
                 cert.createdAt());
     }
 
+    static ResolutionConfigResponse toResponse(ResolutionConfig config) {
+        return new ResolutionConfigResponse(
+                config.instrumentId(),
+                format(config.step()),
+                format(config.origin()),
+                config.version(),
+                config.updatedBy(),
+                config.updatedAt());
+    }
+
     static MeasurementResponse toResponse(Measurement m, boolean certificateRevoked,
                                           List<ReleaseRecord> releases) {
         boolean usable = m.status() == MeasurementStatus.RELEASED && !certificateRevoked;
+        BigDecimal display = m.displayValue();
         return new MeasurementResponse(
                 m.id(),
                 m.measurementKey(),
@@ -55,7 +71,10 @@ final class DtoMapper {
                 m.submittedBy(),
                 m.certificateId(),
                 format(m.computedValue()),
-                m.displayValue().toPlainString(),
+                display == null ? null : display.toPlainString(),
+                format(m.quantizedValue()),
+                format(m.gridK()),
+                m.resolutionVersion(),
                 m.passed(),
                 m.status().name(),
                 usable,
