@@ -200,4 +200,13 @@ public class IncidentTaskRepository {
         }
         return false;
     }
+
+    /**
+     * 按主键查询任务，用于分支组成员装载。
+     */
+    public Optional<IncidentTask> findById(long id) {
+        List<IncidentTask> rows = jdbc.query("SELECT * FROM incident_tasks WHERE id = ?",
+                TASK_MAPPER, id);
+        return rows.stream().findFirst();
+    }
 }

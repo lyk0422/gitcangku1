@@ -100,3 +100,27 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS incident_task_branch_groups (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    group_key VARCHAR(128) NOT NULL COMMENT '分支组业务键，事件内唯一',
+    status VARCHAR(16) NOT NULL COMMENT '状态：OPEN 待选择 / CHOSEN 已选择；仅允许 OPEN→CHOSEN，CHOSEN 为终态',
+    version BIGINT NOT NULL COMMENT '组版本，初始 1；选择成功加一，用于乐观并发裁决，旧版本请求拒绝',
+    chosen_task_id BIGINT NULL COMMENT '选中成员任务 id，关联 incident_tasks.id；仅 CHOSEN 有值，否则为空',
+    created_by VARCHAR(128) NOT NULL COMMENT '创建人（创建时的当前指挥人）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    chosen_by VARCHAR(128) NULL COMMENT '选择操作人（操作时的当前指挥人）；仅 CHOSEN 有值，否则为空',
+    chosen_at TIMESTAMP(6) NULL COMMENT '选择 UTC 时间；仅 CHOSEN 有值，否则为空',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_branch_group_key UNIQUE (incident_id, group_key)
+) COMMENT='互斥处置分支组表（同事件 2~5 个 OPEN 任务的互斥选择集合）';
+
+CREATE TABLE IF NOT EXISTS incident_task_branch_members (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    group_id BIGINT NOT NULL COMMENT '所属分支组 id，关联 incident_task_branch_groups.id',
+    task_id BIGINT NOT NULL COMMENT '成员任务 id，关联 incident_tasks.id；每任务至多属于一个分支组',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '加入 UTC 时间',
+    CONSTRAINT uk_branch_member_task UNIQUE (task_id),
+    CONSTRAINT uk_branch_member_group UNIQUE (group_id, task_id)
+) COMMENT='互斥分支组成员表（建组后全集冻结，不可增删）';
