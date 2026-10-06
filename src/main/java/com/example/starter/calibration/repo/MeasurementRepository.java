@@ -34,6 +34,8 @@ public class MeasurementRepository {
             rs.getBigDecimal("computed_value"),
             rs.getBoolean("passed"),
             MeasurementStatus.valueOf(rs.getString("status")),
+            rs.getObject("session_id", Long.class),
+            rs.getString("direction"),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
 
     private final JdbcTemplate jdbc;
@@ -51,8 +53,9 @@ public class MeasurementRepository {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO measurement "
                             + "(measurement_key, instrument_id, measured_at, raw_reading, lower_limit, upper_limit, "
-                            + "submitted_by, certificate_id, computed_value, passed, status, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            + "submitted_by, certificate_id, computed_value, passed, status, session_id, direction, "
+                            + "created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, measurement.measurementKey());
             ps.setString(2, measurement.instrumentId());
@@ -65,7 +68,13 @@ public class MeasurementRepository {
             ps.setBigDecimal(9, measurement.computedValue());
             ps.setBoolean(10, measurement.passed());
             ps.setString(11, measurement.status().name());
-            ps.setObject(12, JdbcTimes.toDb(measurement.createdAt()));
+            if (measurement.sessionId() == null) {
+                ps.setObject(12, null);
+            } else {
+                ps.setLong(12, measurement.sessionId());
+            }
+            ps.setString(13, measurement.direction());
+            ps.setObject(14, JdbcTimes.toDb(measurement.createdAt()));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -93,6 +102,13 @@ public class MeasurementRepository {
     public void markReleased(long id) {
         jdbc.update("UPDATE measurement SET status = ? WHERE id = ?",
                 MeasurementStatus.RELEASED.name(), id);
+    }
+
+    /**
+     * 查询某会话的全部成员测量（按 ID 升序，即追加顺序）。
+     */
+    public List<Measurement> findBySessionId(long sessionId) {
+        return jdbc.query("SELECT * FROM measurement WHERE session_id = ? ORDER BY id", MAPPER, sessionId);
     }
 
     /**

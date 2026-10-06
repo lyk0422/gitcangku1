@@ -44,4 +44,21 @@ final class Inputs {
             throw ApiException.badRequest(field + " 必须为带时区的 ISO-8601 时间");
         }
     }
+
+    /** 幂等请求 ID：非空且不超过 64 字符。 */
+    static String requireRequestId(String value) {
+        String id = requireText(value, "requestId");
+        if (id.length() > 64) {
+            throw ApiException.badRequest("requestId 长度不能超过 64");
+        }
+        return id;
+    }
+
+    /** 期望会话版本：必填非负整数。 */
+    static long requireVersion(Long value, String field) {
+        if (value == null || value < 0) {
+            throw ApiException.badRequest(field + " 必须为非负整数");
+        }
+        return value;
+    }
 }

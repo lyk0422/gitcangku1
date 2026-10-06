@@ -11,10 +11,11 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.calibration.api.dto.CertificateResponse;
 import com.example.starter.calibration.api.dto.CreateCertificateRequest;
+import com.example.starter.calibration.api.dto.CreateHysteresisCertificateRequest;
 import com.example.starter.calibration.service.CertificateService;
 
 /**
- * 校准证书接口：创建、撤销、查询。
+ * 校准证书接口：创建（线性/迟滞）、撤销、查询。
  */
 @RestController
 @RequestMapping("/api/certificates")
@@ -27,11 +28,20 @@ public class CertificateController {
     }
 
     /**
-     * 创建证书：201；参数非法 400；区间重叠 409。
+     * 创建线性证书：201；参数非法 400；区间重叠 409。
      */
     @PostMapping
     public ResponseEntity<CertificateResponse> create(@RequestBody CreateCertificateRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(certificates.create(request));
+    }
+
+    /**
+     * 创建迟滞证书（斜率+上升/下降偏移，requestId 幂等）：201；参数非法 400；区间重叠或异参冲突 409。
+     */
+    @PostMapping("/hysteresis")
+    public ResponseEntity<CertificateResponse> createHysteresis(
+            @RequestBody CreateHysteresisCertificateRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(certificates.createHysteresis(request));
     }
 
     /**

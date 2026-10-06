@@ -13,6 +13,7 @@ import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
+import com.example.starter.calibration.model.CertType;
 import com.example.starter.calibration.model.Certificate;
 
 /**
@@ -27,8 +28,12 @@ public class CertificateRepository {
             rs.getString("instrument_id"),
             JdbcTimes.fromDb(rs.getObject("valid_from", LocalDateTime.class)),
             JdbcTimes.fromDb(rs.getObject("valid_to", LocalDateTime.class)),
+            CertType.valueOf(rs.getString("cert_type")),
             rs.getBigDecimal("coeff_a"),
             rs.getBigDecimal("offset_b"),
+            rs.getBigDecimal("slope"),
+            rs.getBigDecimal("up_offset"),
+            rs.getBigDecimal("down_offset"),
             rs.getBoolean("revoked"),
             JdbcTimes.fromDb(rs.getObject("revoked_at", LocalDateTime.class)),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
@@ -54,7 +59,7 @@ public class CertificateRepository {
     }
 
     /**
-     * 插入证书并返回生成的证书 ID。
+     * 插入线性证书并返回生成的证书 ID。
      */
     public long insert(String instrumentId, Instant validFrom, Instant validTo,
                        java.math.BigDecimal a, java.math.BigDecimal b, Instant createdAt) {
@@ -62,8 +67,8 @@ public class CertificateRepository {
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO calibration_certificate "
-                            + "(instrument_id, valid_from, valid_to, coeff_a, offset_b, revoked, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, FALSE, ?)",
+                            + "(instrument_id, valid_from, valid_to, cert_type, coeff_a, offset_b, revoked, created_at) "
+                            + "VALUES (?, ?, ?, 'LINEAR', ?, ?, FALSE, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, instrumentId);
             ps.setObject(2, JdbcTimes.toDb(validFrom));
@@ -71,6 +76,32 @@ public class CertificateRepository {
             ps.setBigDecimal(4, a);
             ps.setBigDecimal(5, b);
             ps.setObject(6, JdbcTimes.toDb(createdAt));
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
+    /**
+     * 插入迟滞证书（斜率+上升/下降偏移）并返回生成的证书 ID。
+     */
+    public long insertHysteresis(String instrumentId, Instant validFrom, Instant validTo,
+                                 java.math.BigDecimal slope, java.math.BigDecimal upOffset,
+                                 java.math.BigDecimal downOffset, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO calibration_certificate "
+                            + "(instrument_id, valid_from, valid_to, cert_type, slope, up_offset, down_offset, "
+                            + "revoked, created_at) "
+                            + "VALUES (?, ?, ?, 'HYSTERESIS', ?, ?, ?, FALSE, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, instrumentId);
+            ps.setObject(2, JdbcTimes.toDb(validFrom));
+            ps.setObject(3, JdbcTimes.toDb(validTo));
+            ps.setBigDecimal(4, slope);
+            ps.setBigDecimal(5, upOffset);
+            ps.setBigDecimal(6, downOffset);
+            ps.setObject(7, JdbcTimes.toDb(createdAt));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -104,12 +135,14 @@ public class CertificateRepository {
     }
 
     /**
-     * 按测量时刻匹配唯一有效证书：未撤销且 valid_from &lt;= measuredAt &lt; valid_to。
+     * 按测量时刻匹配唯一有效线性证书：未撤销、LINEAR 类型且 valid_from &lt;= measuredAt &lt; valid_to。
+     * 迟滞证书不走单测量提交，不参与匹配。
      */
     public Optional<Certificate> findMatching(String instrumentId, Instant measuredAt) {
         return jdbc.query(
                 "SELECT * FROM calibration_certificate "
-                        + "WHERE instrument_id = ? AND revoked = FALSE AND valid_from <= ? AND valid_to > ?",
+                        + "WHERE instrument_id = ? AND revoked = FALSE AND cert_type = 'LINEAR' "
+                        + "AND valid_from <= ? AND valid_to > ?",
                 MAPPER, instrumentId, JdbcTimes.toDb(measuredAt), JdbcTimes.toDb(measuredAt))
                 .stream().findFirst();
     }
