@@ -14,6 +14,8 @@ import java.util.List;
  * @param checkpointCount         赛事配置的检查点总数；未配置检查点的赛事为 0
  * @param coveredCheckpointCount  该选手已有分段记录的检查点数量
  * @param missingCheckpoints      该选手尚未通过的检查点代码，按检查点顺序排列；全部覆盖或无检查点时为空列表
+ * @param segmentMillisDesc       COUNTBACK 模式排名条目的倒序分段耗时向量（毫秒，末段在前）；
+ *                                非 COUNTBACK 模式或未排名条目为空列表
  */
 public record ResultEntry(
         String bib,
@@ -24,10 +26,11 @@ public record ResultEntry(
         Long totalTimeMs,
         int checkpointCount,
         int coveredCheckpointCount,
-        List<String> missingCheckpoints
+        List<String> missingCheckpoints,
+        List<Long> segmentMillisDesc
 ) {
 
-    /** 未配置检查点赛事使用的兼容构造器：检查点计数均为 0、缺失列表为空。 */
+    /** 未配置检查点赛事使用的兼容构造器：检查点计数均为 0、缺失列表与段向量均为空。 */
     public ResultEntry(
             String bib,
             Integer rank,
@@ -35,6 +38,21 @@ public record ResultEntry(
             Long finishTimeMs,
             long penaltyMs,
             Long totalTimeMs) {
-        this(bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, 0, 0, List.of());
+        this(bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, 0, 0, List.of(), List.of());
+    }
+
+    /** 不带段向量的兼容构造器：段向量为空列表。 */
+    public ResultEntry(
+            String bib,
+            Integer rank,
+            EntryStatus status,
+            Long finishTimeMs,
+            long penaltyMs,
+            Long totalTimeMs,
+            int checkpointCount,
+            int coveredCheckpointCount,
+            List<String> missingCheckpoints) {
+        this(bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs, checkpointCount,
+                coveredCheckpointCount, missingCheckpoints, List.of());
     }
 }

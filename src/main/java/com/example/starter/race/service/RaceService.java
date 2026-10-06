@@ -1,6 +1,7 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.ChangeRankingModeRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
@@ -47,6 +48,13 @@ public interface RaceService {
 
     /** 封榜：校验版本并原子保存只读成绩快照（含每名选手分段明细与缺失检查点）。 */
     ServiceResult sealRace(String raceId, SealRaceRequest request);
+
+    /**
+     * 变更排名模式（TOTAL_TIME / COUNTBACK）；仅 OPEN 且尚无计时数据
+     * （无分段记录且无已计时选手）时可变更，版本不匹配或已封榜返回409，
+     * 成功后版本加一。
+     */
+    ServiceResult changeRankingMode(String raceId, ChangeRankingModeRequest request);
 
     /** 查询即时成绩（OPEN 实时计算；SEALED 返回封榜快照）。 */
     StandingResponse getResults(String raceId);

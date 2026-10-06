@@ -1,6 +1,7 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.ChangeRankingModeRequest;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
@@ -18,6 +19,7 @@ import com.example.starter.race.api.SubmitTimingRequest;
 import com.example.starter.race.domain.CheckpointRules;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.RankingMode;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
@@ -85,17 +87,46 @@ public class RaceServiceImpl implements RaceService {
     @Transactional
     public ServiceResult createRace(CreateRaceRequest request) {
         return withIdempotency(request.requestId(), "CREATE_RACE",
-                orderedParams("raceId", request.raceId()),
+                orderedParams(
+                        "raceId", request.raceId(),
+                        "rankingMode", request.rankingMode()),
                 () -> {
+                    RankingMode rankingMode = parseRankingMode(request.rankingMode());
                     long now = clock.millis();
                     try {
-                        repository.insertRace(request.raceId(), now);
+                        repository.insertRace(request.raceId(), rankingMode, now);
                     } catch (DuplicateKeyException ex) {
                         throw new ConflictException("赛事已存在: " + request.raceId());
                     }
                     RaceRow race = repository.findRace(request.raceId()).orElseThrow();
                     return ServiceResult.created(new RaceResponse(
-                            race.raceId(), race.version(), race.status(), race.createdAt()));
+                            race.raceId(), race.version(), race.status(),
+                            race.rankingMode(), race.createdAt()));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult changeRankingMode(String raceId, ChangeRankingModeRequest request) {
+        return withIdempotency(request.requestId(), "CHANGE_RANKING_MODE",
+                orderedParams(
+                        "raceId", raceId,
+                        "rankingMode", request.rankingMode(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    RankingMode rankingMode = parseRankingMode(request.rankingMode());
+                    // 已有任何计时数据（分段记录或已计时选手）后禁止变更，避免排名语义被追溯改写。
+                    if (repository.countTimings(raceId) > 0
+                            || repository.countTimedRunners(raceId) > 0) {
+                        throw new ConflictException("赛事已存在计时数据，禁止变更排名模式: " + raceId);
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    repository.updateRankingMode(raceId, rankingMode);
+                    RaceRow refreshed = repository.findRace(raceId).orElseThrow();
+                    return ServiceResult.ok(new RaceResponse(
+                            refreshed.raceId(), refreshed.version(), refreshed.status(),
+                            refreshed.rankingMode(), refreshed.createdAt()));
                 });
     }
 
@@ -359,8 +390,8 @@ public class RaceServiceImpl implements RaceService {
                     List<PenaltyRow> penalties = repository.findPenalties(raceId);
                     List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
                     List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
-                    List<ResultEntry> entries =
-                            ResultCalculator.compute(runners, penalties, checkpoints, timings);
+                    List<ResultEntry> entries = ResultCalculator.compute(
+                            runners, penalties, checkpoints, timings, race.rankingMode());
 
                     int newVersion = request.expectedVersion() + 1;
                     int updated = repository.sealIfOpenAtVersion(
@@ -383,15 +414,16 @@ public class RaceServiceImpl implements RaceService {
                                 order,
                                 entry.checkpointCount(),
                                 entry.coveredCheckpointCount(),
-                                entry.missingCheckpoints()));
+                                entry.missingCheckpoints(),
+                                entry.segmentMillisDesc()));
                     }
                     // 在同一封榜事务内固化每名选手 × 每个检查点的明细，缺失行耗时为 null。
                     List<SnapshotCheckpointRow> snapshotCheckpoints =
                             buildSnapshotCheckpoints(raceId, runners, checkpoints, timings);
-                    repository.insertSnapshot(new SnapshotRow(raceId, newVersion, now,
-                            snapshotEntries, snapshotCheckpoints));
+                    repository.insertSnapshot(new SnapshotRow(raceId, newVersion,
+                            race.rankingMode(), now, snapshotEntries, snapshotCheckpoints));
                     return ServiceResult.ok(new StandingResponse(
-                            raceId, newVersion, RaceStatus.SEALED, now,
+                            raceId, newVersion, RaceStatus.SEALED, race.rankingMode(), now,
                             snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
                 });
     }
@@ -595,6 +627,18 @@ public class RaceServiceImpl implements RaceService {
             return PenaltyType.valueOf(type);
         } catch (IllegalArgumentException ex) {
             throw new BadRequestException("未知处罚类型: " + type);
+        }
+    }
+
+    /** 解析排名模式；null 表示缺省 TOTAL_TIME，非法值返回400。 */
+    private static RankingMode parseRankingMode(String rankingMode) {
+        if (rankingMode == null) {
+            return RankingMode.TOTAL_TIME;
+        }
+        try {
+            return RankingMode.valueOf(rankingMode);
+        } catch (IllegalArgumentException ex) {
+            throw new BadRequestException("未知排名模式: " + rankingMode);
         }
     }
 

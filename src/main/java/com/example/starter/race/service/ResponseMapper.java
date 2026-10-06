@@ -53,11 +53,12 @@ final class ResponseMapper {
             List<CheckpointRow> checkpoints,
             List<CheckpointTimingRow> timings) {
         List<ResultEntry> entries = ResultCalculator.compute(
-                runners, penalties, checkpoints, timings);
+                runners, penalties, checkpoints, timings, race.rankingMode());
         return new StandingResponse(
                 race.raceId(),
                 race.version(),
                 race.status(),
+                race.rankingMode(),
                 null,
                 entries.stream().map(ResponseMapper::toEntryResponse).toList());
     }
@@ -67,6 +68,7 @@ final class ResponseMapper {
                 snapshot.raceId(),
                 snapshot.version(),
                 RaceStatus.SEALED,
+                snapshot.rankingMode(),
                 snapshot.sealedAt(),
                 snapshot.entries().stream().map(ResponseMapper::toEntryResponse).toList());
     }
@@ -81,7 +83,8 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                nullIfEmpty(entry.segmentMillisDesc()));
     }
 
     static ResultEntryResponse toEntryResponse(SnapshotEntryRow entry) {
@@ -94,7 +97,14 @@ final class ResponseMapper {
                 entry.totalTimeMs(),
                 entry.checkpointCount(),
                 entry.coveredCheckpointCount(),
-                entry.missingCheckpoints());
+                entry.missingCheckpoints(),
+                nullIfEmpty(entry.segmentMillisDesc()));
+    }
+
+    /** 空段向量映射为 null，使非 COUNTBACK 条目的响应不含该字段。 */
+    private static List<Long> nullIfEmpty(List<Long> segmentMillisDesc) {
+        return segmentMillisDesc == null || segmentMillisDesc.isEmpty()
+                ? null : segmentMillisDesc;
     }
 
     /**

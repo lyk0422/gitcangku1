@@ -87,6 +87,14 @@ public class RaceController {
         return toResponse(raceService.sealRace(raceId, request));
     }
 
+    /** 变更排名模式（仅尚无计时数据的 OPEN 赛事）。 */
+    @PostMapping("/{raceId}/ranking-mode")
+    public ResponseEntity<Object> changeRankingMode(
+            @PathVariable String raceId,
+            @Valid @RequestBody ChangeRankingModeRequest request) {
+        return toResponse(raceService.changeRankingMode(raceId, request));
+    }
+
     /** 查询即时成绩（封榜后返回只读快照内容）。 */
     @GetMapping("/{raceId}/results")
     public StandingResponse getResults(@PathVariable String raceId) {

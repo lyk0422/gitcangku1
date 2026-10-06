@@ -3,6 +3,7 @@ package com.example.starter.race.persistence;
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.RankingMode;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -40,7 +41,8 @@ public class RaceRepository {
     /** 按ID查询赛事。 */
     public Optional<RaceRow> findRace(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ?",
+                .query("SELECT race_id, version, status, ranking_mode, created_at "
+                                + "FROM race WHERE race_id = ?",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -53,7 +55,8 @@ public class RaceRepository {
      */
     public Optional<RaceRow> findRaceForUpdate(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ? FOR UPDATE",
+                .query("SELECT race_id, version, status, ranking_mode, created_at "
+                                + "FROM race WHERE race_id = ? FOR UPDATE",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -121,6 +124,14 @@ public class RaceRepository {
         return count == null ? 0 : count;
     }
 
+    /** 统计赛事下已有原始完赛耗时的选手数（用于“尚无计时数据时才可变更排名模式”）。 */
+    public int countTimedRunners(String raceId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM runner WHERE race_id = ? AND finish_time_ms IS NOT NULL",
+                Integer.class, raceId);
+        return count == null ? 0 : count;
+    }
+
     /** 查询某选手的全部分段记录，按 position 升序排列。 */
     public List<CheckpointTimingRow> findTimingsForRunner(String raceId, String bib) {
         return jdbcTemplate.query(
@@ -175,11 +186,13 @@ public class RaceRepository {
     /** 查询封榜快照（含全部条目与分段明细）；未封榜返回 empty。 */
     public Optional<SnapshotRow> findSnapshot(String raceId) {
         List<SnapshotRow> headers = jdbcTemplate.query(
-                "SELECT race_id, version, sealed_at FROM result_snapshot WHERE race_id = ?",
+                "SELECT race_id, version, ranking_mode, sealed_at FROM result_snapshot WHERE race_id = ?",
                 (rs, rowNum) -> new SnapshotRow(
                         rs.getString("race_id"),
                         rs.getInt("version"),
+                        RankingMode.valueOf(rs.getString("ranking_mode")),
                         rs.getLong("sealed_at"),
+                        List.of(),
                         List.of()),
                 raceId);
         if (headers.isEmpty()) {
@@ -188,7 +201,8 @@ public class RaceRepository {
         SnapshotRow header = headers.getFirst();
         List<SnapshotEntryRow> entryRows = jdbcTemplate.query(
                 "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count "
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "segment_millis_desc "
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
         List<SnapshotCheckpointRow> checkpoints = jdbcTemplate.query(
@@ -210,17 +224,26 @@ public class RaceRepository {
                         entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
                         entry.displayOrder(), entry.checkpointCount(),
                         entry.coveredCheckpointCount(),
-                        missingByBib.getOrDefault(entry.bib(), List.of())))
+                        missingByBib.getOrDefault(entry.bib(), List.of()),
+                        entry.segmentMillisDesc()))
                 .toList();
-        return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.sealedAt(),
-                entries, checkpoints));
+        return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.rankingMode(),
+                header.sealedAt(), entries, checkpoints));
     }
 
-    /** 新建赛事，初始版本1、状态OPEN。 */
-    public void insertRace(String raceId, long now) {
+    /** 新建赛事，初始版本1、状态OPEN、指定排名模式。 */
+    public void insertRace(String raceId, RankingMode rankingMode, long now) {
         jdbcTemplate.update(
-                "INSERT INTO race (race_id, version, status, created_at) VALUES (?, 1, 'OPEN', ?)",
-                raceId, now);
+                "INSERT INTO race (race_id, version, status, ranking_mode, created_at) "
+                        + "VALUES (?, 1, 'OPEN', ?, ?)",
+                raceId, rankingMode.name(), now);
+    }
+
+    /** 变更赛事排名模式（调用方已在同事务内完成版本推进与前置校验）。 */
+    public void updateRankingMode(String raceId, RankingMode rankingMode) {
+        jdbcTemplate.update(
+                "UPDATE race SET ranking_mode = ? WHERE race_id = ?",
+                rankingMode.name(), raceId);
     }
 
     /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
@@ -287,13 +310,16 @@ public class RaceRepository {
     /** 原子写入封榜快照头表、全部条目以及每名选手的分段明细。 */
     public void insertSnapshot(SnapshotRow snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO result_snapshot (race_id, version, sealed_at) VALUES (?, ?, ?)",
-                snapshot.raceId(), snapshot.version(), snapshot.sealedAt());
+                "INSERT INTO result_snapshot (race_id, version, ranking_mode, sealed_at) "
+                        + "VALUES (?, ?, ?, ?)",
+                snapshot.raceId(), snapshot.version(), snapshot.rankingMode().name(),
+                snapshot.sealedAt());
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_entry "
                         + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "segment_millis_desc) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.entries(),
                 snapshot.entries().size(),
                 (ps, entry) -> {
@@ -307,6 +333,7 @@ public class RaceRepository {
                     ps.setInt(8, entry.displayOrder());
                     ps.setInt(9, entry.checkpointCount());
                     ps.setInt(10, entry.coveredCheckpointCount());
+                    ps.setString(11, serializeSegments(entry.segmentMillisDesc()));
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
@@ -388,6 +415,7 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getInt("version"),
                     RaceStatus.valueOf(rs.getString("status")),
+                    RankingMode.valueOf(rs.getString("ranking_mode")),
                     rs.getLong("created_at"));
         }
     }
@@ -435,7 +463,8 @@ public class RaceRepository {
                     rs.getInt("display_order"),
                     rs.getInt("checkpoint_count"),
                     rs.getInt("covered_checkpoint_count"),
-                    List.of());
+                    List.of(),
+                    parseSegments(rs.getString("segment_millis_desc")));
         }
     }
 
@@ -489,5 +518,32 @@ public class RaceRepository {
                     rs.getString("response_body"),
                     rs.getLong("created_at"));
         }
+    }
+
+    /** 倒序段向量序列化为逗号分隔文本；空向量存 NULL。 */
+    private static String serializeSegments(List<Long> segmentMillisDesc) {
+        if (segmentMillisDesc == null || segmentMillisDesc.isEmpty()) {
+            return null;
+        }
+        StringBuilder builder = new StringBuilder();
+        for (Long segment : segmentMillisDesc) {
+            if (builder.length() > 0) {
+                builder.append(',');
+            }
+            builder.append(segment);
+        }
+        return builder.toString();
+    }
+
+    /** 解析逗号分隔的倒序段向量；NULL/空串还原为空列表。 */
+    private static List<Long> parseSegments(String segmentMillisDesc) {
+        if (segmentMillisDesc == null || segmentMillisDesc.isEmpty()) {
+            return List.of();
+        }
+        List<Long> segments = new java.util.ArrayList<>();
+        for (String part : segmentMillisDesc.split(",")) {
+            segments.add(Long.parseLong(part));
+        }
+        return List.copyOf(segments);
     }
 }
