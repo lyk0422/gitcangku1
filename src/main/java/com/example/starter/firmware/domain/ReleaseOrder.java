@@ -15,8 +15,11 @@ package com.example.starter.firmware.domain;
  * @param monitorRound            当前监控轮次，从1开始，人工恢复后加一
  * @param roundSuccess            当前监控轮次内首次进入 SUCCESS 的任务数
  * @param roundFailed             当前监控轮次内首次进入 FAILED 的任务数
+ * @param releaseType             发布类型：GRAY 灰度逐个投放，TOPOLOGY 拓扑波次投放
+ * @param topologyVersion         拓扑版本，仅 TOPOLOGY 类型有值，发布后图冻结不可改；GRAY 为 null
  */
 public record ReleaseOrder(long id, int version, String model, String fromVersion, String toVersion,
                            int ratio, ReleaseStatus status, int sampleFloor, int failureThresholdPercent,
-                           int monitorRound, int roundSuccess, int roundFailed) {
+                           int monitorRound, int roundSuccess, int roundFailed,
+                           ReleaseType releaseType, Integer topologyVersion) {
 }

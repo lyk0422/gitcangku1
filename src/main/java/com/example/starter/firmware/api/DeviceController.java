@@ -39,4 +39,9 @@ public class DeviceController {
     public PullResponse pull(@PathVariable String deviceId, @Valid @RequestBody RequestIdBody request) {
         return taskService.pull(deviceId, request.requestId());
     }
+
+    @PostMapping("/{deviceId}/recover")
+    public DeviceView recover(@PathVariable String deviceId, @Valid @RequestBody RecoverDeviceRequest request) {
+        return deviceService.recover(deviceId, request);
+    }
 }

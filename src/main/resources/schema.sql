@@ -5,6 +5,8 @@ CREATE TABLE IF NOT EXISTS device (
   model VARCHAR(64) NOT NULL COMMENT '设备型号，登记后不可修改',
   current_version VARCHAR(64) NOT NULL COMMENT '设备当前固件版本',
   bucket_no INT NOT NULL COMMENT '灰度分桶号，取值0~99，登记后不可修改',
+  health_status VARCHAR(16) NOT NULL DEFAULT 'HEALTHY' COMMENT '健康状态：HEALTHY健康，DOWN停机升级中，UNHEALTHY升级失败待人工恢复',
+  health_version INT NOT NULL DEFAULT 1 COMMENT '健康版本号，从1开始，人工恢复成功加一',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
   PRIMARY KEY (device_id)
 ) COMMENT='设备登记表';
@@ -23,6 +25,8 @@ CREATE TABLE IF NOT EXISTS release_order (
   round_success INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入SUCCESS的任务数，重复回执不重复计数',
   round_failed INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入FAILED的任务数，重复回执不重复计数',
   active_model VARCHAR(64) NULL COMMENT 'ACTIVE或PAUSED时等于model，取消后置NULL；用于同型号至多一张未终结发布单的唯一约束',
+  release_type VARCHAR(16) NOT NULL DEFAULT 'GRAY' COMMENT '发布类型：GRAY灰度按比例逐个投放，TOPOLOGY拓扑波次投放',
+  topology_version INT NULL COMMENT '拓扑版本，仅TOPOLOGY类型有值；发布成功后图冻结不可改',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id)
@@ -36,6 +40,7 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  wave_id BIGINT NULL COMMENT '所属拓扑波次ID，仅TOPOLOGY发布单的波次任务有值，灰度拉取任务为NULL',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
@@ -66,8 +71,37 @@ CREATE TABLE IF NOT EXISTS release_resume_record (
 CREATE TABLE IF NOT EXISTS idempotency_record (
   request_id VARCHAR(64) NOT NULL COMMENT '全局唯一请求ID',
   api VARCHAR(64) NOT NULL COMMENT '接口标识',
-  fingerprint VARCHAR(256) NOT NULL COMMENT '请求参数指纹，同键异参返回409',
+  fingerprint VARCHAR(1024) NOT NULL COMMENT '请求参数指纹，同键异参返回409',
   response_body CLOB NOT NULL COMMENT '成功响应快照（JSON），用于同键同参重放',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   PRIMARY KEY (request_id)
 ) COMMENT='写操作幂等去重记录，失败不占键';
+
+CREATE TABLE IF NOT EXISTS release_topology_device (
+  release_id BIGINT NOT NULL COMMENT '所属发布单ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '绑定的设备ID，单发布单最多10个',
+  PRIMARY KEY (release_id, device_id)
+) COMMENT='TOPOLOGY发布单绑定的设备集合，发布成功后冻结不可改';
+
+CREATE TABLE IF NOT EXISTS release_topology_edge (
+  release_id BIGINT NOT NULL COMMENT '所属发布单ID',
+  device_a VARCHAR(64) NOT NULL COMMENT '边的字典序较小端点',
+  device_b VARCHAR(64) NOT NULL COMMENT '边的字典序较大端点',
+  PRIMARY KEY (release_id, device_a, device_b)
+) COMMENT='TOPOLOGY发布单的无向邻接边，规范化存储（device_a<device_b），无自环无重复边，发布后冻结不可改';
+
+CREATE TABLE IF NOT EXISTS release_wave (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '波次ID',
+  release_id BIGINT NOT NULL COMMENT '所属发布单ID',
+  wave_no INT NOT NULL COMMENT '波次序号，从1开始按领取顺序递增',
+  member_count INT NOT NULL COMMENT '成员数，取值1~5',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '领取时间',
+  PRIMARY KEY (id),
+  CONSTRAINT uk_wave_release_no UNIQUE (release_id, wave_no)
+) COMMENT='拓扑波次，领取成功即冻结成员集合与图';
+
+CREATE TABLE IF NOT EXISTS release_wave_member (
+  wave_id BIGINT NOT NULL COMMENT '所属波次ID',
+  device_id VARCHAR(64) NOT NULL COMMENT '成员设备ID',
+  PRIMARY KEY (wave_id, device_id)
+) COMMENT='拓扑波次成员，领取时冻结，重放不按当前健康重选';

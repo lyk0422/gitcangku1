@@ -3,6 +3,7 @@ package com.example.starter.firmware.repo;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
+import com.example.starter.firmware.domain.ReleaseType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
@@ -19,15 +20,20 @@ import java.util.Optional;
 @Repository
 public class ReleaseRepository {
 
-    private static final RowMapper<ReleaseOrder> MAPPER = (rs, rowNum) -> new ReleaseOrder(
-            rs.getLong("id"), rs.getInt("version"), rs.getString("model"),
-            rs.getString("from_version"), rs.getString("to_version"),
-            rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
-            rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
-            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
+    private static final RowMapper<ReleaseOrder> MAPPER = (rs, rowNum) -> {
+        Integer topologyVersion = rs.getObject("topology_version", Integer.class);
+        return new ReleaseOrder(
+                rs.getLong("id"), rs.getInt("version"), rs.getString("model"),
+                rs.getString("from_version"), rs.getString("to_version"),
+                rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
+                rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
+                rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"),
+                ReleaseType.valueOf(rs.getString("release_type")), topologyVersion);
+    };
 
     private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
-            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
+            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed,"
+            + " release_type, topology_version";
 
     private final JdbcTemplate jdbc;
 
@@ -37,12 +43,23 @@ public class ReleaseRepository {
 
     public long insert(String model, String fromVersion, String toVersion, int ratio,
                        int sampleFloor, int failureThresholdPercent) {
+        return insert(model, fromVersion, toVersion, ratio, sampleFloor, failureThresholdPercent,
+                ReleaseType.GRAY, null);
+    }
+
+    /**
+     * 创建发布单；TOPOLOGY 类型必须携带拓扑版本，GRAY 类型拓扑版本为 null。
+     */
+    public long insert(String model, String fromVersion, String toVersion, int ratio,
+                       int sampleFloor, int failureThresholdPercent,
+                       ReleaseType releaseType, Integer topologyVersion) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO release_order (version, model, from_version, to_version, ratio, status,"
-                            + " sample_floor, failure_threshold_percent, monitor_round, active_model)"
-                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?)",
+                            + " sample_floor, failure_threshold_percent, monitor_round, active_model,"
+                            + " release_type, topology_version)"
+                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?, ?, ?)",
                     new String[]{"id"});
             ps.setString(1, model);
             ps.setString(2, fromVersion);
@@ -51,6 +68,12 @@ public class ReleaseRepository {
             ps.setInt(5, sampleFloor);
             ps.setInt(6, failureThresholdPercent);
             ps.setString(7, model);
+            ps.setString(8, releaseType.name());
+            if (topologyVersion == null) {
+                ps.setNull(9, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(9, topologyVersion);
+            }
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

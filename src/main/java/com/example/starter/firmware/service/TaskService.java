@@ -5,9 +5,11 @@ import com.example.starter.firmware.api.ReceiptRequest;
 import com.example.starter.firmware.api.TaskListResponse;
 import com.example.starter.firmware.api.TaskView;
 import com.example.starter.firmware.domain.Device;
+import com.example.starter.firmware.domain.HealthStatus;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
+import com.example.starter.firmware.domain.ReleaseType;
 import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
@@ -55,6 +57,7 @@ public class TaskService {
     /**
      * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
      * PAUSED 时不创建新任务，已有任务仍可查看与回执。
+     * TOPOLOGY 发布单不允许逐个拉取绕过拓扑隔离，只能经波次领取创建任务。
      */
     public PullResponse pull(String deviceId, String requestId) {
         String fingerprint = String.join("|", "task.pull", deviceId);
@@ -69,6 +72,9 @@ public class TaskService {
             var existing = taskRepository.findByReleaseAndDevice(order.id(), deviceId);
             if (existing.isPresent()) {
                 return new PullResponse(TaskView.of(existing.get(), order));
+            }
+            if (order.releaseType() == ReleaseType.TOPOLOGY) {
+                return new PullResponse(null);
             }
             if (order.status() != ReleaseStatus.ACTIVE
                     || !device.currentVersion().equals(order.fromVersion())
@@ -109,6 +115,12 @@ public class TaskService {
                     releaseRepository.incrementRoundStats(snapshot.releaseId(), request.result());
                     if (request.result() == ReceiptResult.SUCCESS) {
                         deviceRepository.updateCurrentVersion(task.deviceId(), lockedOrder.toVersion());
+                    }
+                    if (lockedOrder.releaseType() == ReleaseType.TOPOLOGY) {
+                        // 拓扑波次：仅 SUCCESS 恢复健康，FAILED 保持不健康待人工恢复
+                        deviceRepository.updateHealthStatus(task.deviceId(),
+                                request.result() == ReceiptResult.SUCCESS
+                                        ? HealthStatus.HEALTHY : HealthStatus.UNHEALTHY);
                     }
                     ReleaseOrder updated = releaseRepository.findById(snapshot.releaseId()).orElseThrow();
                     pauseIfThresholdReached(updated, taskId);

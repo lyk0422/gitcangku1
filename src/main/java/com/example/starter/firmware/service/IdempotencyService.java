@@ -91,4 +91,16 @@ public class IdempotencyService {
             throw new IllegalStateException("幂等响应序列化失败", e);
         }
     }
+
+    /**
+     * 结构化指纹：以 JSON 数组序列化操作标识与全部参数，避免分隔符拼接碰撞；
+     * 数值按值、文本原样，参数表之外不引入隐含字段。
+     */
+    public String fingerprint(Object... parts) {
+        try {
+            return objectMapper.writeValueAsString(java.util.Arrays.asList(parts));
+        } catch (Exception e) {
+            throw new IllegalStateException("幂等指纹序列化失败", e);
+        }
+    }
 }

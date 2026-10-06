@@ -23,10 +23,11 @@ public class TaskRepository {
         String firstResult = rs.getString("first_result");
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                rs.getObject("wave_id", Long.class));
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result, wave_id";
 
     private final JdbcTemplate jdbc;
 
@@ -35,13 +36,25 @@ public class TaskRepository {
     }
 
     public long insert(long releaseId, String deviceId) {
+        return insert(releaseId, deviceId, null);
+    }
+
+    /**
+     * 创建任务；拓扑波次任务携带 waveId，灰度拉取任务为 null。
+     */
+    public long insert(long releaseId, String deviceId, Long waveId) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rollout_task (release_id, device_id, status) VALUES (?, ?, 'PENDING')",
+                    "INSERT INTO rollout_task (release_id, device_id, status, wave_id) VALUES (?, ?, 'PENDING', ?)",
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            if (waveId == null) {
+                ps.setNull(3, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(3, waveId);
+            }
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -86,5 +99,21 @@ public class TaskRepository {
                 "SELECT COUNT(*) FROM rollout_task WHERE release_id = ? AND device_id = ?",
                 Long.class, releaseId, deviceId);
         return count == null ? 0 : count;
+    }
+
+    /**
+     * 发布单内已有任务的设备ID集合（波次领取时判定"当前未领"）。
+     */
+    public List<String> findDeviceIdsByRelease(long releaseId) {
+        return jdbc.query("SELECT device_id FROM rollout_task WHERE release_id = ?",
+                (rs, rowNum) -> rs.getString("device_id"), releaseId);
+    }
+
+    /**
+     * 发布单内处于 PENDING（活跃安装中）任务的设备ID集合（波次领取时判定邻居阻断）。
+     */
+    public List<String> findPendingDeviceIdsByRelease(long releaseId) {
+        return jdbc.query("SELECT device_id FROM rollout_task WHERE release_id = ? AND status = 'PENDING'",
+                (rs, rowNum) -> rs.getString("device_id"), releaseId);
     }
 }
