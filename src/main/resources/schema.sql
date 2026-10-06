@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS recall (
 );
 
 CREATE TABLE IF NOT EXISTS command_log (
-    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT',
+    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT/CREATE_RECIPE/BIND_RECIPE/WEIGH/CORRECT_WEIGH',
     command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409',
     fingerprint VARCHAR(64) NOT NULL COMMENT '业务参数（不含 commandKey）的 SHA-256 摘要，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',
@@ -65,4 +65,46 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
+);
+
+-- 配方版本：声明 2～6 种成分的质量百分比，创建后不可修改。
+CREATE TABLE IF NOT EXISTS recipe_version (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    recipe_key VARCHAR(64) NOT NULL COMMENT '配方业务键，与版本号共同唯一',
+    version INT NOT NULL COMMENT '配方版本号，同一配方键下唯一，创建后不可修改',
+    created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_recipe_version UNIQUE (recipe_key, version)
+);
+
+CREATE TABLE IF NOT EXISTS recipe_ingredient (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    recipe_key VARCHAR(64) NOT NULL COMMENT '所属配方业务键',
+    recipe_version INT NOT NULL COMMENT '所属配方版本号',
+    ingredient VARCHAR(128) NOT NULL COMMENT '成分名称，同一配方版本内唯一',
+    percentage DECIMAL(7,4) NOT NULL COMMENT '质量百分比，正值，最多4位小数；同版本全部成分之和精确等于100',
+    seq INT NOT NULL COMMENT '成分在创建请求中的顺序，从 1 开始'
+);
+
+-- 批次配方绑定：每批最多绑定一个不可变配方版本及目标总质量。
+CREATE TABLE IF NOT EXISTS batch_recipe (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '批次业务键，每批最多一条绑定',
+    recipe_key VARCHAR(64) NOT NULL COMMENT '绑定的配方业务键，绑定后不可修改',
+    recipe_version INT NOT NULL COMMENT '绑定的配方版本号，绑定后不可修改',
+    target_mass DECIMAL(19,6) NOT NULL COMMENT '目标总质量，单位克，正值，最多6位小数',
+    state_version INT NOT NULL COMMENT '称量链版本号，绑定后为0，每次称量或更正加1，用于乐观并发校验',
+    created_at VARCHAR(40) NOT NULL COMMENT '绑定时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_batch_recipe UNIQUE (batch_key)
+);
+
+-- 配方称量记录：同成分可多次称量累加；更正以新记录替代被引用记录，旧记录不再有效。
+CREATE TABLE IF NOT EXISTS weighing (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为称量记录提交顺序依据',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键',
+    ingredient VARCHAR(128) NOT NULL COMMENT '成分名称，必须属于批次绑定的配方版本',
+    mass DECIMAL(19,6) NOT NULL COMMENT '称量质量，单位克，正值，最多6位小数',
+    supersedes_id BIGINT NULL COMMENT '更正场景被替代的称量记录ID；NULL 表示原始称量或拆分继承',
+    superseded_by BIGINT NULL COMMENT '替代本记录的更正称量ID；NULL 表示当前有效',
+    operator VARCHAR(64) NOT NULL COMMENT '操作人标识；拆分继承的记录为 system:split',
+    created_at VARCHAR(40) NOT NULL COMMENT '提交时间，ISO-8601 UTC instant 字符串'
 );

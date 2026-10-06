@@ -5,6 +5,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
 
+import java.math.BigDecimal;
 import java.util.List;
 
 /**
@@ -20,10 +21,13 @@ public record SplitRequest(
 
     /**
      * 子批规格：batchKey 全局唯一，batchNo 为子批批号；产品编码、生产时间与必做检验项继承父批。
+     * targetMass 可选（单位克，最多 6 位小数）：父批已绑定配方时必填，子批按质量比例
+     * 精确继承父批各成分质量，全部子批 targetMass 之和必须等于父批目标总质量。
      */
     public record ChildSpec(
             @NotBlank(message = "子批 batchKey 不能为空") String batchKey,
-            @NotBlank(message = "子批 batchNo 不能为空") String batchNo
+            @NotBlank(message = "子批 batchNo 不能为空") String batchNo,
+            BigDecimal targetMass
     ) {
     }
 }

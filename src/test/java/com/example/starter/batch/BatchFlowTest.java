@@ -50,6 +50,10 @@ class BatchFlowTest {
         jdbc.update("DELETE FROM test_result");
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
+        jdbc.update("DELETE FROM weighing");
+        jdbc.update("DELETE FROM batch_recipe");
+        jdbc.update("DELETE FROM recipe_ingredient");
+        jdbc.update("DELETE FROM recipe_version");
         jdbc.update("DELETE FROM batch");
     }
 

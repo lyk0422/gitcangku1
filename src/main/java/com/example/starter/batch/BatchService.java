@@ -61,13 +61,16 @@ public class BatchService {
     private final BatchRepository repo;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
+    private final RecipeService recipeService;
 
     public BatchService(BatchRepository repo,
                         PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+                        ObjectMapper objectMapper,
+                        RecipeService recipeService) {
         this.repo = repo;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
+        this.recipeService = recipeService;
     }
 
     /**
@@ -199,6 +202,11 @@ public class BatchService {
                 }
                 seq = 2;
                 newStatus = BatchStatus.RELEASED;
+            }
+            if (newStatus == BatchStatus.RELEASED) {
+                // 配方门禁：批次绑定配方时，投料必须满足配方（成分齐全、总质量相等、
+                // 每项占比偏差不超过 0.1 个百分点），不满足 422 且本次批准整体回滚
+                recipeService.assertReleaseConformance(batchKey);
             }
             repo.insertApproval(new BatchRepository.ApprovalRow(0L, batchKey, req.commandKey(),
                     actor, role.name(), seq, now));
@@ -418,6 +426,8 @@ public class BatchService {
      * 拆分：仅当前可用的 RELEASED 批次可一次拆成 2～5 个全新子批。
      * 子批继承产品编码、生产 UTC 时间与必做检验项，初始 QUARANTINED，
      * 不继承检验或批准记录；父批置为 SPLIT 不再可用。
+     * 父批已绑定配方时，子批必须给出 targetMass 并按质量比例精确继承父批各成分质量，
+     * 无法在 6 位小数内守恒的拆分 422；已拆父批称量链冻结，不能再称量或更正。
      * 创建全部子批、血缘关系与父批状态在同一事务提交；任一子批键已存在或重复，整次 409 且父批不变。
      */
     public StoredResponse split(String parentKey, SplitRequest req) {
@@ -432,6 +442,7 @@ public class BatchService {
         for (SplitRequest.ChildSpec child : children) {
             parts.add(child.batchKey());
             parts.add(child.batchNo());
+            parts.add(child.targetMass() == null ? "" : child.targetMass().stripTrailingZeros().toPlainString());
         }
         String fingerprint = fingerprint(parts.toArray(new String[0]));
         return executeIdempotent(CMD_SPLIT, req.commandKey(), fingerprint, () -> {
@@ -453,6 +464,10 @@ public class BatchService {
                     throw ApiException.conflict("子批 batchKey 已存在: " + childKey);
                 }
             }
+            // 配方继承计划：父批已绑定配方时，子批按质量比例精确继承各成分质量，
+            // 无法在 6 位小数内守恒则 422；与称量更正、放行经父批行锁互斥
+            RecipeService.SplitInheritance inheritance =
+                    recipeService.planSplitInheritance(parentKey, children);
             String now = now();
             List<String> required = repo.findRequiredTests(parentKey);
             List<SplitResponse.SplitChild> childBodies = new ArrayList<>(children.size());
@@ -465,6 +480,10 @@ public class BatchService {
                 }
                 repo.insertLineage(new BatchRepository.LineageRow(0L, parentKey, spec.batchKey(),
                         i + 1, now));
+                if (inheritance != null) {
+                    // 子批绑定同一配方版本并继承按比例折算的成分质量
+                    recipeService.applySplitInheritance(spec.batchKey(), inheritance, now);
+                }
                 childBodies.add(new SplitResponse.SplitChild(spec.batchKey(), spec.batchNo(),
                         parent.productCode(), Instant.parse(parent.producedAt()),
                         BatchStatus.QUARANTINED, required, Instant.parse(now)));

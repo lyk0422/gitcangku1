@@ -9,11 +9,17 @@ public class ApiException extends RuntimeException {
 
     private final HttpStatus status;
     private final String code;
+    private final transient Object details;
 
     public ApiException(HttpStatus status, String code, String message) {
+        this(status, code, message, null);
+    }
+
+    public ApiException(HttpStatus status, String code, String message, Object details) {
         super(message);
         this.status = status;
         this.code = code;
+        this.details = details;
     }
 
     public HttpStatus status() {
@@ -22,6 +28,13 @@ public class ApiException extends RuntimeException {
 
     public String code() {
         return code;
+    }
+
+    /**
+     * 结构化错误明细（如配方各成分差额），无明细时为 null。
+     */
+    public Object details() {
+        return details;
     }
 
     public static ApiException badRequest(String message) {
@@ -38,5 +51,12 @@ public class ApiException extends RuntimeException {
 
     public static ApiException unprocessable(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "PRECONDITION_FAILED", message);
+    }
+
+    /**
+     * 422 并携带结构化明细（如配方放行门禁的各成分差额）。
+     */
+    public static ApiException unprocessable(String message, Object details) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "PRECONDITION_FAILED", message, details);
     }
 }
