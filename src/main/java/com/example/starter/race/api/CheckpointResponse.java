@@ -5,9 +5,11 @@ package com.example.starter.race.api;
  *
  * @param checkpointCode 检查点代码，赛事内唯一
  * @param position       检查点顺序，从1连续递增
+ * @param sensorMode     是否启用三源计时模式
  */
 public record CheckpointResponse(
         String checkpointCode,
-        int position
+        int position,
+        boolean sensorMode
 ) {
 }

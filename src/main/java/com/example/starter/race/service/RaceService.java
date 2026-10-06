@@ -1,15 +1,18 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.AdjudicateSensorRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.ReviseSensorSampleRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.SubmitSensorSampleRequest;
 import com.example.starter.race.api.SubmitTimingRequest;
 
 /**
@@ -47,6 +50,25 @@ public interface RaceService {
 
     /** 封榜：校验版本并原子保存只读成绩快照（含每名选手分段明细与缺失检查点）。 */
     ServiceResult sealRace(String raceId, SealRaceRequest request);
+
+    /**
+     * 登记三源检查点的传感器读数（修订号初始1）；仅 OPEN 赛事可写并推进赛事版本。
+     * 同一选手同一检查点最多三个不同 sensorId；重复传感器须走修订接口。
+     */
+    ServiceResult submitSensorSample(String raceId, String bib, SubmitSensorSampleRequest request);
+
+    /**
+     * 修订某传感器读数：校验 expectedRaceVersion 与 expectedSensorRevision，
+     * 成功后同时推进赛事版本与传感器修订号；该检查点旧裁定立即失效并移出即时排名视图，
+     * 历史裁定保留不覆写。
+     */
+    ServiceResult reviseSensorSample(String raceId, String bib, ReviseSensorSampleRequest request);
+
+    /**
+     * 三源共识裁定：三条当前修订号读数齐全且最大减最小不超过20毫秒时，
+     * 取中位值写入原分段计时（原严格递增与完赛边界仍须满足），否则422整次不写。
+     */
+    ServiceResult adjudicateSensor(String raceId, String bib, AdjudicateSensorRequest request);
 
     /** 查询即时成绩（OPEN 实时计算；SEALED 返回封榜快照）。 */
     StandingResponse getResults(String raceId);

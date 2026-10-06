@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS checkpoint (
     race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID；未配置检查点的赛事无任何行',
     checkpoint_code VARCHAR(64) NOT NULL COMMENT '检查点代码，同一赛事内唯一',
     position INT NOT NULL COMMENT '检查点顺序，从1连续递增，配置后不可修改',
+    sensor_mode BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否启用三源计时模式：TRUE-须传感器采样+裁定写入分段，FALSE-单条计时入口',
     created_at BIGINT NOT NULL COMMENT '配置时间，Unix毫秒时间戳',
     CONSTRAINT pk_checkpoint PRIMARY KEY (race_id, checkpoint_code),
     CONSTRAINT uk_checkpoint_position UNIQUE (race_id, position),
@@ -91,13 +92,50 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     position INT NOT NULL COMMENT '检查点顺序，从1递增',
     elapsed_millis BIGINT COMMENT '封榜时该选手通过该检查点的累计耗时（毫秒）；缺失检查点为NULL',
     timing_id VARCHAR(128) COMMENT '分段记录ID；缺失检查点为NULL',
+    adjudication_id VARCHAR(128) COMMENT '三源点的有效裁定ID；非三源点或缺失为NULL',
+    sensor_readings VARCHAR(1024) COMMENT '封榜时冻结的三条传感器读数及各自修订号（JSON数组），作为中位依据；非三源点或缺失为NULL',
     CONSTRAINT pk_snapshot_checkpoint PRIMARY KEY (race_id, bib, checkpoint_code),
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS sensor_sample (
+    sample_id VARCHAR(128) NOT NULL COMMENT '采样记录ID，全局唯一（第二层幂等键）',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    checkpoint_code VARCHAR(64) NOT NULL COMMENT '启用三源模式的检查点代码',
+    sensor_id VARCHAR(64) NOT NULL COMMENT '传感器ID；同一选手同一检查点须为三个不同传感器',
+    sensor_revision INT NOT NULL COMMENT '该传感器读数修订号，初始1，每次修订加一',
+    elapsed_millis BIGINT NOT NULL COMMENT '传感器累计读数（毫秒，1~86400000）',
+    operator VARCHAR(64) NOT NULL COMMENT '采样登记操作者',
+    created_at BIGINT NOT NULL COMMENT '登记时间，Unix毫秒时间戳',
+    updated_at BIGINT NOT NULL COMMENT '最近一次修订时间，Unix毫秒时间戳',
+    CONSTRAINT pk_sensor_sample PRIMARY KEY (sample_id),
+    CONSTRAINT uk_sample_runner_sensor UNIQUE (race_id, bib, checkpoint_code, sensor_id),
+    CONSTRAINT fk_sample_checkpoint FOREIGN KEY (race_id, checkpoint_code) REFERENCES checkpoint (race_id, checkpoint_code),
+    CONSTRAINT fk_sample_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_sample_group (race_id, bib, checkpoint_code)
+);
+
+CREATE TABLE IF NOT EXISTS sensor_adjudication (
+    adjudication_id VARCHAR(128) NOT NULL COMMENT '裁定ID，全局唯一（第二层幂等键），同时作为写入分段计时的timing_id',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    checkpoint_code VARCHAR(64) NOT NULL COMMENT '三源检查点代码',
+    median_elapsed_millis BIGINT NOT NULL COMMENT '三条当前读数的中位值（毫秒），写入原分段计时',
+    sensor_readings VARCHAR(1024) NOT NULL COMMENT '裁定时冻结的三条传感器读数及各自修订号（JSON数组）',
+    race_version INT NOT NULL COMMENT '裁定成功后的赛事版本号',
+    superseded BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已因采样修订失效：FALSE-有效，TRUE-已失效；历史裁定保留不覆写',
+    operator VARCHAR(64) NOT NULL COMMENT '裁定操作者',
+    created_at BIGINT NOT NULL COMMENT '裁定时间，Unix毫秒时间戳',
+    CONSTRAINT pk_sensor_adjudication PRIMARY KEY (adjudication_id),
+    CONSTRAINT fk_adjudication_checkpoint FOREIGN KEY (race_id, checkpoint_code) REFERENCES checkpoint (race_id, checkpoint_code),
+    CONSTRAINT fk_adjudication_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_adjudication_group (race_id, bib, checkpoint_code)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/SUBMIT_SENSOR_SAMPLE/REVISE_SENSOR_SAMPLE/ADJUDICATE_SENSOR',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',

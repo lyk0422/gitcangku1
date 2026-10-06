@@ -30,6 +30,10 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final SensorSampleRowMapper SENSOR_SAMPLE_ROW_MAPPER =
+            new SensorSampleRowMapper();
+    private static final SensorAdjudicationRowMapper SENSOR_ADJUDICATION_ROW_MAPPER =
+            new SensorAdjudicationRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -98,7 +102,7 @@ public class RaceRepository {
     /** 查询赛事的全部检查点，按顺序 position 升序排列；未配置时为空列表。 */
     public List<CheckpointRow> findCheckpoints(String raceId) {
         return jdbcTemplate.query(
-                "SELECT race_id, checkpoint_code, position, created_at "
+                "SELECT race_id, checkpoint_code, position, sensor_mode, created_at "
                         + "FROM checkpoint WHERE race_id = ? ORDER BY position",
                 CHECKPOINT_ROW_MAPPER, raceId);
     }
@@ -106,7 +110,7 @@ public class RaceRepository {
     /** 按赛事与代码查询检查点。 */
     public Optional<CheckpointRow> findCheckpoint(String raceId, String checkpointCode) {
         return jdbcTemplate
-                .query("SELECT race_id, checkpoint_code, position, created_at "
+                .query("SELECT race_id, checkpoint_code, position, sensor_mode, created_at "
                                 + "FROM checkpoint WHERE race_id = ? AND checkpoint_code = ?",
                         CHECKPOINT_ROW_MAPPER, raceId, checkpointCode)
                 .stream()
@@ -160,15 +164,16 @@ public class RaceRepository {
     /** 一次性写入赛事检查点配置（配置后不可修改）。 */
     public void insertCheckpoints(List<CheckpointRow> rows) {
         jdbcTemplate.batchUpdate(
-                "INSERT INTO checkpoint (race_id, checkpoint_code, position, created_at) "
-                        + "VALUES (?, ?, ?, ?)",
+                "INSERT INTO checkpoint (race_id, checkpoint_code, position, sensor_mode, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?)",
                 rows,
                 rows.size(),
                 (ps, row) -> {
                     ps.setString(1, row.raceId());
                     ps.setString(2, row.checkpointCode());
                     ps.setInt(3, row.position());
-                    ps.setLong(4, row.createdAt());
+                    ps.setBoolean(4, row.sensorMode());
+                    ps.setLong(5, row.createdAt());
                 });
     }
 
@@ -192,7 +197,8 @@ public class RaceRepository {
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
         List<SnapshotCheckpointRow> checkpoints = jdbcTemplate.query(
-                "SELECT race_id, bib, checkpoint_code, position, elapsed_millis, timing_id "
+                "SELECT race_id, bib, checkpoint_code, position, elapsed_millis, timing_id, "
+                        + "adjudication_id, sensor_readings "
                         + "FROM result_snapshot_checkpoint WHERE race_id = ? "
                         + "ORDER BY bib, position",
                 SNAPSHOT_CHECKPOINT_ROW_MAPPER, raceId);
@@ -310,8 +316,9 @@ public class RaceRepository {
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
-                        + "(race_id, bib, checkpoint_code, position, elapsed_millis, timing_id) "
-                        + "VALUES (?, ?, ?, ?, ?, ?)",
+                        + "(race_id, bib, checkpoint_code, position, elapsed_millis, timing_id, "
+                        + "adjudication_id, sensor_readings) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.checkpoints(),
                 snapshot.checkpoints().size(),
                 (ps, detail) -> {
@@ -321,6 +328,8 @@ public class RaceRepository {
                     ps.setInt(4, detail.position());
                     ps.setObject(5, detail.elapsedMillis());
                     ps.setString(6, detail.timingId());
+                    ps.setString(7, detail.adjudicationId());
+                    ps.setString(8, detail.sensorReadings());
                 });
     }
 
@@ -374,11 +383,134 @@ public class RaceRepository {
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
+        jdbcTemplate.update("DELETE FROM sensor_adjudication");
+        jdbcTemplate.update("DELETE FROM sensor_sample");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
+    }
+
+    /** 按全局采样ID查询传感器读数（用于 sampleId 幂等重放）。 */
+    public Optional<SensorSampleRow> findSensorSample(String sampleId) {
+        return jdbcTemplate
+                .query("SELECT sample_id, race_id, bib, checkpoint_code, sensor_id, sensor_revision, "
+                                + "elapsed_millis, operator, created_at, updated_at "
+                                + "FROM sensor_sample WHERE sample_id = ?",
+                        SENSOR_SAMPLE_ROW_MAPPER, sampleId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询某选手在某三源检查点的全部传感器读数，按传感器ID排序。 */
+    public List<SensorSampleRow> findSensorSamples(String raceId, String bib, String checkpointCode) {
+        return jdbcTemplate.query(
+                "SELECT sample_id, race_id, bib, checkpoint_code, sensor_id, sensor_revision, "
+                        + "elapsed_millis, operator, created_at, updated_at "
+                        + "FROM sensor_sample WHERE race_id = ? AND bib = ? AND checkpoint_code = ? "
+                        + "ORDER BY sensor_id",
+                SENSOR_SAMPLE_ROW_MAPPER, raceId, bib, checkpointCode);
+    }
+
+    /** 按传感器定位采样记录（修订时读取当前修订号）。 */
+    public Optional<SensorSampleRow> findSensorSampleBySensor(
+            String raceId, String bib, String checkpointCode, String sensorId) {
+        return jdbcTemplate
+                .query("SELECT sample_id, race_id, bib, checkpoint_code, sensor_id, sensor_revision, "
+                                + "elapsed_millis, operator, created_at, updated_at "
+                                + "FROM sensor_sample WHERE race_id = ? AND bib = ? "
+                                + "AND checkpoint_code = ? AND sensor_id = ?",
+                        SENSOR_SAMPLE_ROW_MAPPER, raceId, bib, checkpointCode, sensorId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 新增传感器采样记录（sampleId 与 赛事+选手+检查点+传感器 唯一键由数据库约束保证）。 */
+    public void insertSensorSample(SensorSampleRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO sensor_sample "
+                        + "(sample_id, race_id, bib, checkpoint_code, sensor_id, sensor_revision, "
+                        + "elapsed_millis, operator, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.sampleId(), row.raceId(), row.bib(), row.checkpointCode(), row.sensorId(),
+                row.sensorRevision(), row.elapsedMillis(), row.operator(),
+                row.createdAt(), row.updatedAt());
+    }
+
+    /**
+     * 条件修订传感器读数：仅当当前修订号等于 expectedSensorRevision 时更新读数并推进修订号。
+     *
+     * @return 受影响行数；0 表示记录不存在或修订号已被并发推进
+     */
+    public int reviseSensorSample(
+            String sampleId, long elapsedMillis, int expectedSensorRevision, long now) {
+        return jdbcTemplate.update(
+                "UPDATE sensor_sample SET elapsed_millis = ?, sensor_revision = sensor_revision + 1, "
+                        + "updated_at = ? WHERE sample_id = ? AND sensor_revision = ?",
+                elapsedMillis, now, sampleId, expectedSensorRevision);
+    }
+
+    /** 新增三源裁定记录（历史裁定保留不覆写）。 */
+    public void insertSensorAdjudication(SensorAdjudicationRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO sensor_adjudication "
+                        + "(adjudication_id, race_id, bib, checkpoint_code, median_elapsed_millis, "
+                        + "sensor_readings, race_version, superseded, operator, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, FALSE, ?, ?)",
+                row.adjudicationId(), row.raceId(), row.bib(), row.checkpointCode(),
+                row.medianElapsedMillis(), row.sensorReadings(), row.raceVersion(),
+                row.operator(), row.createdAt());
+    }
+
+    /** 按全局裁定ID查询裁定（用于 adjudicationId 幂等重放）。 */
+    public Optional<SensorAdjudicationRow> findSensorAdjudication(String adjudicationId) {
+        return jdbcTemplate
+                .query("SELECT adjudication_id, race_id, bib, checkpoint_code, median_elapsed_millis, "
+                                + "sensor_readings, race_version, superseded, operator, created_at "
+                                + "FROM sensor_adjudication WHERE adjudication_id = ?",
+                        SENSOR_ADJUDICATION_ROW_MAPPER, adjudicationId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询某选手在某三源检查点当前有效的裁定（未被采样修订淘汰）。 */
+    public Optional<SensorAdjudicationRow> findValidAdjudication(
+            String raceId, String bib, String checkpointCode) {
+        return jdbcTemplate
+                .query("SELECT adjudication_id, race_id, bib, checkpoint_code, median_elapsed_millis, "
+                                + "sensor_readings, race_version, superseded, operator, created_at "
+                                + "FROM sensor_adjudication WHERE race_id = ? AND bib = ? "
+                                + "AND checkpoint_code = ? AND superseded = FALSE "
+                                + "ORDER BY created_at DESC, adjudication_id",
+                        SENSOR_ADJUDICATION_ROW_MAPPER, raceId, bib, checkpointCode)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事下全部当前有效的三源裁定（封榜校验与快照冻结用）。 */
+    public List<SensorAdjudicationRow> findValidAdjudications(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT adjudication_id, race_id, bib, checkpoint_code, median_elapsed_millis, "
+                        + "sensor_readings, race_version, superseded, operator, created_at "
+                        + "FROM sensor_adjudication WHERE race_id = ? AND superseded = FALSE "
+                        + "ORDER BY bib, checkpoint_code",
+                SENSOR_ADJUDICATION_ROW_MAPPER, raceId);
+    }
+
+    /** 采样修订后立即淘汰该选手该检查点的全部有效裁定；返回失效裁定数量。 */
+    public int supersedeAdjudications(String raceId, String bib, String checkpointCode) {
+        return jdbcTemplate.update(
+                "UPDATE sensor_adjudication SET superseded = TRUE "
+                        + "WHERE race_id = ? AND bib = ? AND checkpoint_code = ? AND superseded = FALSE",
+                raceId, bib, checkpointCode);
+    }
+
+    /** 删除某选手在某检查点的分段计时（三源修订使旧裁定失效时同步移出即时排名视图）。 */
+    public int deleteTiming(String raceId, String bib, String checkpointCode) {
+        return jdbcTemplate.update(
+                "DELETE FROM checkpoint_timing WHERE race_id = ? AND bib = ? AND checkpoint_code = ?",
+                raceId, bib, checkpointCode);
     }
 
     private static final class RaceRowMapper implements RowMapper<RaceRow> {
@@ -446,6 +578,7 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getString("checkpoint_code"),
                     rs.getInt("position"),
+                    rs.getBoolean("sensor_mode"),
                     rs.getLong("created_at"));
         }
     }
@@ -474,7 +607,44 @@ public class RaceRepository {
                     rs.getString("checkpoint_code"),
                     rs.getInt("position"),
                     (Long) rs.getObject("elapsed_millis"),
-                    rs.getString("timing_id"));
+                    rs.getString("timing_id"),
+                    rs.getString("adjudication_id"),
+                    rs.getString("sensor_readings"));
+        }
+    }
+
+    private static final class SensorSampleRowMapper implements RowMapper<SensorSampleRow> {
+        @Override
+        public SensorSampleRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new SensorSampleRow(
+                    rs.getString("sample_id"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("checkpoint_code"),
+                    rs.getString("sensor_id"),
+                    rs.getInt("sensor_revision"),
+                    rs.getLong("elapsed_millis"),
+                    rs.getString("operator"),
+                    rs.getLong("created_at"),
+                    rs.getLong("updated_at"));
+        }
+    }
+
+    private static final class SensorAdjudicationRowMapper
+            implements RowMapper<SensorAdjudicationRow> {
+        @Override
+        public SensorAdjudicationRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new SensorAdjudicationRow(
+                    rs.getString("adjudication_id"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("checkpoint_code"),
+                    rs.getLong("median_elapsed_millis"),
+                    rs.getString("sensor_readings"),
+                    rs.getInt("race_version"),
+                    rs.getBoolean("superseded"),
+                    rs.getString("operator"),
+                    rs.getLong("created_at"));
         }
     }
 

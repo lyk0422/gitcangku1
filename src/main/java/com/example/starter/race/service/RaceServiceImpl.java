@@ -1,6 +1,7 @@
 package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
+import com.example.starter.race.api.AdjudicateSensorRequest;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
@@ -8,28 +9,36 @@ import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.ReviseSensorSampleRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.RunnerMissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
+import com.example.starter.race.api.SensorReadingResponse;
+import com.example.starter.race.api.SensorRevisionResponse;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.SubmitSensorSampleRequest;
 import com.example.starter.race.api.SubmitTimingRequest;
 import com.example.starter.race.domain.CheckpointRules;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.SensorQuorum;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
+import com.example.starter.race.persistence.SensorAdjudicationRow;
+import com.example.starter.race.persistence.SensorSampleRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
 import com.example.starter.race.persistence.RaceRepository;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -243,7 +252,13 @@ public class RaceServiceImpl implements RaceService {
                         "raceId", raceId,
                         "expectedVersion", request.expectedVersion(),
                         "checkpoints", definitions.stream()
-                                .map(def -> def.position() + ":" + def.checkpointCode())
+                                .map(def -> {
+                                    Map<String, Object> structured = new TreeMap<>();
+                                    structured.put("checkpointCode", def.checkpointCode());
+                                    structured.put("position", def.position());
+                                    structured.put("sensorMode", def.sensorModeEnabled());
+                                    return structured;
+                                })
                                 .toList()),
                 () -> {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
@@ -258,11 +273,13 @@ public class RaceServiceImpl implements RaceService {
                     long now = clock.millis();
                     List<CheckpointRow> rows = request.checkpoints().stream()
                             .map(def -> new CheckpointRow(
-                                    raceId, def.checkpointCode(), def.position(), now))
+                                    raceId, def.checkpointCode(), def.position(),
+                                    def.sensorModeEnabled(), now))
                             .toList();
                     repository.insertCheckpoints(rows);
                     List<CheckpointResponse> responses = repository.findCheckpoints(raceId).stream()
-                            .map(row -> new CheckpointResponse(row.checkpointCode(), row.position()))
+                            .map(row -> new CheckpointResponse(
+                                    row.checkpointCode(), row.position(), row.sensorMode()))
                             .toList();
                     return ServiceResult.created(new CheckpointsConfigResponse(
                             raceId, request.expectedVersion() + 1, responses));
@@ -294,6 +311,12 @@ public class RaceServiceImpl implements RaceService {
                             .findCheckpoint(raceId, request.checkpointCode())
                             .orElseThrow(() -> new NotFoundException(
                                     "检查点不存在: " + request.checkpointCode()));
+                    if (checkpoint.sensorMode()) {
+                        // 三源点不能由原单条计时入口绕过，必须经传感器采样与裁定写入。
+                        throw new UnprocessableEntityException(
+                                "检查点已启用三源计时模式，须通过传感器采样与裁定写入: "
+                                        + request.checkpointCode());
+                    }
                     long elapsedMillis = request.elapsedMillis();
                     List<CheckpointTimingRow> runnerTimings =
                             repository.findTimingsForRunner(raceId, bib);
@@ -359,6 +382,12 @@ public class RaceServiceImpl implements RaceService {
                     List<PenaltyRow> penalties = repository.findPenalties(raceId);
                     List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
                     List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
+                    // 三源点封榜前置：所有参与排名选手的启用点必须存在有效裁定，
+                    // 采样修订后未重新裁定的旧中位值不能作为封榜依据。
+                    Map<String, Map<String, SensorAdjudicationRow>> validAdjudications =
+                            validAdjudicationMap(repository.findValidAdjudications(raceId));
+                    requireValidAdjudicationsForSealing(runners, penalties, checkpoints,
+                            validAdjudications);
                     List<ResultEntry> entries =
                             ResultCalculator.compute(runners, penalties, checkpoints, timings);
 
@@ -385,15 +414,258 @@ public class RaceServiceImpl implements RaceService {
                                 entry.coveredCheckpointCount(),
                                 entry.missingCheckpoints()));
                     }
-                    // 在同一封榜事务内固化每名选手 × 每个检查点的明细，缺失行耗时为 null。
+                    // 在同一封榜事务内固化每名选手 × 每个检查点的明细，缺失行耗时为 null；
+                    // 三源点同时冻结有效裁定ID与三条传感器读数（中位依据）。
                     List<SnapshotCheckpointRow> snapshotCheckpoints =
-                            buildSnapshotCheckpoints(raceId, runners, checkpoints, timings);
+                            buildSnapshotCheckpoints(raceId, runners, checkpoints, timings,
+                                    validAdjudications);
                     repository.insertSnapshot(new SnapshotRow(raceId, newVersion, now,
                             snapshotEntries, snapshotCheckpoints));
                     return ServiceResult.ok(new StandingResponse(
                             raceId, newVersion, RaceStatus.SEALED, now,
                             snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
                 });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult submitSensorSample(
+            String raceId, String bib, SubmitSensorSampleRequest request) {
+        return withIdempotency(request.requestId(), "SUBMIT_SENSOR_SAMPLE",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "sampleId", request.sampleId(),
+                        "checkpointCode", request.checkpointCode(),
+                        "sensorId", request.sensorId(),
+                        "elapsedMillis", request.elapsedMillis(),
+                        "operator", request.operator(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    // sampleId 是第二层全局幂等键：同参重放原结果，异参409。
+                    SensorSampleRow existingSample =
+                            repository.findSensorSample(request.sampleId()).orElse(null);
+                    if (existingSample != null) {
+                        return replaySampleOrConflict(raceId, bib, request, existingSample);
+                    }
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireRunner(raceId, bib);
+                    requireSensorCheckpoint(raceId, request.checkpointCode());
+                    validateSensorReading(request.elapsedMillis());
+                    List<SensorSampleRow> samples =
+                            repository.findSensorSamples(raceId, bib, request.checkpointCode());
+                    for (SensorSampleRow sample : samples) {
+                        if (sample.sensorId().equals(request.sensorId())) {
+                            throw new UnprocessableEntityException(
+                                    "该传感器已登记读数，须通过修订接口变更: " + request.sensorId());
+                        }
+                    }
+                    if (samples.size() >= SensorQuorum.REQUIRED_SENSORS) {
+                        throw new UnprocessableEntityException(
+                                "同一选手同一检查点最多登记 " + SensorQuorum.REQUIRED_SENSORS
+                                        + " 个不同传感器读数");
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    SensorSampleRow row = new SensorSampleRow(
+                            request.sampleId(), raceId, bib, request.checkpointCode(),
+                            request.sensorId(), 1, request.elapsedMillis(),
+                            request.operator(), now, now);
+                    try {
+                        repository.insertSensorSample(row);
+                    } catch (DuplicateKeyException ex) {
+                        // 并发下唯一约束兜底：同 sampleId 走重放/异参冲突，其余为传感器重复登记。
+                        if (constraintMatches(ex, "pk_sensor_sample")) {
+                            SensorSampleRow concurrent =
+                                    repository.findSensorSample(request.sampleId()).orElseThrow();
+                            return replaySampleOrConflict(raceId, bib, request, concurrent);
+                        }
+                        throw new UnprocessableEntityException(
+                                "该传感器已登记读数，须通过修订接口变更: " + request.sensorId());
+                    }
+                    SensorSampleRow saved =
+                            repository.findSensorSample(request.sampleId()).orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toSensorSampleResponse(saved));
+                });
+    }
+
+    private ServiceResult replaySampleOrConflict(
+            String raceId,
+            String bib,
+            SubmitSensorSampleRequest request,
+            SensorSampleRow existing) {
+        boolean sameParams = existing.raceId().equals(raceId)
+                && existing.bib().equals(bib)
+                && existing.checkpointCode().equals(request.checkpointCode())
+                && existing.sensorId().equals(request.sensorId())
+                && existing.elapsedMillis() == request.elapsedMillis()
+                && existing.operator().equals(request.operator());
+        if (!sameParams) {
+            throw new ConflictException(
+                    "sampleId 已用于不同参数的采样记录: " + request.sampleId());
+        }
+        return ServiceResult.created(ResponseMapper.toSensorSampleResponse(existing));
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult reviseSensorSample(
+            String raceId, String bib, ReviseSensorSampleRequest request) {
+        return withIdempotency(request.requestId(), "REVISE_SENSOR_SAMPLE",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "checkpointCode", request.checkpointCode(),
+                        "sensorId", request.sensorId(),
+                        "elapsedMillis", request.elapsedMillis(),
+                        "operator", request.operator(),
+                        "expectedRaceVersion", request.expectedRaceVersion(),
+                        "expectedSensorRevision", request.expectedSensorRevision()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedRaceVersion());
+                    requireRunner(raceId, bib);
+                    requireSensorCheckpoint(raceId, request.checkpointCode());
+                    validateSensorReading(request.elapsedMillis());
+                    SensorSampleRow sample = repository.findSensorSampleBySensor(
+                                    raceId, bib, request.checkpointCode(), request.sensorId())
+                            .orElseThrow(() -> new NotFoundException(
+                                    "传感器采样不存在: " + request.sensorId()));
+                    if (sample.sensorRevision() != request.expectedSensorRevision()) {
+                        throw new ConflictException(
+                                "传感器修订号冲突: expected=" + request.expectedSensorRevision()
+                                        + ", actual=" + sample.sensorRevision());
+                    }
+                    long now = clock.millis();
+                    // 赛事版本与传感器修订号在同一事务内共同推进。
+                    bumpVersion(race, request.expectedRaceVersion());
+                    int updated = repository.reviseSensorSample(
+                            sample.sampleId(), request.elapsedMillis(),
+                            request.expectedSensorRevision(), now);
+                    if (updated == 0) {
+                        throw new ConflictException(
+                                "传感器修订号冲突: expected=" + request.expectedSensorRevision());
+                    }
+                    // 旧裁定立即失效并从即时排名视图排除；历史裁定保留不覆写。
+                    repository.supersedeAdjudications(raceId, bib, request.checkpointCode());
+                    repository.deleteTiming(raceId, bib, request.checkpointCode());
+                    return ServiceResult.ok(new SensorRevisionResponse(
+                            bib, request.checkpointCode(), request.sensorId(),
+                            request.expectedSensorRevision() + 1, request.elapsedMillis(),
+                            request.expectedRaceVersion() + 1));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult adjudicateSensor(
+            String raceId, String bib, AdjudicateSensorRequest request) {
+        return withIdempotency(request.requestId(), "ADJUDICATE_SENSOR",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "adjudicationId", request.adjudicationId(),
+                        "checkpointCode", request.checkpointCode(),
+                        "operator", request.operator(),
+                        "expectedVersion", request.expectedVersion()),
+                () -> {
+                    // adjudicationId 是第二层全局幂等键：同参重放原结果，异参409。
+                    SensorAdjudicationRow existingAdjudication =
+                            repository.findSensorAdjudication(request.adjudicationId())
+                                    .orElse(null);
+                    if (existingAdjudication != null) {
+                        return replayAdjudicationOrConflict(
+                                raceId, bib, request, existingAdjudication);
+                    }
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    RunnerRow runner = requireRunner(raceId, bib);
+                    CheckpointRow checkpoint =
+                            requireSensorCheckpoint(raceId, request.checkpointCode());
+                    List<SensorSampleRow> samples =
+                            repository.findSensorSamples(raceId, bib, request.checkpointCode());
+                    SensorQuorum.QuorumResult quorum = SensorQuorum.adjudicate(samples);
+                    if (!quorum.accepted()) {
+                        throw new UnprocessableEntityException(quorum.violation());
+                    }
+                    long median = quorum.medianMillis();
+                    // 原严格递增与完赛边界不变量仍须满足，违反则422整次不写计时。
+                    List<CheckpointTimingRow> runnerTimings =
+                            repository.findTimingsForRunner(raceId, bib);
+                    String violation = CheckpointRules.validate(
+                            runnerTimings, checkpoint.position(), median, runner.finishTimeMs());
+                    if (violation != null) {
+                        throw new UnprocessableEntityException(violation);
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    List<SensorReadingResponse> readings = samples.stream()
+                            .map(ResponseMapper::toSensorReadingResponse)
+                            .toList();
+                    SensorAdjudicationRow adjudication = new SensorAdjudicationRow(
+                            request.adjudicationId(), raceId, bib, request.checkpointCode(),
+                            median, writeJson(readings), request.expectedVersion() + 1,
+                            false, request.operator(), now);
+                    // 裁定取中位值写入原分段计时，timingId 复用裁定ID。
+                    CheckpointTimingRow timing = new CheckpointTimingRow(
+                            request.adjudicationId(), raceId, bib, request.checkpointCode(),
+                            checkpoint.position(), median, now);
+                    try {
+                        repository.insertTiming(timing);
+                        repository.insertSensorAdjudication(adjudication);
+                    } catch (DuplicateKeyException ex) {
+                        if (constraintMatches(ex, "pk_sensor_adjudication")
+                                || constraintMatches(ex, "pk_checkpoint_timing")) {
+                            SensorAdjudicationRow concurrent = repository
+                                    .findSensorAdjudication(request.adjudicationId())
+                                    .orElseThrow();
+                            return replayAdjudicationOrConflict(
+                                    raceId, bib, request, concurrent);
+                        }
+                        throw new UnprocessableEntityException(
+                                "同一选手同一检查点最多一条分段记录");
+                    }
+                    SensorAdjudicationRow saved =
+                            repository.findSensorAdjudication(request.adjudicationId())
+                                    .orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toSensorAdjudicationResponse(
+                            saved, parseReadings(saved.sensorReadings())));
+                });
+    }
+
+    private ServiceResult replayAdjudicationOrConflict(
+            String raceId,
+            String bib,
+            AdjudicateSensorRequest request,
+            SensorAdjudicationRow existing) {
+        boolean sameParams = existing.raceId().equals(raceId)
+                && existing.bib().equals(bib)
+                && existing.checkpointCode().equals(request.checkpointCode())
+                && existing.operator().equals(request.operator());
+        if (!sameParams) {
+            throw new ConflictException(
+                    "adjudicationId 已用于不同参数的裁定: " + request.adjudicationId());
+        }
+        return ServiceResult.created(ResponseMapper.toSensorAdjudicationResponse(
+                existing, parseReadings(existing.sensorReadings())));
+    }
+
+    /** 校验检查点存在且已启用三源计时模式；未启用时拒绝传感器写入口。 */
+    private CheckpointRow requireSensorCheckpoint(String raceId, String checkpointCode) {
+        CheckpointRow checkpoint = repository.findCheckpoint(raceId, checkpointCode)
+                .orElseThrow(() -> new NotFoundException("检查点不存在: " + checkpointCode));
+        if (!checkpoint.sensorMode()) {
+            throw new UnprocessableEntityException(
+                    "检查点未启用三源计时模式: " + checkpointCode);
+        }
+        return checkpoint;
+    }
+
+    private List<SensorReadingResponse> parseReadings(String readingsJson) {
+        try {
+            return objectMapper.readValue(
+                    readingsJson, new TypeReference<List<SensorReadingResponse>>() { });
+        } catch (com.fasterxml.jackson.core.JsonProcessingException ex) {
+            throw new IllegalStateException("解析冻结的传感器读数失败", ex);
+        }
     }
 
     @Override
@@ -590,6 +862,16 @@ public class RaceServiceImpl implements RaceService {
         }
     }
 
+    /** 传感器读数取值校验：1~86400000 的整数毫秒。 */
+    private static void validateSensorReading(Long elapsedMillis) {
+        if (elapsedMillis == null) {
+            throw new BadRequestException("传感器读数必须携带 elapsedMillis");
+        }
+        if (elapsedMillis < 1 || elapsedMillis > SensorQuorum.MAX_READING_MILLIS) {
+            throw new BadRequestException("传感器读数毫秒数必须在 1~86400000 之间");
+        }
+    }
+
     private static PenaltyType parsePenaltyType(String type) {
         try {
             return PenaltyType.valueOf(type);
@@ -675,12 +957,14 @@ public class RaceServiceImpl implements RaceService {
     /**
      * 构造封榜快照的全部分段明细：每名选手 × 每个检查点一行，
      * 已有通过记录固化耗时与 timingId，缺失检查点对应字段为 null；顺序为参赛号、检查点顺序。
+     * 三源检查点额外固化有效裁定ID与冻结的三条传感器读数（中位依据）。
      */
     private List<SnapshotCheckpointRow> buildSnapshotCheckpoints(
             String raceId,
             List<RunnerRow> runners,
             List<CheckpointRow> checkpoints,
-            List<CheckpointTimingRow> timings) {
+            List<CheckpointTimingRow> timings,
+            Map<String, Map<String, SensorAdjudicationRow>> validAdjudications) {
         Map<String, Map<String, CheckpointTimingRow>> byBibAndCode = new TreeMap<>();
         for (CheckpointTimingRow timing : timings) {
             byBibAndCode
@@ -692,7 +976,8 @@ public class RaceServiceImpl implements RaceService {
         for (RunnerRow runner : runners) {
             appendSnapshotCheckpointRows(
                     rows, raceId, runner.bib(), checkpoints,
-                    byBibAndCode.getOrDefault(runner.bib(), Map.of()));
+                    byBibAndCode.getOrDefault(runner.bib(), Map.of()),
+                    validAdjudications.getOrDefault(runner.bib(), Map.of()));
         }
         return rows;
     }
@@ -702,17 +987,76 @@ public class RaceServiceImpl implements RaceService {
             String raceId,
             String bib,
             List<CheckpointRow> checkpoints,
-            Map<String, CheckpointTimingRow> timingByCode) {
+            Map<String, CheckpointTimingRow> timingByCode,
+            Map<String, SensorAdjudicationRow> adjudicationByCode) {
         for (CheckpointRow checkpoint : checkpoints) {
             CheckpointTimingRow timing = timingByCode.get(checkpoint.checkpointCode());
             if (timing == null) {
                 rows.add(new SnapshotCheckpointRow(
                         raceId, bib, checkpoint.checkpointCode(),
                         checkpoint.position(), null, null));
+            } else if (checkpoint.sensorMode()) {
+                SensorAdjudicationRow adjudication =
+                        adjudicationByCode.get(checkpoint.checkpointCode());
+                rows.add(new SnapshotCheckpointRow(
+                        raceId, bib, checkpoint.checkpointCode(),
+                        checkpoint.position(), timing.elapsedMillis(), timing.timingId(),
+                        adjudication == null ? null : adjudication.adjudicationId(),
+                        adjudication == null ? null : adjudication.sensorReadings()));
             } else {
                 rows.add(new SnapshotCheckpointRow(
                         raceId, bib, checkpoint.checkpointCode(),
                         checkpoint.position(), timing.elapsedMillis(), timing.timingId()));
+            }
+        }
+    }
+
+    /** 把有效裁定列表组织为 参赛号 → 检查点代码 → 裁定 的索引。 */
+    private static Map<String, Map<String, SensorAdjudicationRow>> validAdjudicationMap(
+            List<SensorAdjudicationRow> adjudications) {
+        Map<String, Map<String, SensorAdjudicationRow>> byBib = new TreeMap<>();
+        for (SensorAdjudicationRow adjudication : adjudications) {
+            byBib.computeIfAbsent(adjudication.bib(), key -> new TreeMap<>())
+                    .put(adjudication.checkpointCode(), adjudication);
+        }
+        return byBib;
+    }
+
+    /**
+     * 封榜前置校验：参与排名候选（有完赛耗时且未取消资格）的选手，
+     * 其每个启用三源模式的检查点都必须存在当前有效的裁定；
+     * 采样修订后旧裁定已失效，缺少有效裁定时拒绝封榜（422）。
+     */
+    private static void requireValidAdjudicationsForSealing(
+            List<RunnerRow> runners,
+            List<PenaltyRow> penalties,
+            List<CheckpointRow> checkpoints,
+            Map<String, Map<String, SensorAdjudicationRow>> validAdjudications) {
+        List<CheckpointRow> sensorCheckpoints = checkpoints.stream()
+                .filter(CheckpointRow::sensorMode)
+                .toList();
+        if (sensorCheckpoints.isEmpty()) {
+            return;
+        }
+        java.util.Set<String> disqualified = new java.util.HashSet<>();
+        for (PenaltyRow penalty : penalties) {
+            if (!penalty.revoked() && penalty.type() == PenaltyType.DISQUALIFY) {
+                disqualified.add(penalty.bib());
+            }
+        }
+        for (RunnerRow runner : runners) {
+            if (runner.finishTimeMs() == null || disqualified.contains(runner.bib())) {
+                continue;
+            }
+            Map<String, SensorAdjudicationRow> byCode =
+                    validAdjudications.getOrDefault(runner.bib(), Map.of());
+            for (CheckpointRow checkpoint : sensorCheckpoints) {
+                if (!byCode.containsKey(checkpoint.checkpointCode())) {
+                    throw new UnprocessableEntityException(
+                            "选手 " + runner.bib() + " 的三源检查点 "
+                                    + checkpoint.checkpointCode()
+                                    + " 缺少有效裁定，不能封榜");
+                }
             }
         }
     }

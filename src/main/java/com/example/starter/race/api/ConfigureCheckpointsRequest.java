@@ -27,10 +27,23 @@ public record ConfigureCheckpointsRequest(
      *
      * @param checkpointCode 检查点代码，赛事内唯一
      * @param position       检查点顺序，从1连续递增
+     * @param sensorMode     是否启用三源计时模式：true 时该点只能经传感器采样与裁定写入分段，
+     *                       原单条计时入口拒绝；缺省 false
      */
     public record CheckpointDefinition(
             @NotBlank String checkpointCode,
-            @NotNull @Positive Integer position
+            @NotNull @Positive Integer position,
+            Boolean sensorMode
     ) {
+
+        /** 兼容构造器：未声明三源模式时按普通单条计时检查点处理。 */
+        public CheckpointDefinition(String checkpointCode, Integer position) {
+            this(checkpointCode, position, Boolean.FALSE);
+        }
+
+        /** 归一化后的三源模式标记（null 视为 false）。 */
+        public boolean sensorModeEnabled() {
+            return Boolean.TRUE.equals(sensorMode);
+        }
     }
 }

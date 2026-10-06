@@ -6,6 +6,9 @@ import com.example.starter.race.api.PenaltyResponse;
 import com.example.starter.race.api.ResultEntryResponse;
 import com.example.starter.race.api.RunnerResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
+import com.example.starter.race.api.SensorAdjudicationResponse;
+import com.example.starter.race.api.SensorReadingResponse;
+import com.example.starter.race.api.SensorSampleResponse;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
@@ -15,6 +18,8 @@ import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
+import com.example.starter.race.persistence.SensorAdjudicationRow;
+import com.example.starter.race.persistence.SensorSampleRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
@@ -44,6 +49,23 @@ final class ResponseMapper {
         return new CheckpointTimingResponse(
                 row.timingId(), row.bib(), row.checkpointCode(), row.position(),
                 row.elapsedMillis(), row.createdAt());
+    }
+
+    static SensorSampleResponse toSensorSampleResponse(SensorSampleRow row) {
+        return new SensorSampleResponse(
+                row.sampleId(), row.bib(), row.checkpointCode(), row.sensorId(),
+                row.sensorRevision(), row.elapsedMillis(), row.createdAt());
+    }
+
+    static SensorReadingResponse toSensorReadingResponse(SensorSampleRow row) {
+        return new SensorReadingResponse(row.sensorId(), row.sensorRevision(), row.elapsedMillis());
+    }
+
+    static SensorAdjudicationResponse toSensorAdjudicationResponse(
+            SensorAdjudicationRow row, List<SensorReadingResponse> readings) {
+        return new SensorAdjudicationResponse(
+                row.adjudicationId(), row.bib(), row.checkpointCode(),
+                row.medianElapsedMillis(), readings, row.raceVersion(), row.createdAt());
     }
 
     static StandingResponse liveStanding(
