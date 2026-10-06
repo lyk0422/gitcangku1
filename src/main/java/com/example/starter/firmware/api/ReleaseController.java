@@ -48,6 +48,12 @@ public class ReleaseController {
         return releaseService.resume(releaseId, request);
     }
 
+    @PostMapping("/{releaseId}/install-tasks")
+    public TaskView createInstallTask(@PathVariable long releaseId,
+                                      @Valid @RequestBody CreateInstallTaskRequest request) {
+        return taskService.createInstallTask(releaseId, request);
+    }
+
     @GetMapping("/{releaseId}/monitor")
     public MonitorView monitor(@PathVariable long releaseId) {
         return releaseService.monitor(releaseId);

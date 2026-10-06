@@ -119,6 +119,10 @@ public class ReleaseService {
         }, ReleaseView.class);
     }
 
+    /**
+     * 发布整体取消：禁止新领取；未开始任务直接取消；已开始（INSTALLING）任务转 CANCEL_REQUESTED
+     * 待设备停止确认（代次加一、保留安装槽），不伪造任务已停。
+     */
     public ReleaseView cancel(long releaseId, String requestId) {
         String fingerprint = String.join("|", "release.cancel", String.valueOf(releaseId));
         return idempotency.execute(requestId, "release.cancel", fingerprint, () -> {
@@ -127,6 +131,7 @@ public class ReleaseService {
             if (order.status() == ReleaseStatus.ACTIVE || order.status() == ReleaseStatus.PAUSED) {
                 releaseRepository.cancel(releaseId);
                 taskRepository.cancelPendingByRelease(releaseId);
+                taskRepository.requestCancelInstallingByRelease(releaseId, order.monitorRound());
             }
             return ReleaseView.of(findOrder(releaseId));
         }, ReleaseView.class);

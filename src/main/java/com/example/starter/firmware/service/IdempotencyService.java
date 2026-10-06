@@ -7,6 +7,11 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.function.Supplier;
 
 /**
@@ -90,5 +95,39 @@ public class IdempotencyService {
         } catch (Exception e) {
             throw new IllegalStateException("幂等响应序列化失败", e);
         }
+    }
+
+    /**
+     * 结构化请求指纹：以 JSON 命名字段比较操作、资源与全部参数，字段无碰撞；
+     * 数字统一按十进制值规范化（1 与 1.0 同参），文本原样比较。
+     */
+    public String fingerprint(String api, String resource, Map<String, ?> params) {
+        Map<String, Object> structure = new LinkedHashMap<>();
+        structure.put("api", api);
+        structure.put("resource", resource);
+        structure.put("params", canonicalize(params));
+        return writeJson(structure);
+    }
+
+    private Object canonicalize(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            Map<String, Object> result = new LinkedHashMap<>();
+            map.forEach((k, v) -> result.put(String.valueOf(k), canonicalize(v)));
+            return result;
+        }
+        if (value instanceof List<?> list) {
+            return list.stream().map(this::canonicalize).toList();
+        }
+        if (value instanceof Integer || value instanceof Long || value instanceof Short
+                || value instanceof Byte || value instanceof BigInteger) {
+            return new BigDecimal(value.toString()).stripTrailingZeros();
+        }
+        if (value instanceof BigDecimal decimal) {
+            return decimal.stripTrailingZeros();
+        }
+        if (value instanceof Double || value instanceof Float) {
+            return BigDecimal.valueOf(((Number) value).doubleValue()).stripTrailingZeros();
+        }
+        return value;
     }
 }

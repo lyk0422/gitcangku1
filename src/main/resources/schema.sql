@@ -34,13 +34,19 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '任务ID',
   release_id BIGINT NOT NULL COMMENT '所属发布单ID',
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
-  status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
-  first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  status VARCHAR(16) NOT NULL COMMENT 'PENDING待开始/待回执；INSTALLING安装中（占槽，仅此时接受普通回执）；CANCEL_REQUESTED取消待确认（占槽，只接受同代次停止确认）；SUCCESS成功；FAILED失败；CANCELLED已取消',
+  first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL，历史冻结不可改',
+  task_type VARCHAR(16) NOT NULL DEFAULT 'PLAIN' COMMENT '任务类型：PLAIN普通回执任务；INSTALL安装握手任务（需显式开始与停止确认）',
+  cancel_generation INT NOT NULL DEFAULT 0 COMMENT '取消代次，0表示未请求取消；每次取消请求加一，停止确认须同代次，历史冻结',
+  cancel_round INT NULL COMMENT '最近一次取消请求时所在监控轮次（历史冻结），未取消为NULL',
+  device_slot VARCHAR(64) NULL COMMENT '占用中的设备独占安装槽，INSTALLING/CANCEL_REQUESTED时等于device_id，其余为NULL',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
   CONSTRAINT uk_task_release_device UNIQUE (release_id, device_id)
 ) COMMENT='设备投放任务，同设备同发布单最多一条';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_task_device_slot ON rollout_task (device_slot);
 
 CREATE TABLE IF NOT EXISTS release_pause_record (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '暂停记录ID',
