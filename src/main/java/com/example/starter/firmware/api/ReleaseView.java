@@ -3,15 +3,15 @@ package com.example.starter.firmware.api;
 import com.example.starter.firmware.domain.ReleaseOrder;
 
 /**
- * 发布单视图。
+ * 发布单视图。taskType 为任务类型：NORMAL 普通任务，BOOT_CHALLENGE 启动挑战任务。
  */
 public record ReleaseView(long releaseId, int version, String model, String fromVersion, String toVersion,
-                          int ratio, String status, int sampleFloor, int failureThresholdPercent,
-                          int monitorRound) {
+                          int ratio, String status, String taskType, int sampleFloor,
+                          int failureThresholdPercent, int monitorRound) {
 
     public static ReleaseView of(ReleaseOrder order) {
         return new ReleaseView(order.id(), order.version(), order.model(), order.fromVersion(),
-                order.toVersion(), order.ratio(), order.status().name(), order.sampleFloor(),
-                order.failureThresholdPercent(), order.monitorRound());
+                order.toVersion(), order.ratio(), order.status().name(), order.taskType().name(),
+                order.sampleFloor(), order.failureThresholdPercent(), order.monitorRound());
     }
 }

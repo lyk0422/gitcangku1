@@ -3,6 +3,7 @@ package com.example.starter.firmware.repo;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
+import com.example.starter.firmware.domain.TaskType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
@@ -23,11 +24,12 @@ public class ReleaseRepository {
             rs.getLong("id"), rs.getInt("version"), rs.getString("model"),
             rs.getString("from_version"), rs.getString("to_version"),
             rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
+            TaskType.valueOf(rs.getString("task_type")),
             rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
             rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
 
     private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
-            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
+            + " task_type, sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
 
     private final JdbcTemplate jdbc;
 
@@ -36,21 +38,22 @@ public class ReleaseRepository {
     }
 
     public long insert(String model, String fromVersion, String toVersion, int ratio,
-                       int sampleFloor, int failureThresholdPercent) {
+                       int sampleFloor, int failureThresholdPercent, TaskType taskType) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO release_order (version, model, from_version, to_version, ratio, status,"
-                            + " sample_floor, failure_threshold_percent, monitor_round, active_model)"
-                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?)",
+                            + " task_type, sample_floor, failure_threshold_percent, monitor_round, active_model)"
+                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, 1, ?)",
                     new String[]{"id"});
             ps.setString(1, model);
             ps.setString(2, fromVersion);
             ps.setString(3, toVersion);
             ps.setInt(4, ratio);
-            ps.setInt(5, sampleFloor);
-            ps.setInt(6, failureThresholdPercent);
-            ps.setString(7, model);
+            ps.setString(5, taskType.name());
+            ps.setInt(6, sampleFloor);
+            ps.setInt(7, failureThresholdPercent);
+            ps.setString(8, model);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

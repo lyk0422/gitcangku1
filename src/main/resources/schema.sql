@@ -5,6 +5,8 @@ CREATE TABLE IF NOT EXISTS device (
   model VARCHAR(64) NOT NULL COMMENT '设备型号，登记后不可修改',
   current_version VARCHAR(64) NOT NULL COMMENT '设备当前固件版本',
   bucket_no INT NOT NULL COMMENT '灰度分桶号，取值0~99，登记后不可修改',
+  boot_count BIGINT NOT NULL DEFAULT 0 COMMENT '设备启动计数，不可递减的非负整数，登记时为0；维护或启动挑战成功回执后提升',
+  device_version INT NOT NULL DEFAULT 1 COMMENT '设备档案版本，从1开始，每次维护（提交expectedDeviceVersion校验通过）成功加一',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
   PRIMARY KEY (device_id)
 ) COMMENT='设备登记表';
@@ -17,6 +19,7 @@ CREATE TABLE IF NOT EXISTS release_order (
   to_version VARCHAR(64) NOT NULL COMMENT '目标固件版本，必须与来源版本不同',
   ratio INT NOT NULL COMMENT '投放比例，取值0~100，只增不减',
   status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE投放中，PAUSED失败率自动暂停，CANCELLED已取消（终态）',
+  task_type VARCHAR(16) NOT NULL DEFAULT 'NORMAL' COMMENT '任务类型：NORMAL普通任务；BOOT_CHALLENGE启动挑战任务，回执须携带挑战与启动计数证明',
   sample_floor INT NOT NULL COMMENT '失败率统计样本下限，取值2~100；本轮样本数达到下限才评估暂停',
   failure_threshold_percent INT NOT NULL COMMENT '失败率阈值百分比，取值1~100；FAILED×100>=样本数×阈值时自动暂停',
   monitor_round INT NOT NULL DEFAULT 1 COMMENT '当前监控轮次，从1开始，人工恢复后加一并清零统计',
@@ -36,11 +39,16 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  task_type VARCHAR(16) NOT NULL DEFAULT 'NORMAL' COMMENT '任务类型：NORMAL普通任务；BOOT_CHALLENGE启动挑战任务',
+  challenge VARCHAR(64) NULL COMMENT '启动挑战值，BOOT_CHALLENGE任务领取时生成的合成唯一值（非密码学签名），创建后不可改；普通任务为NULL',
+  frozen_boot_count BIGINT NULL COMMENT '领取时冻结的设备启动计数b，SUCCESS回执的计数c必须严格大于b；普通任务为NULL',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
   CONSTRAINT uk_task_release_device UNIQUE (release_id, device_id)
 ) COMMENT='设备投放任务，同设备同发布单最多一条';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_task_challenge ON rollout_task (challenge);
 
 CREATE TABLE IF NOT EXISTS release_pause_record (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '暂停记录ID',
