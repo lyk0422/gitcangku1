@@ -60,13 +60,16 @@ public class PlanService {
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
+    private final AxleEnvelopeService axleEnvelopeService;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
+                       AxleEnvelopeService axleEnvelopeService,
                        ObjectMapper objectMapper, PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
+        this.axleEnvelopeService = axleEnvelopeService;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
     }
@@ -161,8 +164,17 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "存在时隙冲突，计划保持草稿", conflicts);
                 }
+                // 车轴局部集中承载核验：档案缺失 404，单轴或三轴滑窗越限 422，整次不写占用
+                List<Map<String, Object>> axleViolations =
+                        axleEnvelopeService.validateOccupancies(occupancies);
+                if (!axleViolations.isEmpty()) {
+                    throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "AXLE_LIMIT_EXCEEDED",
+                            "轴重或连续三轴总重越限，计划保持草稿", axleViolations);
+                }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.PUBLISHED, now);
+                // 发布冻结当时轴序列及各区段限值、版本，后续档案合法修改不改写历史
+                axleEnvelopeService.freezeSnapshot(plan.id(), occupancies);
                 PlanResponse response = loadPlan(scheduleKey);
                 idemRepo.insert(OP_PUBLISH, requestKey, hash, toJson(response), now);
                 return response;
@@ -260,10 +272,19 @@ public class PlanService {
                     throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SLOT_CONFLICT",
                             "新草稿存在时隙冲突，改签未生效", conflicts);
                 }
+                // 候选计划全部轴窗核验：档案缺失 404，越限 422，改签整体不生效
+                List<Map<String, Object>> axleViolations =
+                        axleEnvelopeService.validateOccupancies(occupancies);
+                if (!axleViolations.isEmpty()) {
+                    throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "AXLE_LIMIT_EXCEEDED",
+                            "新草稿轴重或连续三轴总重越限，改签未生效", axleViolations);
+                }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(oldPlan.id(), PlanStatus.CANCELLED, now);
                 planRepo.updateStatus(newPlan.id(), PlanStatus.PUBLISHED, now);
                 planRepo.insertRescheduleLink(oldPlan.id(), newPlan.id(), now);
+                // 改签发布同样冻结当时轴序列及各区段限值、版本
+                axleEnvelopeService.freezeSnapshot(newPlan.id(), occupancies);
                 RescheduleResponse response = new RescheduleResponse(
                         loadPlan(oldScheduleKey), loadPlan(req.newScheduleKey()));
                 idemRepo.insert(OP_RESCHEDULE, req.requestKey(), hash, toJson(response), now);
