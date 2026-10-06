@@ -13,12 +13,15 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.example.starter.maintenance.api.dto.AddRawReadingRequest;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
 import com.example.starter.maintenance.api.dto.RegisterEquipmentRequest;
+import com.example.starter.maintenance.api.dto.RegisterRangeRequest;
+import com.example.starter.maintenance.api.dto.ReviseRawReadingRequest;
 import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
@@ -44,12 +47,31 @@ public class EquipmentController {
         return service.register(req);
     }
 
+    /** 登记量程 M：仅可在设备尚无读数时登记一次，正整数且不可变。 */
+    @PostMapping("/{equipmentId}/range")
+    @ResponseStatus(HttpStatus.CREATED)
+    public EquipmentResponse registerRange(@PathVariable String equipmentId,
+                                           @Valid @RequestBody RegisterRangeRequest req) {
+        return service.registerRange(equipmentId, req);
+    }
+
     /** 新增工时读数（允许补录历史）；按采样时刻排序后累计分钟须单调不减，否则 422。 */
     @PostMapping("/{equipmentId}/readings")
     @ResponseStatus(HttpStatus.CREATED)
     public ReadingResponse addReading(@PathVariable String equipmentId,
                                       @Valid @RequestBody AddReadingRequest req) {
         return service.addReading(equipmentId, req);
+    }
+
+    /**
+     * 新增原始工时读数（已启用量程设备）：raw 须满足 0 <= raw < M，wrapCount 非负；
+     * 归一累计分钟 = wrapCount * M + raw，先检查溢出（400），再做前后邻居单调校验（422）。
+     */
+    @PostMapping("/{equipmentId}/raw-readings")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ReadingResponse addRawReading(@PathVariable String equipmentId,
+                                         @Valid @RequestBody AddRawReadingRequest req) {
+        return service.addRawReading(equipmentId, req);
     }
 
     /** 修订读数：只改累计分钟、不改采样时刻；作为历史保养锚点的读数返回 409。 */
@@ -59,6 +81,18 @@ public class EquipmentController {
                                          @PathVariable String readingId,
                                          @Valid @RequestBody ReviseReadingRequest req) {
         return service.reviseReading(equipmentId, readingId, req);
+    }
+
+    /**
+     * 修订原始读数（已启用量程设备）：只改 raw 与 wrapCount、不改 UTC 采样时刻；
+     * 携带读数当前修订号，按所有有效相邻读数重新判断单调性；历史保养锚点不可修订（409）。
+     */
+    @PostMapping("/{equipmentId}/readings/{readingId}/raw-revisions")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ReadingResponse reviseRawReading(@PathVariable String equipmentId,
+                                            @PathVariable String readingId,
+                                            @Valid @RequestBody ReviseRawReadingRequest req) {
+        return service.reviseRawReading(equipmentId, readingId, req);
     }
 
     /** 完成保养：以现存读数及其当前修订号为锚点，锚点时间须晚于上次保养锚点。 */

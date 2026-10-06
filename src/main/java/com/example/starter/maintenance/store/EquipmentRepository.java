@@ -20,9 +20,19 @@ import com.example.starter.maintenance.domain.Reading;
 
 /**
  * 设备工时保养数据访问层。所有 SQL 参数化；时刻字段（TIMESTAMP WITH TIME ZONE）以 UTC 存取。
+ * 量程相关列（range_m、raw_value、wrap_count 及保养锚点快照）在未启用量程的设备上为 NULL。
  */
 @Repository
 public class EquipmentRepository {
+
+    private static final String EQUIPMENT_COLUMNS =
+            "equipment_id, maintenance_period_minutes, range_m, version";
+    private static final String READING_COLUMNS =
+            "equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no, raw_value, wrap_count";
+    private static final String MAINTENANCE_COLUMNS =
+            "maintenance_id, equipment_id, reading_id, anchor_revision_no, anchor_sampled_at,"
+                    + " anchor_cumulative_minutes, anchor_raw_value, anchor_wrap_count, anchor_range_m,"
+                    + " completed_at";
 
     private final JdbcTemplate jdbc;
 
@@ -41,6 +51,7 @@ public class EquipmentRepository {
     private static final RowMapper<Equipment> EQUIPMENT_MAPPER = (rs, rowNum) -> new Equipment(
             rs.getString("equipment_id"),
             rs.getLong("maintenance_period_minutes"),
+            rs.getObject("range_m", Long.class),
             rs.getLong("version"));
 
     private static final RowMapper<Reading> READING_MAPPER = (rs, rowNum) -> new Reading(
@@ -48,7 +59,9 @@ public class EquipmentRepository {
             rs.getString("reading_id"),
             readInstant(rs, "sampled_at"),
             rs.getLong("cumulative_minutes"),
-            rs.getInt("revision_no"));
+            rs.getInt("revision_no"),
+            rs.getObject("raw_value", Long.class),
+            rs.getObject("wrap_count", Long.class));
 
     private static final RowMapper<MaintenanceRecord> MAINTENANCE_MAPPER = (rs, rowNum) -> new MaintenanceRecord(
             rs.getLong("maintenance_id"),
@@ -57,19 +70,27 @@ public class EquipmentRepository {
             rs.getInt("anchor_revision_no"),
             readInstant(rs, "anchor_sampled_at"),
             rs.getLong("anchor_cumulative_minutes"),
+            rs.getObject("anchor_raw_value", Long.class),
+            rs.getObject("anchor_wrap_count", Long.class),
+            rs.getObject("anchor_range_m", Long.class),
             readInstant(rs, "completed_at"));
 
     // ---------- 设备 ----------
 
     public void insertEquipment(String equipmentId, long maintenancePeriodMinutes, Instant createdAt) {
-        jdbc.update("INSERT INTO equipment (equipment_id, maintenance_period_minutes, version, created_at)"
-                        + " VALUES (?, ?, 1, ?)",
+        jdbc.update("INSERT INTO equipment (equipment_id, maintenance_period_minutes, range_m, version,"
+                        + " created_at) VALUES (?, ?, NULL, 1, ?)",
                 equipmentId, maintenancePeriodMinutes, utc(createdAt));
+    }
+
+    /** 登记量程 M：仅允许在尚无读数时调用一次，登记后不可修改。 */
+    public void setRange(String equipmentId, long rangeM) {
+        jdbc.update("UPDATE equipment SET range_m = ? WHERE equipment_id = ?", rangeM, equipmentId);
     }
 
     public Optional<Equipment> findEquipment(String equipmentId) {
         List<Equipment> rows = jdbc.query(
-                "SELECT equipment_id, maintenance_period_minutes, version FROM equipment WHERE equipment_id = ?",
+                "SELECT " + EQUIPMENT_COLUMNS + " FROM equipment WHERE equipment_id = ?",
                 EQUIPMENT_MAPPER, equipmentId);
         return rows.stream().findFirst();
     }
@@ -77,8 +98,7 @@ public class EquipmentRepository {
     /** 悲观行锁：同一设备的写操作串行化，保证版本校验与业务变更原子。 */
     public Optional<Equipment> findEquipmentForUpdate(String equipmentId) {
         List<Equipment> rows = jdbc.query(
-                "SELECT equipment_id, maintenance_period_minutes, version FROM equipment"
-                        + " WHERE equipment_id = ? FOR UPDATE",
+                "SELECT " + EQUIPMENT_COLUMNS + " FROM equipment WHERE equipment_id = ? FOR UPDATE",
                 EQUIPMENT_MAPPER, equipmentId);
         return rows.stream().findFirst();
     }
@@ -91,32 +111,38 @@ public class EquipmentRepository {
 
     public void insertReading(Reading reading, Instant createdAt) {
         jdbc.update("INSERT INTO reading (equipment_id, reading_id, sampled_at, cumulative_minutes,"
-                        + " revision_no, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
+                        + " revision_no, raw_value, wrap_count, created_at, updated_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 reading.equipmentId(), reading.readingId(), utc(reading.sampledAt()),
-                reading.cumulativeMinutes(), utc(createdAt), utc(createdAt));
+                reading.cumulativeMinutes(), reading.revisionNo(), reading.raw(), reading.wrapCount(),
+                utc(createdAt), utc(createdAt));
     }
 
     public Optional<Reading> findReading(String equipmentId, String readingId) {
         List<Reading> rows = jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
-                        + " FROM reading WHERE equipment_id = ? AND reading_id = ?",
+                "SELECT " + READING_COLUMNS + " FROM reading WHERE equipment_id = ? AND reading_id = ?",
                 READING_MAPPER, equipmentId, readingId);
         return rows.stream().findFirst();
     }
 
     public Optional<Reading> findReadingAt(String equipmentId, Instant sampledAt) {
         List<Reading> rows = jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
-                        + " FROM reading WHERE equipment_id = ? AND sampled_at = ?",
+                "SELECT " + READING_COLUMNS + " FROM reading WHERE equipment_id = ? AND sampled_at = ?",
                 READING_MAPPER, equipmentId, utc(sampledAt));
         return rows.stream().findFirst();
+    }
+
+    /** 设备当前读数条数（用于量程登记前置校验）。 */
+    public int countReadings(String equipmentId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM reading WHERE equipment_id = ?", Integer.class, equipmentId);
+        return count == null ? 0 : count;
     }
 
     /** 采样时刻严格早于给定时刻的最近一条读数。 */
     public Optional<Reading> findPrevReading(String equipmentId, Instant sampledAt) {
         List<Reading> rows = jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
-                        + " FROM reading WHERE equipment_id = ? AND sampled_at < ?"
+                "SELECT " + READING_COLUMNS + " FROM reading WHERE equipment_id = ? AND sampled_at < ?"
                         + " ORDER BY sampled_at DESC LIMIT 1",
                 READING_MAPPER, equipmentId, utc(sampledAt));
         return rows.stream().findFirst();
@@ -125,8 +151,7 @@ public class EquipmentRepository {
     /** 采样时刻严格晚于给定时刻的最近一条读数。 */
     public Optional<Reading> findNextReading(String equipmentId, Instant sampledAt) {
         List<Reading> rows = jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
-                        + " FROM reading WHERE equipment_id = ? AND sampled_at > ?"
+                "SELECT " + READING_COLUMNS + " FROM reading WHERE equipment_id = ? AND sampled_at > ?"
                         + " ORDER BY sampled_at ASC LIMIT 1",
                 READING_MAPPER, equipmentId, utc(sampledAt));
         return rows.stream().findFirst();
@@ -134,12 +159,13 @@ public class EquipmentRepository {
 
     public Optional<Reading> findLatestReading(String equipmentId) {
         List<Reading> rows = jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
-                        + " FROM reading WHERE equipment_id = ? ORDER BY sampled_at DESC LIMIT 1",
+                "SELECT " + READING_COLUMNS + " FROM reading WHERE equipment_id = ?"
+                        + " ORDER BY sampled_at DESC LIMIT 1",
                 READING_MAPPER, equipmentId);
         return rows.stream().findFirst();
     }
 
+    /** 直接修订累计分钟（仅未启用量程的设备；raw/wrap 保持 NULL）。 */
     public void updateReadingValue(String equipmentId, String readingId, long cumulativeMinutes,
                                    int newRevisionNo, Instant updatedAt) {
         jdbc.update("UPDATE reading SET cumulative_minutes = ?, revision_no = ?, updated_at = ?"
@@ -147,56 +173,77 @@ public class EquipmentRepository {
                 cumulativeMinutes, newRevisionNo, utc(updatedAt), equipmentId, readingId);
     }
 
+    /** 修订原始读数：更新 raw/wrap 及归一累计分钟，采样时刻不变。 */
+    public void updateReadingRaw(String equipmentId, String readingId, long raw, long wrapCount,
+                                 long cumulativeMinutes, int newRevisionNo, Instant updatedAt) {
+        jdbc.update("UPDATE reading SET raw_value = ?, wrap_count = ?, cumulative_minutes = ?,"
+                        + " revision_no = ?, updated_at = ? WHERE equipment_id = ? AND reading_id = ?",
+                raw, wrapCount, cumulativeMinutes, newRevisionNo, utc(updatedAt),
+                equipmentId, readingId);
+    }
+
     public List<Reading> listReadings(String equipmentId) {
         return jdbc.query(
-                "SELECT equipment_id, reading_id, sampled_at, cumulative_minutes, revision_no"
-                        + " FROM reading WHERE equipment_id = ? ORDER BY sampled_at ASC, reading_id ASC",
+                "SELECT " + READING_COLUMNS + " FROM reading WHERE equipment_id = ?"
+                        + " ORDER BY sampled_at ASC, reading_id ASC",
                 READING_MAPPER, equipmentId);
     }
 
     // ---------- 修订历史 ----------
 
     public void insertRevision(String equipmentId, String readingId, int revisionNo,
-                               long cumulativeMinutes, String requestId, Instant createdAt) {
+                               long cumulativeMinutes, Long raw, Long wrapCount,
+                               String requestId, Instant createdAt) {
         jdbc.update("INSERT INTO reading_revision (equipment_id, reading_id, revision_no,"
-                        + " cumulative_minutes, request_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                equipmentId, readingId, revisionNo, cumulativeMinutes, requestId, utc(createdAt));
+                        + " cumulative_minutes, raw_value, wrap_count, request_id, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                equipmentId, readingId, revisionNo, cumulativeMinutes, raw, wrapCount,
+                requestId, utc(createdAt));
     }
 
     public List<RevisionRow> listRevisions(String equipmentId, String readingId) {
         return jdbc.query(
-                "SELECT revision_no, cumulative_minutes, request_id, created_at FROM reading_revision"
+                "SELECT revision_no, cumulative_minutes, raw_value, wrap_count, request_id, created_at"
+                        + " FROM reading_revision"
                         + " WHERE equipment_id = ? AND reading_id = ? ORDER BY revision_no ASC",
                 (rs, rowNum) -> new RevisionRow(
                         rs.getInt("revision_no"),
                         rs.getLong("cumulative_minutes"),
                         rs.getString("request_id"),
-                        readInstant(rs, "created_at")),
+                        readInstant(rs, "created_at"),
+                        rs.getObject("raw_value", Long.class),
+                        rs.getObject("wrap_count", Long.class)),
                 equipmentId, readingId);
     }
 
-    public record RevisionRow(int revisionNo, long cumulativeMinutes, String requestId, Instant createdAt) {
+    public record RevisionRow(int revisionNo, long cumulativeMinutes, String requestId,
+                              Instant createdAt, Long raw, Long wrapCount) {
     }
 
     // ---------- 保养记录 ----------
 
     public long insertMaintenance(String equipmentId, String readingId, int anchorRevisionNo,
                                   Instant anchorSampledAt, long anchorCumulativeMinutes,
+                                  Long anchorRaw, Long anchorWrapCount, Long anchorRangeM,
                                   String requestId, Instant completedAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(connection -> {
             PreparedStatement ps = connection.prepareStatement(
                     "INSERT INTO maintenance (equipment_id, reading_id, anchor_revision_no,"
-                            + " anchor_sampled_at, anchor_cumulative_minutes, request_id, completed_at)"
-                            + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            + " anchor_sampled_at, anchor_cumulative_minutes, anchor_raw_value,"
+                            + " anchor_wrap_count, anchor_range_m, request_id, completed_at)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, equipmentId);
             ps.setString(2, readingId);
             ps.setInt(3, anchorRevisionNo);
             ps.setObject(4, utc(anchorSampledAt));
             ps.setLong(5, anchorCumulativeMinutes);
-            ps.setString(6, requestId);
-            ps.setObject(7, utc(completedAt));
+            ps.setObject(6, anchorRaw);
+            ps.setObject(7, anchorWrapCount);
+            ps.setObject(8, anchorRangeM);
+            ps.setString(9, requestId);
+            ps.setObject(10, utc(completedAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -209,9 +256,7 @@ public class EquipmentRepository {
     /** 最近一次保养（锚点时间最大者；锚点时间严格递增，故唯一）。 */
     public Optional<MaintenanceRecord> findLastMaintenance(String equipmentId) {
         List<MaintenanceRecord> rows = jdbc.query(
-                "SELECT maintenance_id, equipment_id, reading_id, anchor_revision_no,"
-                        + " anchor_sampled_at, anchor_cumulative_minutes, completed_at"
-                        + " FROM maintenance WHERE equipment_id = ?"
+                "SELECT " + MAINTENANCE_COLUMNS + " FROM maintenance WHERE equipment_id = ?"
                         + " ORDER BY anchor_sampled_at DESC, maintenance_id DESC LIMIT 1",
                 MAINTENANCE_MAPPER, equipmentId);
         return rows.stream().findFirst();
@@ -219,9 +264,7 @@ public class EquipmentRepository {
 
     public List<MaintenanceRecord> listMaintenances(String equipmentId) {
         return jdbc.query(
-                "SELECT maintenance_id, equipment_id, reading_id, anchor_revision_no,"
-                        + " anchor_sampled_at, anchor_cumulative_minutes, completed_at"
-                        + " FROM maintenance WHERE equipment_id = ?"
+                "SELECT " + MAINTENANCE_COLUMNS + " FROM maintenance WHERE equipment_id = ?"
                         + " ORDER BY anchor_sampled_at ASC, maintenance_id ASC",
                 MAINTENANCE_MAPPER, equipmentId);
     }

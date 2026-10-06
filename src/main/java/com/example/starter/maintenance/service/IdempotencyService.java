@@ -1,6 +1,8 @@
 package com.example.starter.maintenance.service;
 
 import java.time.Clock;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.function.Supplier;
 
@@ -27,6 +29,38 @@ public class IdempotencyService {
         this.repository = repository;
         this.objectMapper = objectMapper;
         this.clock = clock;
+    }
+
+    /**
+     * 写操作身份：操作类型 + 结构化参数指纹。
+     *
+     * @param operation   操作类型
+     * @param fingerprint 结构化 JSON 指纹（操作、操作者、资源、全部参数与期望版本）
+     */
+    public record WriteIdentity(String operation, String fingerprint) {
+    }
+
+    /**
+     * 构造写操作身份。指纹为结构化 JSON（键固定、值按类型编码），
+     * 避免字符串拼接在参数含分隔符时发生碰撞；params 按插入顺序序列化，保证确定性。
+     *
+     * @param operation 操作类型
+     * @param resource  资源标识（如 equipment/{id}/readings/{readingId}）
+     * @param operator  操作者标识（可为 null）
+     * @param params    全部业务参数（含期望版本，不含 requestId）
+     */
+    public WriteIdentity identity(String operation, String resource, String operator,
+                                  Map<String, Object> params) {
+        Map<String, Object> structured = new LinkedHashMap<>();
+        structured.put("operation", operation);
+        structured.put("operator", operator);
+        structured.put("resource", resource);
+        structured.put("params", new LinkedHashMap<>(params));
+        try {
+            return new WriteIdentity(operation, objectMapper.writeValueAsString(structured));
+        } catch (Exception e) {
+            throw new IllegalStateException("幂等指纹序列化失败", e);
+        }
     }
 
     /**

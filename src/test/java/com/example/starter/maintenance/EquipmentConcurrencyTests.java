@@ -220,4 +220,126 @@ class EquipmentConcurrencyTests {
         mockMvc.perform(get("/api/equipment/eq-par/status"))
                 .andExpect(jsonPath("$.version").value(1 + threads));
     }
+
+    private void registerRange(String equipmentId, String requestId, long expectedVersion, long rangeM)
+            throws Exception {
+        mockMvc.perform(post("/api/equipment/" + equipmentId + "/range")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"requestId":"%s","expectedVersion":%d,"rangeM":%d}
+                                """.formatted(requestId, expectedVersion, rangeM)))
+                .andExpect(status().isCreated());
+    }
+
+    /** 并发同 requestId 原始读数：全部得到原成功结果，归一与回绕证据只落库一次。 */
+    @Test
+    void concurrentRawAdd_sameRequestId_singleEffect() throws Exception {
+        register("eq-craw", 10000);
+        registerRange("eq-craw", "craw-range", 1, 1000);
+        int threads = 8;
+        CountDownLatch gate = new CountDownLatch(1);
+        String body = """
+                {"requestId":"craw-1","expectedVersion":2,"readingId":"r1",
+                 "sampledAt":"2026-01-01T10:00:00Z","raw":990,"wrapCount":0}
+                """;
+        List<Future<MvcResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            futures.add(executor.submit(() -> {
+                gate.await(5, TimeUnit.SECONDS);
+                return postJson("/api/equipment/eq-craw/raw-readings", body);
+            }));
+        }
+        gate.countDown();
+
+        Set<String> bodies = new HashSet<>();
+        for (Future<MvcResult> future : futures) {
+            MvcResult result = future.get(15, TimeUnit.SECONDS);
+            assertEquals(201, result.getResponse().getStatus(),
+                    "并发同键同参应全部重放成功结果");
+            bodies.add(result.getResponse().getContentAsString());
+        }
+        assertEquals(1, bodies.size(), "所有并发响应应完全相同（重放同一成功结果）");
+
+        mockMvc.perform(get("/api/equipment/eq-craw/readings"))
+                .andExpect(jsonPath("$.length()").value(1))
+                .andExpect(jsonPath("$[0].raw").value(990))
+                .andExpect(jsonPath("$[0].wrapCount").value(0))
+                .andExpect(jsonPath("$[0].cumulativeMinutes").value(990));
+        mockMvc.perform(get("/api/equipment/eq-craw/status"))
+                .andExpect(jsonPath("$.version").value(3));
+        Integer idemCount = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM idempotency_request WHERE request_id = 'craw-1'", Integer.class);
+        assertEquals(1, idemCount, "同一 requestId 只应占一个幂等键");
+    }
+
+    /** 并发原始修订与完成保养：恰有一个成功；保养胜出时锚点冻结 raw/wrap/M 快照。 */
+    @Test
+    void concurrentRawReviseVsMaintenance_anchorFrozen() throws Exception {
+        register("eq-rrace", 10000);
+        registerRange("eq-rrace", "rrace-range", 1, 1000);
+        postJson("/api/equipment/eq-rrace/raw-readings", """
+                {"requestId":"rrace-r1","expectedVersion":2,"readingId":"r1",
+                 "sampledAt":"2026-01-01T10:00:00Z","raw":100,"wrapCount":0}
+                """);
+        postJson("/api/equipment/eq-rrace/raw-readings", """
+                {"requestId":"rrace-r2","expectedVersion":3,"readingId":"r2",
+                 "sampledAt":"2026-01-01T11:00:00Z","raw":200,"wrapCount":0}
+                """);
+
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<MvcResult> reviseFuture = executor.submit(() -> {
+            gate.await(5, TimeUnit.SECONDS);
+            return postJson("/api/equipment/eq-rrace/readings/r1/raw-revisions", """
+                    {"requestId":"rrace-revise","expectedVersion":4,"readingRevision":1,
+                     "raw":150,"wrapCount":0}
+                    """);
+        });
+        Future<MvcResult> maintenanceFuture = executor.submit(() -> {
+            gate.await(5, TimeUnit.SECONDS);
+            return postJson("/api/equipment/eq-rrace/maintenances", """
+                    {"requestId":"rrace-mnt","expectedVersion":4,"readingId":"r1","anchorRevisionNo":1}
+                    """);
+        });
+        gate.countDown();
+
+        MvcResult revise = reviseFuture.get(15, TimeUnit.SECONDS);
+        MvcResult maintenance = maintenanceFuture.get(15, TimeUnit.SECONDS);
+        int reviseStatus = revise.getResponse().getStatus();
+        int maintenanceStatus = maintenance.getResponse().getStatus();
+
+        assertTrue(
+                (reviseStatus == 201 && maintenanceStatus == 409)
+                        || (reviseStatus == 409 && maintenanceStatus == 201),
+                "原始修订与保养并发应恰有一个成功，实际：revise=" + reviseStatus
+                        + ", maintenance=" + maintenanceStatus);
+
+        // 版本只前进一次（登记 1 + 量程 1 + 两条读数 2 + 本次 1 = 5）
+        mockMvc.perform(get("/api/equipment/eq-rrace/status"))
+                .andExpect(jsonPath("$.version").value(5));
+
+        if (maintenanceStatus == 201) {
+            // 保养胜出：锚点冻结 raw=100、wrap=0、M=1000、归一 100，读数修订号不变
+            mockMvc.perform(get("/api/equipment/eq-rrace/maintenances"))
+                    .andExpect(jsonPath("$.length()").value(1))
+                    .andExpect(jsonPath("$[0].anchorRevisionNo").value(1))
+                    .andExpect(jsonPath("$[0].anchorCumulativeMinutes").value(100))
+                    .andExpect(jsonPath("$[0].anchorRaw").value(100))
+                    .andExpect(jsonPath("$[0].anchorWrapCount").value(0))
+                    .andExpect(jsonPath("$[0].anchorRangeM").value(1000));
+            Integer revisionNo = jdbc.queryForObject(
+                    "SELECT revision_no FROM reading WHERE equipment_id = 'eq-rrace' AND reading_id = 'r1'",
+                    Integer.class);
+            assertEquals(1, revisionNo, "保养锚定后读数修订号不得变化");
+        } else {
+            // 修订胜出：无保养记录，读数修订号为 2、归一 150
+            mockMvc.perform(get("/api/equipment/eq-rrace/maintenances"))
+                    .andExpect(jsonPath("$.length()").value(0));
+            mockMvc.perform(get("/api/equipment/eq-rrace/readings/r1/revisions"))
+                    .andExpect(jsonPath("$.length()").value(2));
+            Integer cumulative = jdbc.queryForObject(
+                    "SELECT cumulative_minutes FROM reading WHERE equipment_id = 'eq-rrace' AND reading_id = 'r1'",
+                    Integer.class);
+            assertEquals(150, cumulative);
+        }
+    }
 }

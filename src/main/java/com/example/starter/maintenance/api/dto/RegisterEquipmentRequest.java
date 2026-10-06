@@ -10,9 +10,11 @@ import jakarta.validation.constraints.Positive;
  * @param requestId                 全局唯一请求标识（幂等键）
  * @param equipmentId               设备唯一标识
  * @param maintenancePeriodMinutes  保养周期（分钟），正整数
+ * @param operator                  操作者标识（可选，参与幂等身份指纹）
  */
 public record RegisterEquipmentRequest(
         @NotBlank String requestId,
         @NotBlank String equipmentId,
-        @NotNull @Positive Long maintenancePeriodMinutes) {
+        @NotNull @Positive Long maintenancePeriodMinutes,
+        String operator) {
 }
