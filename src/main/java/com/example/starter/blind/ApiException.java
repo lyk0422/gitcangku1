@@ -48,4 +48,14 @@ public class ApiException extends RuntimeException {
     public static ApiException full(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message);
     }
+
+    /** 422 业务不可处理：洗脱期未满等时序条件未满足。 */
+    public static ApiException unprocessable(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message);
+    }
+
+    /** 410 资源已终结：参与者已退组，拒绝后续阶段操作。 */
+    public static ApiException gone(String message) {
+        return new ApiException(HttpStatus.GONE, message);
+    }
 }

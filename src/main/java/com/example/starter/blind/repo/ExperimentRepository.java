@@ -12,8 +12,9 @@ import java.util.List;
 @Repository
 public class ExperimentRepository {
 
-    /** 实验行。status 取值 OPEN/CLOSED；createdAt 为 Unix 毫秒 UTC。 */
-    public record ExperimentRow(String id, int blockCount, String status, long createdAt) {
+    /** 实验行。status 取值 OPEN/CLOSED；createdAt 为 Unix 毫秒 UTC；washoutMinutes 为 null 表示单阶段实验。 */
+    public record ExperimentRow(String id, int blockCount, String status, long createdAt,
+                                Integer washoutMinutes) {
     }
 
     /** 席位行（盲底）：treatment 为 A/B，seatNo 可直接解码，禁止出现在普通接口。 */
@@ -24,7 +25,8 @@ public class ExperimentRepository {
             rs.getString("id"),
             rs.getInt("block_count"),
             rs.getString("status"),
-            rs.getLong("created_at"));
+            rs.getLong("created_at"),
+            rs.getObject("washout_minutes", Integer.class));
 
     private static final RowMapper<SeatRow> SEAT_MAPPER = (rs, n) -> new SeatRow(
             rs.getString("experiment_id"),
@@ -39,13 +41,15 @@ public class ExperimentRepository {
     }
 
     public void insertExperiment(ExperimentRow row) {
-        jdbc.update("INSERT INTO experiment (id, block_count, status, created_at) VALUES (?, ?, ?, ?)",
-                row.id(), row.blockCount(), row.status(), row.createdAt());
+        jdbc.update("INSERT INTO experiment (id, block_count, status, created_at, washout_minutes) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                row.id(), row.blockCount(), row.status(), row.createdAt(), row.washoutMinutes());
     }
 
     public ExperimentRow findById(String experimentId) {
         List<ExperimentRow> rows = jdbc.query(
-                "SELECT id, block_count, status, created_at FROM experiment WHERE id = ?",
+                "SELECT id, block_count, status, created_at, washout_minutes "
+                        + "FROM experiment WHERE id = ?",
                 EXPERIMENT_MAPPER, experimentId);
         return rows.isEmpty() ? null : rows.get(0);
     }
@@ -55,7 +59,8 @@ public class ExperimentRepository {
      */
     public ExperimentRow lockById(String experimentId) {
         List<ExperimentRow> rows = jdbc.query(
-                "SELECT id, block_count, status, created_at FROM experiment WHERE id = ? FOR UPDATE",
+                "SELECT id, block_count, status, created_at, washout_minutes "
+                        + "FROM experiment WHERE id = ? FOR UPDATE",
                 EXPERIMENT_MAPPER, experimentId);
         return rows.isEmpty() ? null : rows.get(0);
     }

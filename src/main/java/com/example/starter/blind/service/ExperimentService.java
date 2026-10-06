@@ -7,6 +7,7 @@ import com.example.starter.blind.dto.ExperimentView;
 import com.example.starter.blind.repo.AllocationRepository;
 import com.example.starter.blind.repo.AllocationRepository.AllocationRow;
 import com.example.starter.blind.repo.AllocationRepository.VacantSeat;
+import com.example.starter.blind.repo.CrossoverPhaseRepository;
 import com.example.starter.blind.repo.ExperimentRepository;
 import com.example.starter.blind.repo.ExperimentRepository.ExperimentRow;
 import com.example.starter.blind.repo.ExperimentRepository.SeatRow;
@@ -29,25 +30,30 @@ public class ExperimentService {
 
     private final ExperimentRepository experimentRepository;
     private final AllocationRepository allocationRepository;
+    private final CrossoverPhaseRepository crossoverPhaseRepository;
     private final BlindCodeGenerator blindCodeGenerator;
     private final Clock clock;
 
     public ExperimentService(ExperimentRepository experimentRepository,
                              AllocationRepository allocationRepository,
+                             CrossoverPhaseRepository crossoverPhaseRepository,
                              BlindCodeGenerator blindCodeGenerator,
                              Clock clock) {
         this.experimentRepository = experimentRepository;
         this.allocationRepository = allocationRepository;
+        this.crossoverPhaseRepository = crossoverPhaseRepository;
         this.blindCodeGenerator = blindCodeGenerator;
         this.clock = clock;
     }
 
     /**
      * 创建实验并固定席位：每区组按席位顺序两个 A、两个 B。
+     * washoutMinutes 非空时为交叉实验：同一参与者按盲码完成两个阶段，
+     * 第一阶段处理沿用席位隐藏代码，第二阶段为其对侧代码；洗脱时长创建后不可改。
      * 不记录任何处理映射到日志。
      */
     @Transactional
-    public ExperimentView createExperiment(String experimentId, int blockCount) {
+    public ExperimentView createExperiment(String experimentId, int blockCount, Integer washoutMinutes) {
         if (experimentId == null || experimentId.isBlank()) {
             throw ApiException.badRequest("experimentId 不能为空");
         }
@@ -56,7 +62,7 @@ public class ExperimentService {
         }
         long now = clock.nowMillis();
         experimentRepository.insertExperiment(
-                new ExperimentRow(experimentId, blockCount, "OPEN", now));
+                new ExperimentRow(experimentId, blockCount, "OPEN", now, washoutMinutes));
         List<SeatRow> seats = new ArrayList<>(blockCount * SEATS_PER_BLOCK);
         for (int blockNo = 1; blockNo <= blockCount; blockNo++) {
             for (int seatNo = 1; seatNo <= SEATS_PER_BLOCK; seatNo++) {
@@ -67,13 +73,14 @@ public class ExperimentService {
         }
         seats.forEach(experimentRepository::insertSeat);
         return new ExperimentView(experimentId, blockCount, SEATS_PER_BLOCK,
-                blockCount * SEATS_PER_BLOCK, "OPEN", now);
+                blockCount * SEATS_PER_BLOCK, "OPEN", now, washoutMinutes);
     }
 
     public ExperimentView getExperiment(String experimentId) {
         ExperimentRow row = mustFindExperiment(experimentId);
         return new ExperimentView(row.id(), row.blockCount(), SEATS_PER_BLOCK,
-                row.blockCount() * SEATS_PER_BLOCK, row.status(), row.createdAt());
+                row.blockCount() * SEATS_PER_BLOCK, row.status(), row.createdAt(),
+                row.washoutMinutes());
     }
 
     /**
@@ -104,6 +111,10 @@ public class ExperimentService {
         long now = clock.nowMillis();
         AllocationRow inserted = insertWithUniqueBlindCode(experimentId, participantId, actorId,
                 vacant, now);
+        if (experiment.washoutMinutes() != null) {
+            // 交叉实验：登记时同步创建阶段行，初始未开始任何阶段。
+            crossoverPhaseRepository.insert(inserted.id(), experimentId, participantId);
+        }
         return toView(inserted);
     }
 
@@ -162,7 +173,8 @@ public class ExperimentService {
         }
         experimentRepository.markClosed(experimentId);
         return new ExperimentView(experiment.id(), experiment.blockCount(), SEATS_PER_BLOCK,
-                experiment.blockCount() * SEATS_PER_BLOCK, "CLOSED", experiment.createdAt());
+                experiment.blockCount() * SEATS_PER_BLOCK, "CLOSED", experiment.createdAt(),
+                experiment.washoutMinutes());
     }
 
     /**

@@ -9,6 +9,7 @@ package com.example.starter.blind.dto;
  * @param totalSeats   总席位数，固定为区组数 × 4
  * @param status       OPEN / CLOSED
  * @param createdAt    创建时间，Unix 毫秒，UTC
+ * @param washoutMinutes 交叉实验洗脱时长（分钟，1~120），创建时固定；null 表示单阶段实验
  */
 public record ExperimentView(
         String experimentId,
@@ -16,6 +17,7 @@ public record ExperimentView(
         int seatsPerBlock,
         int totalSeats,
         String status,
-        long createdAt
+        long createdAt,
+        Integer washoutMinutes
 ) {
 }
