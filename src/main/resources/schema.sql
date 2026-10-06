@@ -59,3 +59,63 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
 );
+
+-- 二维坐标观测当前状态表：坐标 (x, y) 与协方差矩阵 (a, b, c) 为一个完整字段组。
+CREATE TABLE IF NOT EXISTS geo_observation_current (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    x VARCHAR(64) NOT NULL COMMENT '观测点 X 坐标，单位米，十进制字符串，最多三位小数，比较按数值',
+    y VARCHAR(64) NOT NULL COMMENT '观测点 Y 坐标，单位米，十进制字符串，最多三位小数，比较按数值',
+    a VARCHAR(64) NOT NULL COMMENT '协方差矩阵元素 a（X 方差），单位平方米，最多三位小数，必须为正且 a*c > b*b',
+    b VARCHAR(64) NOT NULL COMMENT '协方差矩阵元素 b（XY 协方差），单位平方米，最多三位小数',
+    c VARCHAR(64) NOT NULL COMMENT '协方差矩阵元素 c（Y 方差），单位平方米，最多三位小数，必须为正且 a*c > b*b',
+    version INT NOT NULL COMMENT '当前版本号，从 1 开始',
+    deleted BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已删除：TRUE 表示当前状态为删除墓碑',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次变更时间（服务器时区）',
+    PRIMARY KEY (observation_id)
+);
+
+-- 二维坐标观测版本快照表：每次成功变更（创建/合并/删除）追加一行完整快照，历史永不删除。
+CREATE TABLE IF NOT EXISTS geo_observation_version (
+    observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
+    version INT NOT NULL COMMENT '版本号，从 1 开始，与 geo_observation_current.version 对应',
+    x VARCHAR(64) NULL COMMENT '该版本 X 坐标快照（米，十进制原文）；删除墓碑版本为 NULL',
+    y VARCHAR(64) NULL COMMENT '该版本 Y 坐标快照（米，十进制原文）；删除墓碑版本为 NULL',
+    a VARCHAR(64) NULL COMMENT '该版本协方差 a 快照（平方米，十进制原文）；删除墓碑版本为 NULL',
+    b VARCHAR(64) NULL COMMENT '该版本协方差 b 快照（平方米，十进制原文）；删除墓碑版本为 NULL',
+    c VARCHAR(64) NULL COMMENT '该版本协方差 c 快照（平方米，十进制原文）；删除墓碑版本为 NULL',
+    deleted BOOLEAN NOT NULL COMMENT '该版本是否为删除墓碑：TRUE 时业务字段无意义',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '该版本生成时间（服务器时区）',
+    PRIMARY KEY (observation_id, version)
+);
+
+-- 一致性确认记录表：确认成功后原子写入，不可变、永不更新或删除。
+-- 冻结确认时刻两条观测的完整版本快照与比较两侧的值，后续观测变更不影响本表。
+CREATE TABLE IF NOT EXISTS consistency_confirmation (
+    confirmation_id VARCHAR(64) NOT NULL COMMENT '全局唯一一致性确认记录标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '生成该确认记录的请求标识（requestId）',
+    observation_id_a VARCHAR(64) NOT NULL COMMENT '第一条观测记录标识',
+    version_a INT NOT NULL COMMENT '确认时第一条观测的当前版本号',
+    x_a VARCHAR(64) NOT NULL COMMENT '第一条观测 X 坐标快照（米，十进制原文）',
+    y_a VARCHAR(64) NOT NULL COMMENT '第一条观测 Y 坐标快照（米，十进制原文）',
+    a_a VARCHAR(64) NOT NULL COMMENT '第一条观测协方差 a 快照（平方米，十进制原文）',
+    b_a VARCHAR(64) NOT NULL COMMENT '第一条观测协方差 b 快照（平方米，十进制原文）',
+    c_a VARCHAR(64) NOT NULL COMMENT '第一条观测协方差 c 快照（平方米，十进制原文）',
+    observation_id_b VARCHAR(64) NOT NULL COMMENT '第二条观测记录标识',
+    version_b INT NOT NULL COMMENT '确认时第二条观测的当前版本号',
+    x_b VARCHAR(64) NOT NULL COMMENT '第二条观测 X 坐标快照（米，十进制原文）',
+    y_b VARCHAR(64) NOT NULL COMMENT '第二条观测 Y 坐标快照（米，十进制原文）',
+    a_b VARCHAR(64) NOT NULL COMMENT '第二条观测协方差 a 快照（平方米，十进制原文）',
+    b_b VARCHAR(64) NOT NULL COMMENT '第二条观测协方差 b 快照（平方米，十进制原文）',
+    c_b VARCHAR(64) NOT NULL COMMENT '第二条观测协方差 c 快照（平方米，十进制原文）',
+    u VARCHAR(96) NOT NULL COMMENT '坐标差 u = x_a - x_b（米，精确十进制）',
+    v VARCHAR(96) NOT NULL COMMENT '坐标差 v = y_a - y_b（米，精确十进制）',
+    sum_a VARCHAR(96) NOT NULL COMMENT '两矩阵之和 A = a_a + a_b（平方米，精确十进制）',
+    sum_b VARCHAR(96) NOT NULL COMMENT '两矩阵之和 B = b_a + b_b（平方米，精确十进制）',
+    sum_c VARCHAR(96) NOT NULL COMMENT '两矩阵之和 C = c_a + c_b（平方米，精确十进制）',
+    lhs VARCHAR(128) NOT NULL COMMENT '比较左侧 C*u^2 - 2*B*u*v + A*v^2（精确乘积，未开根未舍入）',
+    rhs VARCHAR(128) NOT NULL COMMENT '比较右侧 9*(A*C - B^2)（精确乘积，未开根未舍入）',
+    operator VARCHAR(128) NOT NULL COMMENT '执行一致性确认的操作者标识',
+    confirmed_at_utc TIMESTAMP NOT NULL COMMENT '确认完成时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (confirmation_id)
+);

@@ -68,4 +68,11 @@ public class ApiException extends RuntimeException {
     public static ApiException gone(String message) {
         return new ApiException(HttpStatus.GONE, message, null, null);
     }
+
+    /**
+     * 422：业务条件不满足（如一致性确认超出门限、参与确认的观测为墓碑或不为两条不同观测）。
+     */
+    public static ApiException unprocessable(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, null);
+    }
 }
