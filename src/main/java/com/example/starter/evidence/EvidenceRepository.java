@@ -77,12 +77,41 @@ public class EvidenceRepository {
     }
 
     /**
-     * 查询指定保管人当前可交接的证物（本人保管且状态 SEALED）。
+     * 查询指定保管人当前可交接的证物（本人保管、状态 SEALED 且未装入任何封存箱）。
      */
     public List<Evidence> findTransferable(String custodianId) {
         return jdbc.query(
-                "SELECT * FROM evidence WHERE custodian_id = ? AND status = ? ORDER BY id",
+                "SELECT * FROM evidence WHERE custodian_id = ? AND status = ?"
+                        + " AND evidence_key NOT IN (SELECT member_key FROM container_member"
+                        + " WHERE member_type = 'EVIDENCE') ORDER BY id",
                 ROW_MAPPER, custodianId, EvidenceStatus.SEALED.name());
+    }
+
+    /**
+     * 按业务键集合查询并锁定证物行（SELECT ... FOR UPDATE），按业务键排序避免死锁；
+     * 用于根箱交接接受时重新核验并锁定整树证物。
+     */
+    public List<Evidence> findByKeysForUpdate(List<String> evidenceKeys) {
+        if (evidenceKeys.isEmpty()) {
+            return List.of();
+        }
+        String placeholders = String.join(", ", evidenceKeys.stream().map(k -> "?").toList());
+        return jdbc.query(
+                "SELECT * FROM evidence WHERE evidence_key IN (" + placeholders + ")"
+                        + " ORDER BY evidence_key FOR UPDATE",
+                ROW_MAPPER, evidenceKeys.toArray());
+    }
+
+    /**
+     * 批量切换一组证物的保管人（根箱交接接受时整树证物同步推进，状态保持 SEALED）。
+     */
+    public void updateCustodianForKeys(List<String> evidenceKeys, String custodianId,
+                                       LocalDateTime now) {
+        for (String key : evidenceKeys) {
+            jdbc.update(
+                    "UPDATE evidence SET custodian_id = ?, updated_at = ? WHERE evidence_key = ?",
+                    custodianId, now, key);
+        }
     }
 
     private static final class EvidenceRowMapper implements RowMapper<Evidence> {

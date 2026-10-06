@@ -60,12 +60,64 @@ CREATE TABLE IF NOT EXISTS loan_record (
     KEY idx_loan_borrower_status (borrower_id, status)
 );
 
+-- 封存箱：可嵌套最多 3 层；根箱 version 从 1 开始，成员变更携带根箱 expectedVersion 并加一。
+-- root_key 冗余记录所属根箱，便于整树锁定与查询；parent_key 为 NULL 表示根箱。
+CREATE TABLE IF NOT EXISTS evidence_container (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    container_key VARCHAR(64) NOT NULL COMMENT '封存箱业务键，全局唯一，创建后不可修改',
+    seal_no VARCHAR(64) NOT NULL COMMENT '箱独立封条编号，创建后不可修改；箱封条正常不代表成员全部正常',
+    custodian_id VARCHAR(64) NOT NULL COMMENT '当前保管人，整树交接接受时与子树所有对象同步切换',
+    status VARCHAR(20) NOT NULL COMMENT '箱状态：SEALED 已封存 / TRANSFER_PENDING 待接收（整树冻结）/ SEAL_BROKEN 封条异常（终态）',
+    version INT NOT NULL COMMENT '成员版本，仅根箱有意义：从 1 开始，每次成员变更携带 expectedVersion 并加一',
+    parent_key VARCHAR(64) NULL COMMENT '直接父箱业务键；NULL 表示根箱；子箱仅能有一个直接父箱',
+    root_key VARCHAR(64) NOT NULL COMMENT '所属根箱业务键，根箱等于自身 container_key',
+    created_at DATETIME(6) NOT NULL COMMENT '创建时间，Asia/Shanghai',
+    updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态、保管人或版本变更时间，Asia/Shanghai',
+    CONSTRAINT uk_container_key UNIQUE (container_key),
+    KEY idx_container_root (root_key)
+);
+
+-- 箱成员：证物或子箱；(member_type, member_key) 全局唯一保证任一对象最多一个直接父箱。
+CREATE TABLE IF NOT EXISTS container_member (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    container_key VARCHAR(64) NOT NULL COMMENT '所属箱业务键（直接父箱）',
+    member_type VARCHAR(10) NOT NULL COMMENT '成员类型：EVIDENCE 证物 / BOX 子箱',
+    member_key VARCHAR(64) NOT NULL COMMENT '成员业务键：证物键或子箱键',
+    created_at DATETIME(6) NOT NULL COMMENT '装箱时间，Asia/Shanghai',
+    CONSTRAINT uk_container_member UNIQUE (member_type, member_key),
+    KEY idx_member_container (container_key)
+);
+
+-- 根箱交接记录：只追加；发起时冻结整树，接受时重新核验完整树后一次推进全部保管权。
+CREATE TABLE IF NOT EXISTS container_transfer (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    container_key VARCHAR(64) NOT NULL COMMENT '根箱业务键',
+    from_custodian VARCHAR(64) NOT NULL COMMENT '发起交接时的保管人',
+    to_custodian VARCHAR(64) NOT NULL COMMENT '指定接收人，必须与发起人不同',
+    status VARCHAR(20) NOT NULL COMMENT '交接状态：PENDING 待接收 / ACCEPTED 已接受 / CANCELLED 已取消',
+    initiated_by VARCHAR(64) NOT NULL COMMENT '发起操作人（与 from_custodian 相同）',
+    created_at DATETIME(6) NOT NULL COMMENT '交接发起时间，Asia/Shanghai',
+    decided_at DATETIME(6) NULL COMMENT '接受或取消时间；NULL 表示仍待接收',
+    KEY idx_ctransfer_container (container_key)
+);
+
+-- 箱封条核验记录：只追加、不可变；核验失败使该箱进入 SEAL_BROKEN 并使根箱不能交接。
+CREATE TABLE IF NOT EXISTS container_inspection (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    container_key VARCHAR(64) NOT NULL COMMENT '关联箱业务键',
+    inspector_id VARCHAR(64) NOT NULL COMMENT '提交核验的当前保管人',
+    passed TINYINT NOT NULL COMMENT '核验结果：1 通过 / 0 失败（箱进入 SEAL_BROKEN）',
+    note VARCHAR(512) NULL COMMENT '核验备注；NULL 表示未填写',
+    created_at DATETIME(6) NOT NULL COMMENT '核验提交时间，Asia/Shanghai',
+    KEY idx_cinsp_container (container_key)
+);
+
 -- 幂等命令日志：command_key 全局唯一；同键同参重放返回首次结果，同键改参返回 409。
 CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/CONTAINER_CREATE/CONTAINER_PACK/CONTAINER_UNPACK/CONTAINER_TRANSFER_INITIATE/CONTAINER_TRANSFER_ACCEPT/CONTAINER_TRANSFER_CANCEL/CONTAINER_SEAL_INSPECTION',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
