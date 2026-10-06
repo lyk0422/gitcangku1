@@ -2,6 +2,8 @@ package com.example.starter.translation.service;
 
 import com.example.starter.translation.api.ApiDtos;
 import com.example.starter.translation.api.ApiException;
+import com.example.starter.translation.domain.BidiIsolateValidator;
+import com.example.starter.translation.domain.BidiIsolateValidator.BidiError;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
@@ -81,6 +83,7 @@ public class TranslationService {
     /**
      * 译文提交：所依据源文版本必须等于当前源文版本；绑定当前术语版本，
      * 当前源文命中的术语规则要求译文包含对应必译文本，否则 422 返回全部违规术语且不写译文；
+     * 译文双向隔离符校验失败 422 并返回码点索引，不改变原稿与批准；
      * 译文版本递增，草稿版本加一。
      */
     @Transactional
@@ -96,6 +99,7 @@ public class TranslationService {
             throw ApiException.unprocessable("译文所依据的源文版本 " + request.sourceVersion()
                     + " 与当前源文版本 " + segment.sourceVersion() + " 不匹配");
         }
+        requireValidBidi(request.content(), "译文");
         List<TermRuleRow> termRules = repository.listTermRules(documentId, document.termVersion());
         List<ApiDtos.TermRuleView> violations = findViolations(
                 segment.sourceText(), normalizedLanguage, request.content(), termRules);
@@ -111,7 +115,7 @@ public class TranslationService {
                 translationVersion, segment.sourceVersion(), document.termVersion(), draftVersion);
     }
 
-    /** 译文批准：审核人不得是作者，且必须同时匹配当前源文与译文版本。 */
+    /** 译文批准：审核人不得是作者，且必须同时匹配当前源文与译文版本；译文隔离符非法时不能（重新）批准。 */
     @Transactional
     public ApiDtos.ApprovalResponse approveTranslation(long documentId, String segmentId, String language,
                                                        String actorId, ApiDtos.ApproveTranslationRequest request) {
@@ -132,6 +136,7 @@ public class TranslationService {
             throw ApiException.unprocessable("译文基于源文版本 " + translation.sourceVersion()
                     + "，当前源文版本 " + segment.sourceVersion() + "，译文待更新，不能批准");
         }
+        requireValidBidi(translation.content(), "译文 " + segmentId + "/" + normalizedLanguage);
         repository.upsertApproval(documentId, new ApprovalRow(segmentId, normalizedLanguage, actorId,
                 segment.sourceVersion(), translation.translationVersion()));
         return new ApiDtos.ApprovalResponse(documentId, segmentId, normalizedLanguage, actorId,
@@ -222,6 +227,8 @@ public class TranslationService {
                     throw ApiException.unprocessable("批准已失效: " + segment.segmentId() + "/" + language
                             + "，源文或译文版本已改变");
                 }
+                requireValidBidi(translation.content(),
+                        "译文 " + segment.segmentId() + "/" + language);
                 termViolations.addAll(findViolations(
                         segment.sourceText(), language, translation.content(), termRules));
             }
@@ -309,6 +316,19 @@ public class TranslationService {
 
     private static String key(String segmentId, String language) {
         return segmentId + " " + language;
+    }
+
+    /**
+     * 双向隔离符校验：非法时抛 422 并携带从 0 起的码点索引；
+     * 文本本身不删除控制符、不自动修复，合法文本按原码点串保存。
+     */
+    private static void requireValidBidi(String content, String subject) {
+        BidiError error = BidiIsolateValidator.validate(content);
+        if (error != null) {
+            throw ApiException.bidiViolation(
+                    subject + "双向隔离符校验失败（码点索引 " + error.codePointIndex() + "）：" + error.reason(),
+                    error.codePointIndex());
+        }
     }
 
     private static String normalizeLanguage(String language) {

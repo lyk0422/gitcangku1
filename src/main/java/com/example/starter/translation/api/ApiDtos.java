@@ -125,11 +125,19 @@ public final class ApiDtos {
     public record TermStatusResponse(long documentId, int termVersion, List<TranslationTermStatus> translations) {
     }
 
-    /** 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语。 */
+    /**
+     * 统一错误响应；violations 仅在术语违规 422 时返回，含全部违规术语；
+     * codePointIndex 仅在双向隔离符违规 422 时返回，为从 0 起的 Unicode 码点索引。
+     */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record ErrorResponse(String error, String message, List<TermRuleView> violations) {
+    public record ErrorResponse(String error, String message, List<TermRuleView> violations,
+                                Integer codePointIndex) {
         public ErrorResponse(String error, String message) {
-            this(error, message, null);
+            this(error, message, null, null);
+        }
+
+        public ErrorResponse(String error, String message, List<TermRuleView> violations) {
+            this(error, message, violations, null);
         }
     }
 }

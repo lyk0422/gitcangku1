@@ -12,17 +12,24 @@ public class ApiException extends RuntimeException {
     private final HttpStatus status;
     private final String code;
     private final List<ApiDtos.TermRuleView> violations;
+    private final Integer codePointIndex;
 
     public ApiException(HttpStatus status, String code, String message) {
-        this(status, code, message, null);
+        this(status, code, message, null, null);
     }
 
     public ApiException(HttpStatus status, String code, String message,
                         List<ApiDtos.TermRuleView> violations) {
+        this(status, code, message, violations, null);
+    }
+
+    public ApiException(HttpStatus status, String code, String message,
+                        List<ApiDtos.TermRuleView> violations, Integer codePointIndex) {
         super(message);
         this.status = status;
         this.code = code;
         this.violations = violations;
+        this.codePointIndex = codePointIndex;
     }
 
     public HttpStatus status() {
@@ -36,6 +43,11 @@ public class ApiException extends RuntimeException {
     /** 术语违规明细，仅术语违规 422 时非空。 */
     public List<ApiDtos.TermRuleView> violations() {
         return violations;
+    }
+
+    /** 双向隔离符校验失败的码点索引（从 0 起），仅隔离符违规 422 时非空。 */
+    public Integer codePointIndex() {
+        return codePointIndex;
     }
 
     /** 404：资源不存在。 */
@@ -56,5 +68,11 @@ public class ApiException extends RuntimeException {
     /** 422：译文违反术语规则，返回全部违规术语。 */
     public static ApiException termViolation(String message, List<ApiDtos.TermRuleView> violations) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "TERM_VIOLATION", message, violations);
+    }
+
+    /** 422：译文双向隔离符校验失败，返回从 0 起的码点索引。 */
+    public static ApiException bidiViolation(String message, int codePointIndex) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "BIDI_ISOLATE_VIOLATION", message,
+                null, codePointIndex);
     }
 }
