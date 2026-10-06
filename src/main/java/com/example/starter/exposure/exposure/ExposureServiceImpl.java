@@ -8,8 +8,10 @@ import com.example.starter.exposure.repo.IdempotencyRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository.IdempotencyRecord;
 import com.example.starter.exposure.repo.LedgerRepository;
 import com.example.starter.exposure.repo.ReservationRepository;
+import com.example.starter.exposure.repo.RotationStateRepository;
 import com.example.starter.exposure.web.ApiException;
 import com.example.starter.exposure.web.ApplyExposureRequest;
+import com.example.starter.exposure.web.ApplyRotationRequest;
 import com.example.starter.exposure.web.CampaignResponse;
 import com.example.starter.exposure.web.CreateCampaignRequest;
 import com.example.starter.exposure.web.QuotaResponse;
@@ -23,7 +25,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 import java.time.LocalDate;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -33,6 +37,11 @@ import java.util.function.Supplier;
  * <p>所有写操作以 requestId 为全局幂等键：同键同参重放原成功结果，异参 409；
  * 业务失败随事务回滚，不占幂等键。所有操作与额度查询先结算相关过期预占，
  * 不依赖后台定时器。终态竞争由行锁 + 状态 CAS 保证只允许一个终态。</p>
+ *
+ * <p>创意轮换：公告可固定 2~5 个有序创意；轮换申请按访客已确认次数模创意数
+ * 选出创意并在预占单上冻结创意与轮换序号，每访客每公告至多一条活跃轮换预占；
+ * 仅确认推进跨 UTC 日连续序号，取消/过期只释放额度与轮换占位，不推进序号。
+ * 普通申请与活跃轮换互斥（409），轮换已开始后该访客普通新申请 422。</p>
  */
 @Service
 public class ExposureServiceImpl implements ExposureService {
@@ -46,6 +55,7 @@ public class ExposureServiceImpl implements ExposureService {
     private final CampaignRepository campaignRepository;
     private final ReservationRepository reservationRepository;
     private final LedgerRepository ledgerRepository;
+    private final RotationStateRepository rotationStateRepository;
     private final IdempotencyRepository idempotencyRepository;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate txTemplate;
@@ -54,6 +64,7 @@ public class ExposureServiceImpl implements ExposureService {
                                CampaignRepository campaignRepository,
                                ReservationRepository reservationRepository,
                                LedgerRepository ledgerRepository,
+                               RotationStateRepository rotationStateRepository,
                                IdempotencyRepository idempotencyRepository,
                                ObjectMapper objectMapper,
                                TransactionTemplate txTemplate) {
@@ -61,6 +72,7 @@ public class ExposureServiceImpl implements ExposureService {
         this.campaignRepository = campaignRepository;
         this.reservationRepository = reservationRepository;
         this.ledgerRepository = ledgerRepository;
+        this.rotationStateRepository = rotationStateRepository;
         this.idempotencyRepository = idempotencyRepository;
         this.objectMapper = objectMapper;
         this.txTemplate = txTemplate;
@@ -68,8 +80,14 @@ public class ExposureServiceImpl implements ExposureService {
 
     @Override
     public CampaignResponse createCampaign(CreateCampaignRequest request) {
-        String fingerprint = request.campaignId() + "|" + request.dailyTotalCap() + "|"
-                + request.perVisitorDailyCap();
+        List<String> creativeIds = request.creativeIds() == null
+                ? List.of() : List.copyOf(request.creativeIds());
+        validateCreativeIds(creativeIds);
+        String fingerprint = fingerprint(
+                "campaignId", request.campaignId(),
+                "dailyTotalCap", request.dailyTotalCap(),
+                "perVisitorDailyCap", request.perVisitorDailyCap(),
+                "creativeIds", creativeIds);
         return runIdempotent(request.requestId(), Operation.CREATE_CAMPAIGN, fingerprint,
                 CampaignResponse.class, () -> {
                     if (campaignRepository.findById(request.campaignId()).isPresent()) {
@@ -80,7 +98,8 @@ public class ExposureServiceImpl implements ExposureService {
                             request.campaignId(),
                             request.dailyTotalCap(),
                             request.perVisitorDailyCap(),
-                            clock.millis());
+                            clock.millis(),
+                            creativeIds);
                     try {
                         campaignRepository.insert(campaign);
                     } catch (DuplicateKeyException duplicateCampaign) {
@@ -94,7 +113,9 @@ public class ExposureServiceImpl implements ExposureService {
 
     @Override
     public ReservationResponse apply(ApplyExposureRequest request) {
-        String fingerprint = request.campaignId() + "|" + request.visitorId();
+        String fingerprint = fingerprint(
+                "campaignId", request.campaignId(),
+                "visitorId", request.visitorId());
         return runIdempotent(request.requestId(), Operation.APPLY, fingerprint,
                 ReservationResponse.class, () -> {
                     long now = clock.millis();
@@ -104,47 +125,73 @@ public class ExposureServiceImpl implements ExposureService {
                     // 先结算该公告相关过期预占并释放额度
                     settleExpired(campaign.campaignId(), now);
 
-                    // 固定加锁顺序：公告当日总账 -> 访客当日账，避免死锁
-                    ledgerRepository.ensureTotalRow(campaign.campaignId(), utcDate);
-                    ledgerRepository.ensureVisitorRow(campaign.campaignId(), request.visitorId(), utcDate);
-                    int usedTotal = ledgerRepository.lockUsedTotal(campaign.campaignId(), utcDate);
-                    int usedVisitor = ledgerRepository.lockUsedVisitor(
-                            campaign.campaignId(), request.visitorId(), utcDate);
-
-                    // 任一额度已满则 429，两个额度均不增加（尚未写入）
-                    if (usedTotal + 1 > campaign.dailyTotalCap()
-                            || usedVisitor + 1 > campaign.perVisitorDailyCap()) {
-                        throw new ApiException(HttpStatus.TOO_MANY_REQUESTS,
-                                "exposure quota exhausted for campaign " + campaign.campaignId());
+                    // 锁定该访客轮换账目，与轮换申请互斥
+                    rotationStateRepository.ensureRow(campaign.campaignId(), request.visitorId());
+                    rotationStateRepository.lockConfirmedCount(campaign.campaignId(), request.visitorId());
+                    if (reservationRepository.findActiveRotation(
+                            campaign.campaignId(), request.visitorId()).isPresent()) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "active rotation reservation exists for visitor " + request.visitorId());
                     }
-                    ledgerRepository.addTotal(campaign.campaignId(), utcDate, 1);
-                    ledgerRepository.addVisitor(campaign.campaignId(), request.visitorId(), utcDate, 1);
+                    if (rotationStarted(campaign.campaignId(), request.visitorId())) {
+                        throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY,
+                                "rotation already started for visitor " + request.visitorId()
+                                        + ", normal apply is not allowed");
+                    }
 
-                    String reservationId = UUID.randomUUID().toString().replace("-", "");
-                    Reservation reservation = new Reservation(
-                            reservationId,
-                            campaign.campaignId(),
-                            request.visitorId(),
-                            java.sql.Date.valueOf(utcDate),
-                            ReservationStatus.RESERVED,
-                            now,
-                            now + RESERVATION_TTL_MILLIS,
-                            null);
-                    reservationRepository.insert(reservation);
-                    return ReservationResponse.from(reservation);
+                    return doApply(campaign, request.visitorId(), utcDate, now, null, null);
+                });
+    }
+
+    @Override
+    public ReservationResponse applyRotation(ApplyRotationRequest request) {
+        String fingerprint = fingerprint(
+                "campaignId", request.campaignId(),
+                "visitorId", request.visitorId());
+        return runIdempotent(request.requestId(), Operation.APPLY_ROTATION, fingerprint,
+                ReservationResponse.class, () -> {
+                    long now = clock.millis();
+                    LocalDate utcDate = LocalDate.now(clock);
+                    Campaign campaign = requireCampaign(request.campaignId());
+                    if (campaign.creativeIds().size() < 2) {
+                        throw new ApiException(HttpStatus.UNPROCESSABLE_ENTITY,
+                                "campaign has no rotation creatives: " + campaign.campaignId());
+                    }
+
+                    // 先结算该公告相关过期预占并释放额度与轮换占位
+                    settleExpired(campaign.campaignId(), now);
+
+                    // 锁定该访客轮换账目：同一访客轮换申请串行，序号读取与推进一致
+                    rotationStateRepository.ensureRow(campaign.campaignId(), request.visitorId());
+                    int confirmedCount = rotationStateRepository.lockConfirmedCount(
+                            campaign.campaignId(), request.visitorId());
+
+                    // 每访客每公告至多一条活跃轮换预占
+                    if (reservationRepository.findActiveRotation(
+                            campaign.campaignId(), request.visitorId()).isPresent()) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "active rotation reservation exists for visitor " + request.visitorId());
+                    }
+
+                    // 按已确认次数模创意数选下一个创意；取消/过期不推进序号，重选同一创意
+                    int rotationSeq = confirmedCount;
+                    String creativeId = campaign.creativeIds()
+                            .get(rotationSeq % campaign.creativeIds().size());
+                    return doApply(campaign, request.visitorId(), utcDate, now,
+                            creativeId, rotationSeq);
                 });
     }
 
     @Override
     public ReservationResponse confirm(String reservationId, ReservationActionRequest request) {
-        String fingerprint = reservationId;
+        String fingerprint = fingerprint("reservationId", reservationId);
         return runIdempotent(request.requestId(), Operation.CONFIRM, fingerprint,
                 ReservationResponse.class, () -> transition(reservationId, true));
     }
 
     @Override
     public ReservationResponse cancel(String reservationId, ReservationActionRequest request) {
-        String fingerprint = reservationId;
+        String fingerprint = fingerprint("reservationId", reservationId);
         return runIdempotent(request.requestId(), Operation.CANCEL, fingerprint,
                 ReservationResponse.class, () -> transition(reservationId, false));
     }
@@ -195,8 +242,83 @@ public class ExposureServiceImpl implements ExposureService {
     private enum Operation {
         CREATE_CAMPAIGN,
         APPLY,
+        APPLY_ROTATION,
         CONFIRM,
         CANCEL
+    }
+
+    /**
+     * 结构化请求指纹：按固定顺序以 JSON 对象序列化全部业务参数（不含 requestId），
+     * 避免分隔符拼接造成参数碰撞。
+     *
+     * @param keyValues 交替的字段名与字段值
+     */
+    private String fingerprint(Object... keyValues) {
+        Map<String, Object> params = new LinkedHashMap<>();
+        for (int i = 0; i < keyValues.length; i += 2) {
+            params.put((String) keyValues[i], keyValues[i + 1]);
+        }
+        return writeJson(params);
+    }
+
+    /** 校验固定轮换创意：配置时须为 2~5 个互不相同的非空编号。 */
+    private void validateCreativeIds(List<String> creativeIds) {
+        if (creativeIds.isEmpty()) {
+            return;
+        }
+        if (creativeIds.size() < 2 || creativeIds.size() > 5) {
+            throw new ApiException(HttpStatus.BAD_REQUEST,
+                    "creativeIds must contain 2 to 5 entries when configured");
+        }
+        if (creativeIds.stream().anyMatch(id -> id == null || id.isBlank())
+                || creativeIds.stream().distinct().count() != creativeIds.size()) {
+            throw new ApiException(HttpStatus.BAD_REQUEST,
+                    "creativeIds must be distinct non-blank entries");
+        }
+    }
+
+    /** 该访客在该公告下轮换是否已开始（已有确认计数或任何轮换预占记录）。 */
+    private boolean rotationStarted(String campaignId, String visitorId) {
+        return rotationStateRepository.getConfirmedCount(campaignId, visitorId) > 0
+                || reservationRepository.existsAnyRotation(campaignId, visitorId);
+    }
+
+    /**
+     * 占用两级额度并写入预占单。调用前须已结算过期预占并完成互斥校验；
+     * 额度不足抛 429，不留下任何占位或账目变更。
+     */
+    private ReservationResponse doApply(Campaign campaign, String visitorId, LocalDate utcDate,
+                                        long now, String creativeId, Integer rotationSeq) {
+        // 固定加锁顺序：公告当日总账 -> 访客当日账，避免死锁
+        ledgerRepository.ensureTotalRow(campaign.campaignId(), utcDate);
+        ledgerRepository.ensureVisitorRow(campaign.campaignId(), visitorId, utcDate);
+        int usedTotal = ledgerRepository.lockUsedTotal(campaign.campaignId(), utcDate);
+        int usedVisitor = ledgerRepository.lockUsedVisitor(
+                campaign.campaignId(), visitorId, utcDate);
+
+        // 任一额度已满则 429，两个额度均不增加（尚未写入）
+        if (usedTotal + 1 > campaign.dailyTotalCap()
+                || usedVisitor + 1 > campaign.perVisitorDailyCap()) {
+            throw new ApiException(HttpStatus.TOO_MANY_REQUESTS,
+                    "exposure quota exhausted for campaign " + campaign.campaignId());
+        }
+        ledgerRepository.addTotal(campaign.campaignId(), utcDate, 1);
+        ledgerRepository.addVisitor(campaign.campaignId(), visitorId, utcDate, 1);
+
+        String reservationId = UUID.randomUUID().toString().replace("-", "");
+        Reservation reservation = new Reservation(
+                reservationId,
+                campaign.campaignId(),
+                visitorId,
+                java.sql.Date.valueOf(utcDate),
+                ReservationStatus.RESERVED,
+                creativeId,
+                rotationSeq,
+                now,
+                now + RESERVATION_TTL_MILLIS,
+                null);
+        reservationRepository.insert(reservation);
+        return ReservationResponse.from(reservation);
     }
 
     /**
@@ -265,6 +387,12 @@ public class ExposureServiceImpl implements ExposureService {
                 if (!reservationRepository.compareAndSetStatus(
                         reservationId, ReservationStatus.RESERVED, ReservationStatus.CONFIRMED, now)) {
                     throw new ApiException(HttpStatus.CONFLICT, "reservation state changed concurrently");
+                }
+                // 仅确认推进跨 UTC 日连续轮换序号；额度仍计在原申请日
+                if (current.isRotation()) {
+                    rotationStateRepository.ensureRow(current.campaignId(), current.visitorId());
+                    rotationStateRepository.incrementConfirmedCount(
+                            current.campaignId(), current.visitorId());
                 }
             } else {
                 if (!reservationRepository.compareAndSetStatus(

@@ -40,6 +40,12 @@ public class ExposureController {
         return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.apply(request));
     }
 
+    /** 申请轮换创意：按已确认次数模创意数选下一个创意并冻结，每访客每公告至多一条活跃轮换预占。 */
+    @PostMapping("/rotations")
+    public ResponseEntity<ReservationResponse> applyRotation(@Valid @RequestBody ApplyRotationRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.applyRotation(request));
+    }
+
     /** 预占明细。 */
     @GetMapping("/reservations/{reservationId}")
     public ReservationResponse getReservation(@PathVariable String reservationId) {

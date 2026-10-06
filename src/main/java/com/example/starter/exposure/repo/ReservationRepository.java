@@ -6,8 +6,6 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
-import java.sql.ResultSet;
-import java.sql.SQLException;
 import java.util.List;
 import java.util.Optional;
 
@@ -29,21 +27,26 @@ public class ReservationRepository {
             rs.getString("visitor_id"),
             rs.getDate("utc_date"),
             ReservationStatus.valueOf(rs.getString("status")),
+            rs.getString("creative_id"),
+            (Integer) rs.getObject("rotation_seq"),
             rs.getLong("created_at_utc"),
             rs.getLong("expires_at_utc"),
             (Long) rs.getObject("terminal_at_utc"));
 
     private static final String COLUMNS =
-            "reservation_id, campaign_id, visitor_id, utc_date, status, "
+            "reservation_id, campaign_id, visitor_id, utc_date, status, creative_id, rotation_seq, "
                     + "created_at_utc, expires_at_utc, terminal_at_utc";
 
     public void insert(Reservation reservation) {
-        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 reservation.reservationId(),
                 reservation.campaignId(),
                 reservation.visitorId(),
                 reservation.utcDate(),
                 reservation.status().name(),
+                reservation.creativeId(),
+                reservation.rotationSeq(),
                 reservation.createdAtUtc(),
                 reservation.expiresAtUtc(),
                 reservation.terminalAtUtc());
@@ -73,6 +76,30 @@ public class ReservationRepository {
         return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
                         + "WHERE campaign_id = ? AND status = 'RESERVED' AND expires_at_utc <= ? FOR UPDATE",
                 MAPPER, campaignId, nowUtc);
+    }
+
+    /**
+     * 查询某访客在某公告下当前活跃的轮换预占（RESERVED 且已冻结创意）；至多一条。
+     * 调用方须先结算过期预占，保证 RESERVED 均未到期。
+     */
+    public Optional<Reservation> findActiveRotation(String campaignId, String visitorId) {
+        List<Reservation> list = jdbc.query(
+                "SELECT " + COLUMNS + " FROM exposure_reservation "
+                        + "WHERE campaign_id = ? AND visitor_id = ? AND status = 'RESERVED' "
+                        + "AND creative_id IS NOT NULL",
+                MAPPER, campaignId, visitorId);
+        return list.stream().findFirst();
+    }
+
+    /**
+     * 该访客在该公告下是否已存在任何轮换预占记录（含终态）；用于判定轮换是否已开始。
+     */
+    public boolean existsAnyRotation(String campaignId, String visitorId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM exposure_reservation "
+                        + "WHERE campaign_id = ? AND visitor_id = ? AND creative_id IS NOT NULL",
+                Integer.class, campaignId, visitorId);
+        return count != null && count > 0;
     }
 
     /**
