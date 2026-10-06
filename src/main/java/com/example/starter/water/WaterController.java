@@ -3,10 +3,15 @@ package com.example.starter.water;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CommandRequest;
+import com.example.starter.water.dto.Dtos.CreateFieldRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.FieldResponse;
+import com.example.starter.water.dto.Dtos.FieldSaltResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.IrrigateRequest;
+import com.example.starter.water.dto.Dtos.IrrigationResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
@@ -46,7 +51,30 @@ public class WaterController {
     public AllocationResponse submitAllocation(@RequestBody SubmitAllocationRequest request,
                                                @RequestHeader("X-Actor-Id") String actor) {
         return service.submitAllocation(request.commandKey(), request.allocationKey(), request.windowId(),
-                request.userId(), request.amount(), actor);
+                request.userId(), request.amount(), request.fieldId(), request.concentration(), actor);
+    }
+
+    /** 创建农户田块（不可变盐量上限）。 */
+    @PostMapping("/fields")
+    public FieldResponse createField(@RequestBody CreateFieldRequest request,
+                                     @RequestHeader("X-Actor-Id") String actor) {
+        return service.createField(request.commandKey(), request.fieldKey(), request.farmerId(),
+                request.saltCapGrams(), request.expectedVersion(), actor);
+    }
+
+    /** 查询田块盐负荷（累计实灌、全部预留、余量及账本明细）。 */
+    @GetMapping("/fields/{fieldId}/salt")
+    public FieldSaltResponse getFieldSalt(@PathVariable long fieldId) {
+        return service.getFieldSalt(fieldId);
+    }
+
+    /** 实际灌入登记（仅申请人本人，正水量且不超过未灌量）。 */
+    @PostMapping("/allocations/{allocationKey}/irrigate")
+    public IrrigationResponse irrigateAllocation(@PathVariable String allocationKey,
+                                                 @RequestBody IrrigateRequest request,
+                                                 @RequestHeader("X-Actor-Id") String actor) {
+        return service.irrigateAllocation(request.commandKey(), allocationKey, request.amount(),
+                request.expectedVersion(), actor);
     }
 
     /** 批准配水申请。 */
