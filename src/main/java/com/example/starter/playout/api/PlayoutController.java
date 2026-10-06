@@ -11,10 +11,14 @@ import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.GrantResponse;
 import com.example.starter.playout.api.Dtos.CancelEmergencyOverrideRequest;
+import com.example.starter.playout.api.Dtos.MixDraftResponse;
+import com.example.starter.playout.api.Dtos.MixPlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
+import com.example.starter.playout.api.Dtos.PublishMixRequest;
 import com.example.starter.playout.api.Dtos.PublishRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
+import com.example.starter.playout.api.Dtos.ReplaceMixDraftRequest;
 import com.example.starter.playout.api.Dtos.RevokeGrantRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -117,6 +121,31 @@ public class PlayoutController {
     @GetMapping("/emergency-overrides/{overrideKey}")
     public EmergencyOverrideResponse emergencyOverride(@PathVariable @NotBlank String overrideKey) {
         return service.getEmergencyOverride(overrideKey);
+    }
+
+    /** 整份替换频道某业务日混音草稿（素材顺序 + 邻接交叉淡化，乐观锁 + 幂等）。 */
+    @PutMapping("/channels/{channelId}/mix-drafts/{businessDay}")
+    public MixDraftResponse replaceMixDraft(@PathVariable @NotBlank String channelId,
+                                            @PathVariable String businessDay,
+                                            @Valid @RequestBody ReplaceMixDraftRequest request) {
+        return service.replaceMixDraft(channelId, parseBusinessDay(businessDay), request);
+    }
+
+    /** 发布频道某业务日混音草稿（乐观锁 + 幂等；授权须覆盖完整实际播放区间）。 */
+    @PostMapping("/channels/{channelId}/mix-drafts/{businessDay}/publish")
+    public PublishResponse publishMix(@PathVariable @NotBlank String channelId,
+                                      @PathVariable String businessDay,
+                                      @Valid @RequestBody PublishMixRequest request) {
+        return service.publishMix(channelId, parseBusinessDay(businessDay), request);
+    }
+
+    /** 按频道与时刻查询混音播出决策（重叠区返回两条素材、各授权与增益）。 */
+    @GetMapping("/channels/{channelId}/mix-playout")
+    public MixPlayoutDecisionResponse mixPlayout(@PathVariable @NotBlank String channelId,
+                                                 @RequestParam
+                                                 @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME)
+                                                 OffsetDateTime at) {
+        return service.mixPlayoutDecision(channelId, at);
     }
 
     private static LocalDate parseBusinessDay(String businessDay) {

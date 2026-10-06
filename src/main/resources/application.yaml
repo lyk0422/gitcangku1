@@ -20,6 +20,7 @@ spring:
       mode: always
       encoding: UTF-8
       schema-locations: ${SCHEMA_LOCATION:classpath:schema-h2.sql}
+      data-locations: ${DATA_LOCATION:classpath:data-h2.sql}
   lifecycle:
     timeout-per-shutdown-phase: 20s
 

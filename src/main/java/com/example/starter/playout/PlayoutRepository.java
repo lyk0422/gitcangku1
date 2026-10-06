@@ -381,4 +381,121 @@ public class PlayoutRepository {
                         + " WHERE override_key = ? AND status = 'ACTIVE'",
                 cancelRequestId, cancelledAtMs, overrideKey);
     }
+
+    // ---------- 混音草稿与发布 ----------
+
+    /** 混音草稿条目行；startMs/endMs 为替换时合成的实际播出区间（含重叠段）。 */
+    public record MixItemRow(String id, int seq, String assetId, long fadeInMs,
+                             long startMs, long endMs) {
+    }
+
+    /** 混音发布快照条目行，grantId 为发布时选定的完整覆盖授权。 */
+    public record MixPublicationItemRow(long id, long publicationId, int seq, String itemId,
+                                        String assetId, long grantId, long fadeInMs,
+                                        long startMs, long endMs) {
+    }
+
+    private static final RowMapper<MixItemRow> MIX_ITEM_MAPPER = (rs, n) ->
+            new MixItemRow(rs.getString("id"), rs.getInt("seq"), rs.getString("asset_id"),
+                    rs.getLong("fade_in_ms"), rs.getLong("start_ms"), rs.getLong("end_ms"));
+
+    private static final RowMapper<MixPublicationItemRow> MIX_PUB_ITEM_MAPPER = (rs, n) ->
+            new MixPublicationItemRow(rs.getLong("id"), rs.getLong("publication_id"),
+                    rs.getInt("seq"), rs.getString("item_id"), rs.getString("asset_id"),
+                    rs.getLong("grant_id"), rs.getLong("fade_in_ms"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"));
+
+    public Optional<DraftRow> findMixDraft(String channelId, LocalDate businessDay) {
+        return jdbc.query("SELECT channel_id, business_day, version FROM playout_mix_draft"
+                        + " WHERE channel_id = ? AND business_day = ?",
+                DRAFT_MAPPER, channelId, Date.valueOf(businessDay)).stream().findFirst();
+    }
+
+    public void insertMixDraft(String channelId, LocalDate businessDay, long updatedAtMs) {
+        jdbc.update("INSERT INTO playout_mix_draft (channel_id, business_day, version, updated_at_ms)"
+                        + " VALUES (?, ?, 1, ?)",
+                channelId, Date.valueOf(businessDay), updatedAtMs);
+    }
+
+    /** 乐观锁递增混音草稿版本；返回受影响行数，0 表示版本冲突或不存在。 */
+    public int bumpMixDraftVersion(String channelId, LocalDate businessDay,
+                                   long expectedVersion, long updatedAtMs) {
+        return jdbc.update("UPDATE playout_mix_draft SET version = version + 1, updated_at_ms = ?"
+                        + " WHERE channel_id = ? AND business_day = ? AND version = ?",
+                updatedAtMs, channelId, Date.valueOf(businessDay), expectedVersion);
+    }
+
+    public void deleteMixDraftItems(String channelId, LocalDate businessDay) {
+        jdbc.update("DELETE FROM playout_mix_draft_item WHERE channel_id = ? AND business_day = ?",
+                channelId, Date.valueOf(businessDay));
+    }
+
+    public void insertMixDraftItem(String id, String channelId, LocalDate businessDay, int seq,
+                                   String assetId, long fadeInMs, long startMs, long endMs) {
+        jdbc.update("INSERT INTO playout_mix_draft_item"
+                        + " (id, channel_id, business_day, seq, asset_id, fade_in_ms, start_ms, end_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                id, channelId, Date.valueOf(businessDay), seq, assetId, fadeInMs, startMs, endMs);
+    }
+
+    public List<MixItemRow> findMixDraftItems(String channelId, LocalDate businessDay) {
+        return jdbc.query("SELECT id, seq, asset_id, fade_in_ms, start_ms, end_ms"
+                        + " FROM playout_mix_draft_item"
+                        + " WHERE channel_id = ? AND business_day = ? ORDER BY seq",
+                MIX_ITEM_MAPPER, channelId, Date.valueOf(businessDay));
+    }
+
+    /** 当前混音发布版本，无发布记录时为 0。 */
+    public long currentMixPublishedVersion(String channelId, LocalDate businessDay) {
+        Long version = jdbc.queryForObject(
+                "SELECT MAX(published_version) FROM playout_mix_publication"
+                        + " WHERE channel_id = ? AND business_day = ?",
+                Long.class, channelId, Date.valueOf(businessDay));
+        return version == null ? 0L : version;
+    }
+
+    public long insertMixPublication(String channelId, LocalDate businessDay, long publishedVersion,
+                                     long draftVersion, long createdAtMs) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO playout_mix_publication"
+                            + " (channel_id, business_day, published_version, draft_version, created_at_ms)"
+                            + " VALUES (?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, channelId);
+            ps.setDate(2, Date.valueOf(businessDay));
+            ps.setLong(3, publishedVersion);
+            ps.setLong(4, draftVersion);
+            ps.setLong(5, createdAtMs);
+            return ps;
+        }, keyHolder);
+        return keyHolder.getKey().longValue();
+    }
+
+    public void insertMixPublicationItem(long publicationId, int seq, String itemId, String assetId,
+                                         long grantId, long fadeInMs, long startMs, long endMs) {
+        jdbc.update("INSERT INTO playout_mix_publication_item"
+                        + " (publication_id, seq, item_id, asset_id, grant_id, fade_in_ms, start_ms, end_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                publicationId, seq, itemId, assetId, grantId, fadeInMs, startMs, endMs);
+    }
+
+    /** 最新一次混音发布快照。 */
+    public Optional<PublicationRow> findLatestMixPublication(String channelId, LocalDate businessDay) {
+        return jdbc.query("SELECT id, channel_id, business_day, published_version, draft_version"
+                        + " FROM playout_mix_publication"
+                        + " WHERE channel_id = ? AND business_day = ?"
+                        + " ORDER BY published_version DESC LIMIT 1",
+                PUBLICATION_MAPPER, channelId, Date.valueOf(businessDay)).stream().findFirst();
+    }
+
+    /** 混音快照中覆盖指定时刻的条目（start <= at < end），按顺序号升序；正常数据至多两条。 */
+    public List<MixPublicationItemRow> findMixPublicationItemsAt(long publicationId, long atMs) {
+        return jdbc.query("SELECT id, publication_id, seq, item_id, asset_id, grant_id,"
+                        + " fade_in_ms, start_ms, end_ms"
+                        + " FROM playout_mix_publication_item"
+                        + " WHERE publication_id = ? AND start_ms <= ? AND end_ms > ?"
+                        + " ORDER BY seq",
+                MIX_PUB_ITEM_MAPPER, publicationId, atMs, atMs);
+    }
 }

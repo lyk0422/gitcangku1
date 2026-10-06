@@ -3,6 +3,7 @@ package com.example.starter.playout.api;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
@@ -107,9 +108,9 @@ public final class Dtos {
             long draftVersion) {
     }
 
-    /** 播出决定来源：EMERGENCY 命中紧急插播，PROGRAM 命中节目片段，FALLBACK 返回保底素材。 */
+    /** 播出决定来源：EMERGENCY 命中紧急插播，PROGRAM 命中节目片段，MIX 命中交叉淡化重叠区，FALLBACK 返回保底素材。 */
     public enum DecisionSource {
-        EMERGENCY, PROGRAM, FALLBACK
+        EMERGENCY, PROGRAM, MIX, FALLBACK
     }
 
     /** 保底原因：无已发布编排 / 处于空档 / 覆盖片段的授权已撤销。 */
@@ -166,6 +167,79 @@ public final class Dtos {
             String cancelRequestId,
             OffsetDateTime cancelledAt,
             OffsetDateTime createdAt) {
+    }
+
+    /**
+     * 混音条目输入：按列表顺序登记素材；id 为空时由系统生成；
+     * fadeInMs 为与前一条目的交叉淡化时长（毫秒，0～10000），首条目必须为 0 或缺省。
+     */
+    public record MixItemInput(
+            String id,
+            @NotBlank String assetId,
+            Long fadeInMs) {
+    }
+
+    /**
+     * 整份替换混音草稿请求。startAt 为首个素材的播出起点（须位于业务日内）；
+     * 各条目时长取素材登记的整秒时长，下一条目开始等于前一条目结束减去淡化时长。
+     */
+    public record ReplaceMixDraftRequest(
+            @NotBlank String requestId,
+            @NotBlank String operator,
+            @NotNull @PositiveOrZero Long expectedDraftVersion,
+            @NotNull OffsetDateTime startAt,
+            @NotEmpty List<@NotNull MixItemInput> items) {
+    }
+
+    /** 混音条目响应；start/end 为合成后的实际播出区间（含与相邻条目的重叠段）。 */
+    public record MixItemResponse(
+            String id,
+            String assetId,
+            long fadeInMs,
+            OffsetDateTime start,
+            OffsetDateTime end) {
+    }
+
+    /** 混音草稿响应。 */
+    public record MixDraftResponse(
+            String channelId,
+            String businessDay,
+            long version,
+            List<MixItemResponse> items) {
+    }
+
+    /** 发布混音草稿请求。 */
+    public record PublishMixRequest(
+            @NotBlank String requestId,
+            @NotBlank String operator,
+            @NotNull @Positive Long draftVersion,
+            @NotNull @PositiveOrZero Long expectedPublishedVersion) {
+    }
+
+    /**
+     * 混音分量：重叠区内前条目增益为 1-u、后条目增益为 u（u 为重叠进度，左端 u=0）；
+     * 非重叠区单条目增益恒为 1.0。
+     */
+    public record MixComponent(
+            String itemId,
+            String assetId,
+            long grantId,
+            double gain) {
+    }
+
+    /**
+     * 混音播出决策响应。source 为 MIX 时 components 含两个分量；为 PROGRAM 时含一个分量；
+     * 为 EMERGENCY 时 assetId/overrideKey 非空；为 FALLBACK 时 assetId 为保底素材且 reason 非空。
+     */
+    public record MixPlayoutDecisionResponse(
+            String channelId,
+            OffsetDateTime at,
+            DecisionSource source,
+            FallbackReason reason,
+            String assetId,
+            String overrideKey,
+            Long publicationId,
+            List<MixComponent> components) {
     }
 
     /** 统一错误响应体。 */

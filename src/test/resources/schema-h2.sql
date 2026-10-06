@@ -91,3 +91,49 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
 );
 CREATE INDEX IF NOT EXISTS idx_override_playout
     ON playout_emergency_override (channel_id, status, start_ms, end_ms, priority);
+
+CREATE TABLE IF NOT EXISTS playout_mix_draft (
+    channel_id    VARCHAR(64) NOT NULL,
+    business_day  DATE        NOT NULL,
+    version       BIGINT      NOT NULL,
+    updated_at_ms BIGINT      NOT NULL,
+    PRIMARY KEY (channel_id, business_day)
+);
+
+CREATE TABLE IF NOT EXISTS playout_mix_draft_item (
+    id           VARCHAR(64) NOT NULL PRIMARY KEY,
+    channel_id   VARCHAR(64) NOT NULL,
+    business_day DATE        NOT NULL,
+    seq          INT         NOT NULL,
+    asset_id     VARCHAR(64) NOT NULL,
+    fade_in_ms   BIGINT      NOT NULL,
+    start_ms     BIGINT      NOT NULL,
+    end_ms       BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mix_draft_item
+    ON playout_mix_draft_item (channel_id, business_day);
+
+CREATE TABLE IF NOT EXISTS playout_mix_publication (
+    id                BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    channel_id        VARCHAR(64) NOT NULL,
+    business_day      DATE        NOT NULL,
+    published_version BIGINT      NOT NULL,
+    draft_version     BIGINT      NOT NULL,
+    created_at_ms     BIGINT      NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_mix_publication_version
+    ON playout_mix_publication (channel_id, business_day, published_version);
+
+CREATE TABLE IF NOT EXISTS playout_mix_publication_item (
+    id             BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    publication_id BIGINT      NOT NULL,
+    seq            INT         NOT NULL,
+    item_id        VARCHAR(64) NOT NULL,
+    asset_id       VARCHAR(64) NOT NULL,
+    grant_id       BIGINT      NOT NULL,
+    fade_in_ms     BIGINT      NOT NULL,
+    start_ms       BIGINT      NOT NULL,
+    end_ms         BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mix_pub_item
+    ON playout_mix_publication_item (publication_id);

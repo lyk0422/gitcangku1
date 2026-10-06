@@ -1,7 +1,10 @@
 package com.example.starter.playout;
 
+import com.example.starter.playout.PlayoutRepository.AssetRow;
 import com.example.starter.playout.PlayoutRepository.DraftRow;
 import com.example.starter.playout.PlayoutRepository.GrantRow;
+import com.example.starter.playout.PlayoutRepository.MixItemRow;
+import com.example.starter.playout.PlayoutRepository.MixPublicationItemRow;
 import com.example.starter.playout.PlayoutRepository.OverrideRow;
 import com.example.starter.playout.PlayoutRepository.PublicationRow;
 import com.example.starter.playout.PlayoutRepository.PublicationSegmentRow;
@@ -19,11 +22,18 @@ import com.example.starter.playout.api.Dtos.DraftResponse;
 import com.example.starter.playout.api.Dtos.EmergencyOverrideResponse;
 import com.example.starter.playout.api.Dtos.FallbackReason;
 import com.example.starter.playout.api.Dtos.GrantResponse;
+import com.example.starter.playout.api.Dtos.MixComponent;
+import com.example.starter.playout.api.Dtos.MixDraftResponse;
+import com.example.starter.playout.api.Dtos.MixItemInput;
+import com.example.starter.playout.api.Dtos.MixItemResponse;
+import com.example.starter.playout.api.Dtos.MixPlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.OverrideStatus;
 import com.example.starter.playout.api.Dtos.PlayoutDecisionResponse;
 import com.example.starter.playout.api.Dtos.PublishRequest;
+import com.example.starter.playout.api.Dtos.PublishMixRequest;
 import com.example.starter.playout.api.Dtos.PublishResponse;
 import com.example.starter.playout.api.Dtos.ReplaceDraftRequest;
+import com.example.starter.playout.api.Dtos.ReplaceMixDraftRequest;
 import com.example.starter.playout.api.Dtos.SegmentInput;
 import com.example.starter.playout.api.Dtos.SegmentResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -39,6 +49,7 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
@@ -63,9 +74,14 @@ public class PlayoutService {
     private static final String OP_REVOKE_GRANT = "REVOKE_GRANT";
     private static final String OP_CREATE_OVERRIDE = "CREATE_OVERRIDE";
     private static final String OP_CANCEL_OVERRIDE = "CANCEL_OVERRIDE";
+    private static final String OP_REPLACE_MIX_DRAFT = "REPLACE_MIX_DRAFT";
+    private static final String OP_PUBLISH_MIX = "PUBLISH_MIX";
 
     /** 紧急插播时长上限（含）：30 分钟，单位毫秒。 */
     private static final long OVERRIDE_MAX_DURATION_MS = 30L * 60L * 1000L;
+
+    /** 交叉淡化时长上限（含）：10 秒，单位毫秒。 */
+    private static final long MIX_MAX_FADE_MS = 10_000L;
 
     private final PlayoutRepository repo;
     private final ObjectMapper objectMapper;
@@ -428,6 +444,256 @@ public class PlayoutService {
                 atMs(row.createdAtMs()));
     }
 
+    // ---------- 混音草稿 ----------
+
+    /**
+     * 整份替换混音草稿：登记素材顺序，条目时长取素材登记的整秒时长；邻接淡化 0～10 秒且不超过
+     * 相邻任一素材时长；下一条目开始等于前一条目结束减淡化时长；任意时刻不得有三条素材同时播出；
+     * 整体播出区间不得跨业务日。携带 expectedDraftVersion（0 表示首次创建），版本不符返回 409。
+     */
+    @Transactional
+    public MixDraftResponse replaceMixDraft(String channelId, LocalDate businessDay,
+                                            ReplaceMixDraftRequest request) {
+        repo.findChannel(channelId)
+                .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
+
+        String hash = sha256(canonical(OP_REPLACE_MIX_DRAFT, request.operator(), channelId,
+                businessDay.toString(), String.valueOf(request.expectedDraftVersion()),
+                String.valueOf(toMs(request.startAt())), canonicalMixItems(request.items())));
+        return idempotent(request.requestId(), OP_REPLACE_MIX_DRAFT, hash, MixDraftResponse.class, () -> {
+            List<ValidatedMixItem> items = validateMixItems(channelId, businessDay, request);
+            long newVersion;
+            if (request.expectedDraftVersion() == 0) {
+                try {
+                    repo.insertMixDraft(channelId, businessDay, nowMs());
+                } catch (DuplicateKeyException e) {
+                    throw ApiException.conflict("DRAFT_VERSION_CONFLICT",
+                            "混音草稿已存在，expectedDraftVersion 不能为 0");
+                }
+                newVersion = 1;
+            } else {
+                int updated = repo.bumpMixDraftVersion(channelId, businessDay,
+                        request.expectedDraftVersion(), nowMs());
+                if (updated == 0) {
+                    throw ApiException.conflict("DRAFT_VERSION_CONFLICT",
+                            "混音草稿版本不符，期望 " + request.expectedDraftVersion());
+                }
+                newVersion = request.expectedDraftVersion() + 1;
+            }
+            repo.deleteMixDraftItems(channelId, businessDay);
+            int seq = 0;
+            for (ValidatedMixItem item : items) {
+                repo.insertMixDraftItem(item.id(), channelId, businessDay, seq++,
+                        item.assetId(), item.fadeInMs(), item.startMs(), item.endMs());
+            }
+            return new MixDraftResponse(channelId, businessDay.toString(), newVersion,
+                    items.stream().map(ValidatedMixItem::toResponse).toList());
+        });
+    }
+
+    /**
+     * 发布混音草稿：校验草稿版本与发布版本，逐条目加锁校验授权完整覆盖其实际播放区间
+     * （含重叠段，不能只覆盖非重叠部分），并防御性复检三重叠；任一不满足则 422 整次不发布。
+     * 发布冻结区间与授权生成只读快照，历史不重算。
+     */
+    @Transactional
+    public PublishResponse publishMix(String channelId, LocalDate businessDay,
+                                      PublishMixRequest request) {
+        repo.findChannel(channelId)
+                .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
+
+        String hash = sha256(canonical(OP_PUBLISH_MIX, request.operator(), channelId,
+                businessDay.toString(), String.valueOf(request.draftVersion()),
+                String.valueOf(request.expectedPublishedVersion())));
+        return idempotent(request.requestId(), OP_PUBLISH_MIX, hash, PublishResponse.class, () -> {
+            DraftRow draft = repo.findMixDraft(channelId, businessDay)
+                    .orElseThrow(() -> ApiException.notFound(
+                            "混音草稿不存在: " + channelId + " " + businessDay));
+            List<MixItemRow> items = repo.findMixDraftItems(channelId, businessDay);
+            if (draft.version() != request.draftVersion()) {
+                throw ApiException.conflict("DRAFT_VERSION_CONFLICT",
+                        "混音草稿版本不符，当前 " + draft.version());
+            }
+            long currentPublished = repo.currentMixPublishedVersion(channelId, businessDay);
+            if (currentPublished != request.expectedPublishedVersion()) {
+                throw ApiException.conflict("PUBLISHED_VERSION_CONFLICT",
+                        "混音发布版本冲突，当前 " + currentPublished);
+            }
+            for (int i = 2; i < items.size(); i++) {
+                if (items.get(i).startMs() < items.get(i - 2).endMs()) {
+                    throw ApiException.unprocessable("MIX_TRIPLE_OVERLAP",
+                            "混音时间线存在三条素材同时播出，整次发布拒绝: " + items.get(i).id());
+                }
+            }
+            List<Long> grantIds = new ArrayList<>();
+            for (MixItemRow item : items) {
+                GrantRow grant = selectCoveringGrantForUpdate(channelId, item.assetId(),
+                        item.startMs(), item.endMs());
+                grantIds.add(grant.id());
+            }
+            long newVersion = currentPublished + 1;
+            long publicationId;
+            try {
+                publicationId = repo.insertMixPublication(channelId, businessDay,
+                        newVersion, draft.version(), nowMs());
+            } catch (DuplicateKeyException e) {
+                throw ApiException.conflict("PUBLISHED_VERSION_CONFLICT",
+                        "混音发布版本冲突，版本 " + newVersion + " 已存在");
+            }
+            for (int i = 0; i < items.size(); i++) {
+                MixItemRow item = items.get(i);
+                repo.insertMixPublicationItem(publicationId, item.seq(), item.id(), item.assetId(),
+                        grantIds.get(i), item.fadeInMs(), item.startMs(), item.endMs());
+            }
+            return new PublishResponse(publicationId, channelId, businessDay.toString(),
+                    newVersion, draft.version());
+        });
+    }
+
+    /**
+     * 混音播出决策：紧急插播优先替代整组混音；命中重叠区时返回两条素材、各授权与增益
+     * （重叠进度 u，前增益 1-u、后增益 u；左端 u=0，右端仅后素材）；任一重叠素材授权撤销时
+     * 当前决策整组回退频道保底素材并说明原因，不能只播另一条。查询基于发布冻结的快照区间，
+     * 授权撤销状态为查询时实时状态。
+     */
+    @Transactional(readOnly = true)
+    public MixPlayoutDecisionResponse mixPlayoutDecision(String channelId, OffsetDateTime at) {
+        var channel = repo.findChannel(channelId)
+                .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
+        long atMs = toMs(at);
+
+        Optional<OverrideRow> override = selectActiveOverrideAt(channelId, atMs);
+        if (override.isPresent()) {
+            OverrideRow hit = override.get();
+            return new MixPlayoutDecisionResponse(channelId, at, DecisionSource.EMERGENCY, null,
+                    hit.assetId(), hit.overrideKey(), null, null);
+        }
+
+        LocalDate businessDay = at.atZoneSameInstant(ZONE).toLocalDate();
+        Optional<PublicationRow> publication = repo.findLatestMixPublication(channelId, businessDay);
+        if (publication.isEmpty()) {
+            return mixFallback(channelId, at, channel.fallbackAssetId(),
+                    FallbackReason.NO_PUBLISHED_SCHEDULE);
+        }
+        List<MixPublicationItemRow> items =
+                repo.findMixPublicationItemsAt(publication.get().id(), atMs);
+        if (items.isEmpty()) {
+            return mixFallback(channelId, at, channel.fallbackAssetId(), FallbackReason.GAP);
+        }
+        if (items.size() > 2) {
+            throw ApiException.unprocessable("SNAPSHOT_INCOMPLETE",
+                    "混音快照存在三条以上同时播出条目: " + publication.get().id());
+        }
+        List<GrantRow> grants = new ArrayList<>();
+        for (MixPublicationItemRow item : items) {
+            grants.add(repo.findGrant(item.grantId())
+                    .orElseThrow(() -> ApiException.unprocessable("SNAPSHOT_INCOMPLETE",
+                            "混音快照引用的授权不存在: " + item.grantId())));
+        }
+        for (GrantRow grant : grants) {
+            if (grant.revoked()) {
+                return new MixPlayoutDecisionResponse(channelId, at, DecisionSource.FALLBACK,
+                        FallbackReason.GRANT_REVOKED, channel.fallbackAssetId(), null,
+                        publication.get().id(), null);
+            }
+        }
+        if (items.size() == 1) {
+            MixPublicationItemRow item = items.get(0);
+            return new MixPlayoutDecisionResponse(channelId, at, DecisionSource.PROGRAM, null,
+                    null, null, publication.get().id(),
+                    List.of(new MixComponent(item.itemId(), item.assetId(), item.grantId(), 1.0)));
+        }
+        MixPublicationItemRow prev = items.get(0);
+        MixPublicationItemRow next = items.get(1);
+        long overlapStartMs = next.startMs();
+        long fadeMs = prev.endMs() - next.startMs();
+        double u = (double) (atMs - overlapStartMs) / (double) fadeMs;
+        return new MixPlayoutDecisionResponse(channelId, at, DecisionSource.MIX, null,
+                null, null, publication.get().id(),
+                List.of(new MixComponent(prev.itemId(), prev.assetId(), prev.grantId(), 1.0 - u),
+                        new MixComponent(next.itemId(), next.assetId(), next.grantId(), u)));
+    }
+
+    private MixPlayoutDecisionResponse mixFallback(String channelId, OffsetDateTime at,
+                                                   String assetId, FallbackReason reason) {
+        return new MixPlayoutDecisionResponse(channelId, at, DecisionSource.FALLBACK, reason,
+                assetId, null, null, null);
+    }
+
+    /**
+     * 校验并合成混音条目时间线：首条目淡化必须为 0；淡化 0～10 秒且不超过相邻素材时长；
+     * 相邻淡化区间不得叠加（否则三条素材同时播出）；素材时长须为整秒；整体区间不得跨业务日；
+     * 素材存在且被单条未撤销授权完整覆盖实际播放区间。
+     */
+    private List<ValidatedMixItem> validateMixItems(String channelId, LocalDate businessDay,
+                                                    ReplaceMixDraftRequest request) {
+        long dayStartMs = businessDay.atStartOfDay(ZONE).toInstant().toEpochMilli();
+        long dayEndMs = businessDay.plusDays(1).atStartOfDay(ZONE).toInstant().toEpochMilli();
+        long cursorMs = toMs(request.startAt());
+        if (cursorMs < dayStartMs || cursorMs >= dayEndMs) {
+            throw ApiException.unprocessable("MIX_CROSSES_DAY",
+                    "混音起点须位于业务日内: " + request.startAt());
+        }
+
+        List<ValidatedMixItem> items = new ArrayList<>();
+        long prevDurationMs = -1;
+        long prevFadeMs = 0;
+        int index = 0;
+        for (MixItemInput input : request.items()) {
+            if (input.assetId() == null || input.assetId().isBlank()) {
+                throw ApiException.badRequest("混音条目素材 ID 不能为空");
+            }
+            long fadeMs = input.fadeInMs() == null ? 0 : input.fadeInMs();
+            if (index == 0 && fadeMs != 0) {
+                throw ApiException.badRequest("首个混音条目的淡化时长必须为 0");
+            }
+            if (fadeMs < 0 || fadeMs > MIX_MAX_FADE_MS) {
+                throw ApiException.unprocessable("MIX_FADE_OUT_OF_RANGE",
+                        "淡化时长须在 0～10000 毫秒之间: " + fadeMs);
+            }
+            AssetRow asset = repo.findAsset(input.assetId())
+                    .orElseThrow(() -> ApiException.notFound("素材不存在: " + input.assetId()));
+            long durationMs = asset.durationMs();
+            if (durationMs % 1000 != 0) {
+                throw ApiException.unprocessable("MIX_DURATION_NOT_WHOLE_SECONDS",
+                        "混音素材时长须为整秒: " + input.assetId());
+            }
+            if (index > 0) {
+                if (fadeMs > prevDurationMs || fadeMs > durationMs) {
+                    throw ApiException.unprocessable("MIX_FADE_EXCEEDS_DURATION",
+                            "淡化时长超过相邻素材时长: " + input.assetId());
+                }
+                if (prevFadeMs + fadeMs > prevDurationMs) {
+                    throw ApiException.unprocessable("MIX_TRIPLE_OVERLAP",
+                            "相邻淡化区间叠加将导致三条素材同时播出: " + input.assetId());
+                }
+            }
+            long startMs = cursorMs - fadeMs;
+            long endMs = startMs + durationMs;
+            String id = input.id() == null || input.id().isBlank()
+                    ? UUID.randomUUID().toString() : input.id();
+            items.add(new ValidatedMixItem(id, input.assetId(), fadeMs, startMs, endMs));
+            cursorMs = endMs;
+            prevDurationMs = durationMs;
+            prevFadeMs = fadeMs;
+            index++;
+        }
+        if (cursorMs > dayEndMs) {
+            throw ApiException.unprocessable("MIX_CROSSES_DAY",
+                    "混音整体播出区间不得跨业务日，结束超出: " + atMs(cursorMs));
+        }
+
+        for (ValidatedMixItem item : items) {
+            List<GrantRow> covering = repo.findCoveringGrants(channelId, item.assetId(),
+                    item.startMs(), item.endMs());
+            if (covering.isEmpty()) {
+                throw ApiException.unprocessable("NO_COVERING_GRANT",
+                        "混音条目未被单条有效授权完整覆盖实际播放区间: " + item.id());
+            }
+        }
+        return items;
+    }
+
     // ---------- 内部方法 ----------
 
     /** 校验并规范化草稿片段：非空、区间内、不跨日、不重叠、素材存在且被单条未撤销授权完整覆盖。 */
@@ -494,6 +760,18 @@ public class PlayoutService {
                         "片段授权已失效，发布拒绝: " + segment.id()));
     }
 
+    /** 发布混音时加行锁选取完整覆盖条目实际播放区间（含重叠段）的授权；失效时 422 拒绝整次发布。 */
+    private GrantRow selectCoveringGrantForUpdate(String channelId, String assetId,
+                                                  long startMs, long endMs) {
+        List<GrantRow> candidates = repo.findCoveringGrantsForUpdate(channelId, assetId,
+                startMs, endMs);
+        return candidates.stream()
+                .filter(grant -> !grant.revoked())
+                .findFirst()
+                .orElseThrow(() -> ApiException.unprocessable("GRANT_INVALID",
+                        "混音条目授权未完整覆盖实际播放区间或已失效，发布拒绝: " + assetId));
+    }
+
     /**
      * 幂等执行：去重记录与业务结果同事务提交；同 requestId 同参数返回原结果，
      * 同 requestId 不同参数返回 409；业务失败抛异常回滚，不占用 requestId。
@@ -552,6 +830,34 @@ public class PlayoutService {
         return sb.toString();
     }
 
+    /**
+     * 结构化参数指纹：以 JSON 数组编码操作、操作者、资源与全部参数（含期望版本），
+     * 字段边界由 JSON 字符串语义保证，避免分隔符碰撞。
+     */
+    private String canonical(String... fields) {
+        try {
+            return objectMapper.writeValueAsString(Arrays.asList(fields));
+        } catch (Exception e) {
+            throw new IllegalStateException("参数指纹序列化失败", e);
+        }
+    }
+
+    /** 混音条目列表的结构化指纹，顺序敏感。 */
+    private String canonicalMixItems(List<MixItemInput> items) {
+        List<List<String>> canonical = new ArrayList<>();
+        for (MixItemInput input : items) {
+            canonical.add(Arrays.asList(
+                    input.id() == null ? "" : input.id(),
+                    input.assetId() == null ? "" : input.assetId(),
+                    input.fadeInMs() == null ? "" : String.valueOf(input.fadeInMs())));
+        }
+        try {
+            return objectMapper.writeValueAsString(canonical);
+        } catch (Exception e) {
+            throw new IllegalStateException("参数指纹序列化失败", e);
+        }
+    }
+
     private PlayoutDecisionResponse fallback(String channelId, OffsetDateTime at, String assetId,
                                              FallbackReason reason) {
         return new PlayoutDecisionResponse(channelId, at, assetId,
@@ -589,6 +895,14 @@ public class PlayoutService {
     private record ValidatedSegment(String id, String assetId, long startMs, long endMs) {
         SegmentResponse toResponse() {
             return new SegmentResponse(id, assetId, atMs(startMs), atMs(endMs));
+        }
+    }
+
+    /** 校验并合成时间线后的混音条目。 */
+    private record ValidatedMixItem(String id, String assetId, long fadeInMs,
+                                    long startMs, long endMs) {
+        MixItemResponse toResponse() {
+            return new MixItemResponse(id, assetId, fadeInMs, atMs(startMs), atMs(endMs));
         }
     }
 }

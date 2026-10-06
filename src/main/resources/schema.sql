@@ -97,3 +97,49 @@ CREATE TABLE IF NOT EXISTS playout_emergency_override (
     PRIMARY KEY (override_key),
     KEY idx_override_playout (channel_id, status, start_ms, end_ms, priority)
 ) COMMENT = '限时紧急插播表；不改写日草稿与发布快照，同频道同优先级 ACTIVE 区间不得重叠';
+
+CREATE TABLE IF NOT EXISTS playout_mix_draft (
+    channel_id    VARCHAR(64) NOT NULL COMMENT '频道 ID',
+    business_day  DATE        NOT NULL COMMENT '业务日，Asia/Shanghai 日历日',
+    version       BIGINT      NOT NULL COMMENT '混音草稿乐观锁版本，每次整份替换递增，初始为 1',
+    updated_at_ms BIGINT      NOT NULL COMMENT '最近替换时间，UTC 纪元毫秒',
+    PRIMARY KEY (channel_id, business_day)
+) COMMENT = '混音草稿表，每个频道+业务日一份，登记素材顺序与邻接交叉淡化';
+
+CREATE TABLE IF NOT EXISTS playout_mix_draft_item (
+    id           VARCHAR(64) NOT NULL COMMENT '混音条目 ID，客户端指定或系统生成',
+    channel_id   VARCHAR(64) NOT NULL COMMENT '所属频道 ID',
+    business_day DATE        NOT NULL COMMENT '所属业务日，Asia/Shanghai 日历日',
+    seq          INT         NOT NULL COMMENT '素材顺序号，从 0 起递增',
+    asset_id     VARCHAR(64) NOT NULL COMMENT '播出素材 ID，条目时长取素材登记的整秒时长',
+    fade_in_ms   BIGINT      NOT NULL COMMENT '与前一条目的交叉淡化时长，单位毫秒，0～10000 且不超过相邻素材时长，首条目恒为 0',
+    start_ms     BIGINT      NOT NULL COMMENT '实际播出开始（含），UTC 纪元毫秒；等于前一条目结束减淡化时长',
+    end_ms       BIGINT      NOT NULL COMMENT '实际播出结束（不含），UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    KEY idx_mix_draft_item (channel_id, business_day)
+) COMMENT = '混音草稿条目表，随草稿整份替换而整体重建；任意时刻不得有三条素材同时播出';
+
+CREATE TABLE IF NOT EXISTS playout_mix_publication (
+    id                BIGINT      NOT NULL AUTO_INCREMENT COMMENT '混音发布快照自增 ID',
+    channel_id        VARCHAR(64) NOT NULL COMMENT '频道 ID',
+    business_day      DATE        NOT NULL COMMENT '业务日，Asia/Shanghai 日历日',
+    published_version BIGINT      NOT NULL COMMENT '发布版本，每频道+业务日从 1 起递增',
+    draft_version     BIGINT      NOT NULL COMMENT '发布时对应的混音草稿版本',
+    created_at_ms     BIGINT      NOT NULL COMMENT '发布时间，UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_mix_publication_version (channel_id, business_day, published_version)
+) COMMENT = '混音发布快照表，快照只读，发布冻结区间与授权，历史不重算';
+
+CREATE TABLE IF NOT EXISTS playout_mix_publication_item (
+    id             BIGINT      NOT NULL AUTO_INCREMENT COMMENT '混音快照条目自增 ID',
+    publication_id BIGINT      NOT NULL COMMENT '所属混音发布快照 ID',
+    seq            INT         NOT NULL COMMENT '素材顺序号，从 0 起递增',
+    item_id        VARCHAR(64) NOT NULL COMMENT '来源混音草稿条目 ID',
+    asset_id       VARCHAR(64) NOT NULL COMMENT '播出素材 ID',
+    grant_id       BIGINT      NOT NULL COMMENT '发布时完整覆盖该条目实际播放区间（含重叠段）的授权 ID，播出查询据此实时判定撤销状态',
+    fade_in_ms     BIGINT      NOT NULL COMMENT '与前一条目的交叉淡化时长，单位毫秒',
+    start_ms       BIGINT      NOT NULL COMMENT '实际播出开始（含），UTC 纪元毫秒',
+    end_ms         BIGINT      NOT NULL COMMENT '实际播出结束（不含），UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    KEY idx_mix_pub_item (publication_id)
+) COMMENT = '混音发布快照条目表，只读';
