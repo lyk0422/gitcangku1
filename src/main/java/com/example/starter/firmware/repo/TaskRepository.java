@@ -15,18 +15,22 @@ import java.util.Optional;
 
 /**
  * 投放任务数据访问。同设备同发布单由唯一约束 uk_task_release_device 保证最多一条。
+ * 状态迁移均由 WHERE 当前状态 守卫，并发下至多一个事务生效；取消代次冻结保留。
  */
 @Repository
 public class TaskRepository {
 
     private static final RowMapper<RolloutTask> MAPPER = (rs, rowNum) -> {
         String firstResult = rs.getString("first_result");
+        Integer cancelGeneration = rs.getObject("cancel_generation", Integer.class);
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                cancelGeneration, rs.getString("cancel_operator"));
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result,"
+            + " cancel_generation, cancel_operator";
 
     private final JdbcTemplate jdbc;
 
@@ -62,9 +66,55 @@ public class TaskRepository {
                 MAPPER, releaseId, deviceId).stream().findFirst();
     }
 
-    public void complete(long id, ReceiptResult result) {
-        jdbc.update("UPDATE rollout_task SET status = ?, first_result = ?, updated_at = CURRENT_TIMESTAMP"
-                + " WHERE id = ?", result.name(), result.name(), id);
+    /**
+     * 显式开始：仅 PENDING 可转 INSTALLING，返回影响行数；调用方须先占设备独占安装槽。
+     */
+    public int start(long id) {
+        return jdbc.update("UPDATE rollout_task SET status = 'INSTALLING', updated_at = CURRENT_TIMESTAMP"
+                + " WHERE id = ? AND status = 'PENDING'", id);
+    }
+
+    /**
+     * 终结任务（SUCCESS/FAILED），仅 INSTALLING 可迁移，返回影响行数。
+     */
+    public int complete(long id, ReceiptResult result) {
+        return jdbc.update("UPDATE rollout_task SET status = ?, first_result = ?, updated_at = CURRENT_TIMESTAMP"
+                + " WHERE id = ? AND status = 'INSTALLING'", result.name(), result.name(), id);
+    }
+
+    /**
+     * 任务取消请求：仅 INSTALLING 可转 CANCEL_REQUESTED，取消代次加一并记录操作者，返回影响行数。
+     */
+    public int requestCancel(long id, String operator) {
+        return jdbc.update("UPDATE rollout_task SET status = 'CANCEL_REQUESTED',"
+                + " cancel_generation = COALESCE(cancel_generation, 0) + 1, cancel_operator = ?,"
+                + " updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'INSTALLING'", operator, id);
+    }
+
+    /**
+     * 发布整体取消：所有 INSTALLING 任务转 CANCEL_REQUESTED 并生成取消代次，仍占槽，不伪造已停。
+     */
+    public int requestCancelByRelease(long releaseId, String operator) {
+        return jdbc.update("UPDATE rollout_task SET status = 'CANCEL_REQUESTED',"
+                + " cancel_generation = COALESCE(cancel_generation, 0) + 1, cancel_operator = ?,"
+                + " updated_at = CURRENT_TIMESTAMP WHERE release_id = ? AND status = 'INSTALLING'",
+                operator, releaseId);
+    }
+
+    /**
+     * 停止确认：仅 CANCEL_REQUESTED 且代次一致时转 CANCELLED，返回影响行数。
+     */
+    public int confirmStop(long id, int generation) {
+        return jdbc.update("UPDATE rollout_task SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP"
+                + " WHERE id = ? AND status = 'CANCEL_REQUESTED' AND cancel_generation = ?", id, generation);
+    }
+
+    /**
+     * 未开始任务直接取消：仅 PENDING 可迁移，返回影响行数；PENDING 不占槽，无需释放。
+     */
+    public int cancelPendingTask(long id) {
+        return jdbc.update("UPDATE rollout_task SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP"
+                + " WHERE id = ? AND status = 'PENDING'", id);
     }
 
     public int cancelPendingByRelease(long releaseId) {

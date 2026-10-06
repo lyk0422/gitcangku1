@@ -34,13 +34,22 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '任务ID',
   release_id BIGINT NOT NULL COMMENT '所属发布单ID',
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
-  status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
+  status VARCHAR(16) NOT NULL COMMENT 'PENDING待开始；INSTALLING安装中（占设备独占安装槽）；CANCEL_REQUESTED取消待确认（仍占槽，只接受停止确认）；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  cancel_generation INT NULL COMMENT '取消代次，每次取消请求加一，停止确认须携带同代次；未请求取消为NULL，任务终结后保留冻结',
+  cancel_operator VARCHAR(64) NULL COMMENT '最近一次取消请求的操作者',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
   CONSTRAINT uk_task_release_device UNIQUE (release_id, device_id)
 ) COMMENT='设备投放任务，同设备同发布单最多一条';
+
+CREATE TABLE IF NOT EXISTS device_install_slot (
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID，主键即独占安装槽，同设备至多一条',
+  task_id BIGINT NOT NULL COMMENT '当前占用槽的任务ID（INSTALLING或CANCEL_REQUESTED）',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '占槽时间',
+  PRIMARY KEY (device_id)
+) COMMENT='设备独占安装槽：任务进入INSTALLING时占用，进入SUCCESS/FAILED/CANCELLED终态时释放';
 
 CREATE TABLE IF NOT EXISTS release_pause_record (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '暂停记录ID',

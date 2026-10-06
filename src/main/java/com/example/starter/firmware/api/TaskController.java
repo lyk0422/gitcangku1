@@ -9,7 +9,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 投放任务回执。
+ * 投放任务：回执、显式开始、取消请求与停止确认。
  */
 @RestController
 @RequestMapping("/api/tasks")
@@ -24,5 +24,21 @@ public class TaskController {
     @PostMapping("/{taskId}/receipt")
     public TaskView receipt(@PathVariable long taskId, @Valid @RequestBody ReceiptRequest request) {
         return taskService.receipt(taskId, request);
+    }
+
+    @PostMapping("/{taskId}/start")
+    public TaskView start(@PathVariable long taskId, @Valid @RequestBody TaskStartRequest request) {
+        return taskService.start(taskId, request);
+    }
+
+    @PostMapping("/{taskId}/cancel")
+    public TaskView cancel(@PathVariable long taskId, @Valid @RequestBody TaskCancelRequest request) {
+        return taskService.cancelTask(taskId, request);
+    }
+
+    @PostMapping("/{taskId}/stop-confirmation")
+    public TaskView stopConfirmation(@PathVariable long taskId,
+                                     @Valid @RequestBody StopConfirmRequest request) {
+        return taskService.confirmStop(taskId, request);
     }
 }
