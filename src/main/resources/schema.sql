@@ -112,3 +112,49 @@ COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路
 COMMENT ON COLUMN idempotent_request.response_status IS '首次成功响应的 HTTP 状态码，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.response_body IS '首次成功响应体 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '记录时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS result_version (
+    experiment_id   VARCHAR(64) NOT NULL,
+    participant_id  VARCHAR(64) NOT NULL,
+    version         INT         NOT NULL,
+    result_value    INT         NOT NULL,
+    submitted_actor VARCHAR(64) NOT NULL,
+    submitted_at    BIGINT      NOT NULL,
+    CONSTRAINT pk_result_version PRIMARY KEY (experiment_id, participant_id, version),
+    CONSTRAINT ck_result_version_value CHECK (result_value BETWEEN 0 AND 100),
+    CONSTRAINT ck_result_version_version CHECK (version >= 1)
+);
+COMMENT ON TABLE  result_version IS '结果版本表：参与者整数结果的每次提交/修订各存一行，版本从1递增，历史版本保留供固定版本分析；仅实验 OPEN 且未退组时可写';
+COMMENT ON COLUMN result_version.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN result_version.participant_id IS '合成参与者编号，非真实医疗数据';
+COMMENT ON COLUMN result_version.version IS '结果版本号，首次提交为1，每次修订加一';
+COMMENT ON COLUMN result_version.result_value IS '整数结果值，取值0~100，无单位';
+COMMENT ON COLUMN result_version.submitted_actor IS '提交/修订的操作者编号（X-Actor-Id），须为 COORDINATOR';
+COMMENT ON COLUMN result_version.submitted_at IS '提交时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS analysis (
+    id                VARCHAR(64) NOT NULL,
+    experiment_id     VARCHAR(64) NOT NULL,
+    result_version    INT         NOT NULL,
+    participant_count INT         NOT NULL,
+    group_a_count     INT         NOT NULL,
+    group_b_count     INT         NOT NULL,
+    favorable_count   BIGINT      NOT NULL,
+    total_count       BIGINT      NOT NULL,
+    snapshot          CLOB        NOT NULL,
+    analyst_actor     VARCHAR(64) NOT NULL,
+    created_at        BIGINT      NOT NULL,
+    CONSTRAINT pk_analysis PRIMARY KEY (id)
+);
+COMMENT ON TABLE  analysis IS '受限精确置换分析表；实验关闭后由 REVIEWER 发起，冻结引用版本与完整内部依据，外部仅返回 k/n 与匿名人数';
+COMMENT ON COLUMN analysis.id IS '分析编号，全局唯一';
+COMMENT ON COLUMN analysis.experiment_id IS '所属实验编号，分析时须已 CLOSED';
+COMMENT ON COLUMN analysis.result_version IS '引用的固定结果版本号，分析冻结该版本的取值';
+COMMENT ON COLUMN analysis.participant_count IS '引用的不同未退组参与者人数，4~8';
+COMMENT ON COLUMN analysis.group_a_count IS '匿名人数：引用集合中处理 A 的人数，至少2';
+COMMENT ON COLUMN analysis.group_b_count IS '匿名人数：引用集合中处理 B 的人数，至少2';
+COMMENT ON COLUMN analysis.favorable_count IS '精确置换分子 k：统计量大于等于观察值的分组组合数';
+COMMENT ON COLUMN analysis.total_count IS '精确置换分母 n：保持 A 人数不变的全部分组组合数';
+COMMENT ON COLUMN analysis.snapshot IS '完整内部依据（引用参与者、处理映射、冻结取值、观察统计量）的 JSON；盲底，禁止通过接口返回';
+COMMENT ON COLUMN analysis.analyst_actor IS '发起分析的 REVIEWER 操作者编号';
+COMMENT ON COLUMN analysis.created_at IS '分析时间，Unix 毫秒，UTC';

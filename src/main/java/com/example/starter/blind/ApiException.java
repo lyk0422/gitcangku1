@@ -48,4 +48,9 @@ public class ApiException extends RuntimeException {
     public static ApiException full(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message);
     }
+
+    /** 422 业务不可处理：引用人数不符、结果缺值等业务条件不满足。 */
+    public static ApiException unprocessable(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message);
+    }
 }
