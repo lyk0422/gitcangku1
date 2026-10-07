@@ -1,18 +1,18 @@
 package com.example.starter.blind.dto;
 
-import jakarta.validation.constraints.Max;
-import jakarta.validation.constraints.Min;
-import jakarta.validation.constraints.NotNull;
-
 /**
- * 创建实验请求体。
+ * 创建实验请求体。mode 缺省为 BLOCK；
+ * BLOCK 需要 blockCount（2~8）且不得携带 capacity；
+ * MINIMIZE 需要 capacity（偶数 4~20，A、B 各半）且不得携带 blockCount，区组统一为 1。
+ * 具体取值校验在服务层完成，保证两种模式各自的约束互不干扰。
  *
- * @param blockCount 区组数量，2～8，创建时固定；每组固定 4 个席位
+ * @param blockCount 区组数量，仅 BLOCK 模式使用，创建时固定；每组固定 4 个席位
+ * @param mode       分配模式：BLOCK（默认）/ MINIMIZE
+ * @param capacity   总容量，仅 MINIMIZE 模式使用，偶数 4~20
  */
 public record CreateExperimentRequest(
-        @NotNull(message = "blockCount 不能为空")
-        @Min(value = 2, message = "区组数量必须在 2~8 之间")
-        @Max(value = 8, message = "区组数量必须在 2~8 之间")
-        Integer blockCount
+        Integer blockCount,
+        String mode,
+        Integer capacity
 ) {
 }

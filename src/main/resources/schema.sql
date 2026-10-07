@@ -2,16 +2,26 @@
 
 CREATE TABLE IF NOT EXISTS experiment (
     id          VARCHAR(64)  NOT NULL,
+    mode        VARCHAR(16)  NOT NULL,
     block_count INT          NOT NULL,
+    capacity    INT          NOT NULL,
     status      VARCHAR(16)  NOT NULL,
     created_at  BIGINT       NOT NULL,
     CONSTRAINT pk_experiment PRIMARY KEY (id),
-    CONSTRAINT ck_experiment_block_count CHECK (block_count BETWEEN 2 AND 8),
+    CONSTRAINT ck_experiment_mode CHECK (mode IN ('BLOCK', 'MINIMIZE')),
+    CONSTRAINT ck_experiment_block_count CHECK (
+        (mode = 'BLOCK' AND block_count BETWEEN 2 AND 8)
+        OR (mode = 'MINIMIZE' AND block_count = 1)),
+    CONSTRAINT ck_experiment_capacity CHECK (
+        (mode = 'BLOCK' AND capacity = block_count * 4)
+        OR (mode = 'MINIMIZE' AND capacity BETWEEN 4 AND 20 AND MOD(capacity, 2) = 0)),
     CONSTRAINT ck_experiment_status CHECK (status IN ('OPEN', 'CLOSED'))
 );
-COMMENT ON TABLE  experiment IS '实验表，experimentId 全局唯一，创建后区组数量与席位内容不可修改';
+COMMENT ON TABLE  experiment IS '实验表，experimentId 全局唯一，创建后分配模式、区组数量、容量与席位内容不可修改';
 COMMENT ON COLUMN experiment.id IS '实验编号，业务唯一，创建时由请求给定';
-COMMENT ON COLUMN experiment.block_count IS '区组数量，取值2~8，创建时固定，每组固定4个席位';
+COMMENT ON COLUMN experiment.mode IS '分配模式：BLOCK=固定区组（每区组两A两B）；MINIMIZE=最小化分配（按边际格不平衡度动态选处理）';
+COMMENT ON COLUMN experiment.block_count IS '区组数量：BLOCK 模式 2~8；MINIMIZE 模式统一为 1（普通视图不暴露可解码席位）';
+COMMENT ON COLUMN experiment.capacity IS '总席位数：BLOCK=区组数×4；MINIMIZE=创建时给定的偶数 4~20，A、B 各半';
 COMMENT ON COLUMN experiment.status IS '实验状态：OPEN=开放登记；CLOSED=已关闭，关闭后拒绝新增分配';
 COMMENT ON COLUMN experiment.created_at IS '创建时间，Unix 毫秒，UTC';
 
@@ -22,13 +32,13 @@ CREATE TABLE IF NOT EXISTS seat (
     treatment     VARCHAR(1)  NOT NULL,
     CONSTRAINT pk_seat PRIMARY KEY (experiment_id, block_no, seat_no),
     CONSTRAINT ck_seat_block_no CHECK (block_no >= 1),
-    CONSTRAINT ck_seat_seat_no CHECK (seat_no BETWEEN 1 AND 4),
+    CONSTRAINT ck_seat_seat_no CHECK (seat_no >= 1),
     CONSTRAINT ck_seat_treatment CHECK (treatment IN ('A', 'B'))
 );
-COMMENT ON TABLE  seat IS '席位表（处理映射）：每区组4席，按提交顺序固定两个A两个B，之后不可改；仅保存于数据库';
+COMMENT ON TABLE  seat IS '席位表（处理映射）：BLOCK 每区组4席按提交顺序两A两B；MINIMIZE 区组统一为1、前一半席位A后一半B；内容创建后不可改，仅保存于数据库';
 COMMENT ON COLUMN seat.experiment_id IS '所属实验编号';
-COMMENT ON COLUMN seat.block_no IS '区组号，从1开始，按区组顺序分配';
-COMMENT ON COLUMN seat.seat_no IS '区组内席位号1~4，属于可直接解码信息，禁止通过普通接口暴露';
+COMMENT ON COLUMN seat.block_no IS '区组号，从1开始；MINIMIZE 模式恒为 1';
+COMMENT ON COLUMN seat.seat_no IS '区组内席位号，属于可直接解码信息，禁止通过普通接口暴露';
 COMMENT ON COLUMN seat.treatment IS '处理代码 A 或 B，盲底，仅揭盲批准后可返回给申请人';
 
 CREATE TABLE IF NOT EXISTS allocation (
@@ -38,6 +48,8 @@ CREATE TABLE IF NOT EXISTS allocation (
     block_no       INT          NOT NULL,
     seat_no        INT          NOT NULL,
     blind_code     VARCHAR(32)  NOT NULL,
+    feature1       INT,
+    feature2       INT,
     status         VARCHAR(16)  NOT NULL,
     assigned_actor VARCHAR(64)  NOT NULL,
     assigned_at    BIGINT       NOT NULL,
@@ -46,16 +58,20 @@ CREATE TABLE IF NOT EXISTS allocation (
     CONSTRAINT uq_allocation_participant UNIQUE (experiment_id, participant_id),
     CONSTRAINT uq_allocation_seat UNIQUE (experiment_id, block_no, seat_no),
     CONSTRAINT uq_allocation_blind_code UNIQUE (blind_code),
+    CONSTRAINT ck_allocation_feature1 CHECK (feature1 IS NULL OR feature1 IN (0, 1)),
+    CONSTRAINT ck_allocation_feature2 CHECK (feature2 IS NULL OR feature2 IN (0, 1)),
     CONSTRAINT ck_allocation_status CHECK (status IN ('ASSIGNED', 'WITHDRAWN'))
 );
-COMMENT ON TABLE  allocation IS '参与者分配表；同实验同参与者只占一席，退组不释放席位、不重排已有分配';
+COMMENT ON TABLE  allocation IS '参与者分配表；同实验同参与者只占一席，退组不释放席位、不重排已有分配，退组记录仍计入历史平衡';
 COMMENT ON COLUMN allocation.id IS '分配自增主键';
 COMMENT ON COLUMN allocation.experiment_id IS '所属实验编号';
 COMMENT ON COLUMN allocation.participant_id IS '合成参与者编号，非真实医疗数据';
-COMMENT ON COLUMN allocation.block_no IS '分配到的区组号，普通查询可返回';
+COMMENT ON COLUMN allocation.block_no IS '分配到的区组号，普通查询可返回；MINIMIZE 模式恒为 1';
 COMMENT ON COLUMN allocation.seat_no IS '分配到的席位号，可直接解码处理代码，禁止通过普通接口暴露';
-COMMENT ON COLUMN allocation.blind_code IS '随机生成的无含义盲码，全局唯一，与区组/席位无对应规律';
-COMMENT ON COLUMN allocation.status IS '分配状态：ASSIGNED=在组；WITHDRAWN=已退组（席位仍保留）';
+COMMENT ON COLUMN allocation.blind_code IS '随机生成的无含义盲码，全局唯一，与区组/席位/处理无对应规律';
+COMMENT ON COLUMN allocation.feature1 IS '最小化分配的枚举特征一，仅允许 0 或 1；BLOCK 模式为 NULL（无特征）';
+COMMENT ON COLUMN allocation.feature2 IS '最小化分配的枚举特征二，仅允许 0 或 1；BLOCK 模式为 NULL（无特征）';
+COMMENT ON COLUMN allocation.status IS '分配状态：ASSIGNED=在组；WITHDRAWN=已退组（席位仍保留且计入历史平衡）';
 COMMENT ON COLUMN allocation.assigned_actor IS '执行登记的操作者编号（X-Actor-Id）';
 COMMENT ON COLUMN allocation.assigned_at IS '分配时间，Unix 毫秒，UTC';
 COMMENT ON COLUMN allocation.withdrawn_at IS '退组时间，Unix 毫秒，UTC；NULL 表示未退组';
@@ -108,7 +124,7 @@ COMMENT ON COLUMN idempotent_request.request_id IS '全局唯一 requestId（X-R
 COMMENT ON COLUMN idempotent_request.actor_id IS '首次成功调用的操作者编号，属于幂等参数的一部分';
 COMMENT ON COLUMN idempotent_request.role IS '首次成功调用的角色 COORDINATOR/REVIEWER，属于幂等参数的一部分';
 COMMENT ON COLUMN idempotent_request.operation IS '写操作标识，如 experiment.create/allocation.create';
-COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路径参数与请求体），与 actor/role 共同判定同参/异参';
+COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路径参数与请求体全部参数），与 actor/role 共同判定同参/异参';
 COMMENT ON COLUMN idempotent_request.response_status IS '首次成功响应的 HTTP 状态码，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.response_body IS '首次成功响应体 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '记录时间，Unix 毫秒，UTC';
