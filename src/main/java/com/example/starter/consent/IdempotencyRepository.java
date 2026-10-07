@@ -8,7 +8,8 @@ import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
 /**
- * 幂等请求持久化访问：成功结果与业务变更同事务保存，应用重启后幂等语义仍成立。
+ * 幂等请求持久化访问：成功结果与业务变更同事务保存；按本题要求仅同 JVM 内保留，
+ * 不依赖跨进程恢复。
  */
 @Repository
 public class IdempotencyRepository {
