@@ -1,4 +1,5 @@
--- 固件灰度投放 schema（H2，MODE=MySQL）。时间均为服务器本地时区（Asia/Shanghai）。
+-- 固件灰度投放 schema（H2，MODE=MySQL）。
+-- 行内 created_at/updated_at 为数据库当前时间戳；业务时刻列（暂停/恢复、执行租约到期）统一存 UTC ISO-8601 文本。
 
 CREATE TABLE IF NOT EXISTS device (
   device_id VARCHAR(64) NOT NULL COMMENT '设备唯一标识',
@@ -36,6 +37,11 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  lease_agent_id VARCHAR(64) NULL COMMENT '当前执行租约持有人代理ID；从未领取为NULL；到期被新代理接管后替换为新持有人',
+  lease_token INT NULL COMMENT '当前执行租约令牌，首次领取为1，到期后重新领取加一；接管后旧令牌失效',
+  lease_expires_at VARCHAR(40) NULL COMMENT '当前执行租约到期时刻，UTC，ISO-8601格式；有效期左闭右开，到达该时刻即失效，NULL表示从未领取',
+  result_agent_id VARCHAR(64) NULL COMMENT '首次终结（SUCCESS/FAILED）实际写回结果的代理ID，终结后冻结，未终结为NULL',
+  result_token INT NULL COMMENT '首次终结实际写回结果时使用的租约令牌，终结后冻结，未终结为NULL',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
