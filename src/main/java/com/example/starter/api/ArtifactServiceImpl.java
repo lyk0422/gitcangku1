@@ -1,11 +1,13 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.DeclarePeersRequest;
 import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.DependencyView;
 import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
+import com.example.starter.api.dto.PeerDeclarationResponse;
 import com.example.starter.api.dto.RegisterArtifactRequest;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
@@ -45,10 +47,12 @@ public class ArtifactServiceImpl implements ArtifactService {
 
     private static final int MAX_NAMES = 20;
     private static final int MAX_VERSIONS_PER_NAME = 5;
+    private static final int MAX_PEERS_PER_VERSION = 3;
 
     private static final String OP_REGISTER = "REGISTER_ARTIFACT";
     private static final String OP_WITHDRAW = "WITHDRAW_ARTIFACT";
     private static final String OP_LOCK = "CREATE_LOCK";
+    private static final String OP_DECLARE_PEERS = "DECLARE_PEERS";
 
     private final RepositoryDao repositoryDao;
     private final TransactionTemplate transactionTemplate;
@@ -69,8 +73,8 @@ public class ArtifactServiceImpl implements ArtifactService {
     public ArtifactResponse registerArtifact(String requestId, RegisterArtifactRequest request) {
         requireRequestId(requestId);
         validateRegisterRequest(request);
-        String hash = sha256(OP_REGISTER + "|" + request.name().trim() + "|" + request.version() + "|"
-                + canonicalDependencies(request));
+        String hash = sha256(canonicalFields(OP_REGISTER, request.name().trim(),
+                String.valueOf(request.version()), canonicalRanges(request.dependencies())));
         return executeIdempotent(requestId, OP_REGISTER, hash, 201,
                 () -> doRegister(request), ArtifactResponse.class);
     }
@@ -81,9 +85,25 @@ public class ArtifactServiceImpl implements ArtifactService {
         if (name == null || name.isBlank()) {
             throw ApiException.badRequest("name 不能为空");
         }
-        String hash = sha256(OP_WITHDRAW + "|" + name.trim() + "|" + version);
+        String hash = sha256(canonicalFields(OP_WITHDRAW, name.trim(), String.valueOf(version)));
         return executeIdempotent(requestId, OP_WITHDRAW, hash, 200,
                 () -> doWithdraw(name.trim(), version), ArtifactResponse.class);
+    }
+
+    @Override
+    public PeerDeclarationResponse declarePeers(String requestId, String name, int version,
+                                                DeclarePeersRequest request) {
+        requireRequestId(requestId);
+        if (name == null || name.isBlank()) {
+            throw ApiException.badRequest("name 不能为空");
+        }
+        String trimmedName = name.trim();
+        validateDeclarePeersRequest(trimmedName, request);
+        // 操作者原文参与幂等参数比较（文本原样），peer 列表排序后同参。
+        String hash = sha256(canonicalFields(OP_DECLARE_PEERS, trimmedName, String.valueOf(version),
+                request.operator(), canonicalRanges(request.peers())));
+        return executeIdempotent(requestId, OP_DECLARE_PEERS, hash, 201,
+                () -> doDeclarePeers(trimmedName, version, request), PeerDeclarationResponse.class);
     }
 
     @Override
@@ -92,8 +112,9 @@ public class ArtifactServiceImpl implements ArtifactService {
         if (request.rootName() == null || request.rootName().isBlank()) {
             throw ApiException.badRequest("rootName 不能为空");
         }
-        String hash = sha256(OP_LOCK + "|" + request.rootName().trim() + "|" + request.rootVersion()
-                + "|" + request.expectedRepositoryVersion());
+        String hash = sha256(canonicalFields(OP_LOCK, request.rootName().trim(),
+                String.valueOf(request.rootVersion()),
+                String.valueOf(request.expectedRepositoryVersion())));
         return executeIdempotent(requestId, OP_LOCK, hash, 201,
                 () -> doLock(request), LockFileResponse.class);
     }
@@ -165,6 +186,28 @@ public class ArtifactServiceImpl implements ArtifactService {
         long repositoryVersion = repositoryDao.incrementRepositoryVersion();
         return new ArtifactResponse(name, version, true, repositoryVersion,
                 Instant.now(clock), toDependencyViews(artifact.dependencies()));
+    }
+
+    private PeerDeclarationResponse doDeclarePeers(String name, int version,
+                                                   DeclarePeersRequest request) {
+        ArtifactVersion artifact = repositoryDao.loadArtifact(name, version);
+        if (artifact == null) {
+            throw ApiException.notFound("制品版本不存在: " + name + ":" + version);
+        }
+        if (artifact.withdrawn()) {
+            throw ApiException.conflict("制品版本已撤回，不能声明 peer: " + name + ":" + version);
+        }
+        if (repositoryDao.countPeers(artifact.id()) > 0) {
+            throw ApiException.conflict("制品版本已声明 peer，登记后不可改: " + name + ":" + version);
+        }
+        Instant now = Instant.now(clock);
+        for (DependencySpec peer : request.peers()) {
+            repositoryDao.insertPeer(artifact.id(), peer.name().trim(),
+                    peer.minimumVersion(), peer.maximumVersion());
+        }
+        long repositoryVersion = repositoryDao.incrementRepositoryVersion();
+        return new PeerDeclarationResponse(name, version, request.operator(), repositoryVersion, now,
+                toDependencyViews(request.peers()));
     }
 
     private LockFileResponse doLock(LockRequest request) {
@@ -271,6 +314,40 @@ public class ArtifactServiceImpl implements ArtifactService {
     // 校验与转换
     // ------------------------------------------------------------------
 
+    private void validateDeclarePeersRequest(String name, DeclarePeersRequest request) {
+        if (request == null) {
+            throw ApiException.badRequest("请求体不能为空");
+        }
+        if (request.operator() == null || request.operator().isBlank()) {
+            throw ApiException.badRequest("operator 不能为空");
+        }
+        List<DependencySpec> peers = request.peers();
+        if (peers == null || peers.isEmpty()) {
+            throw ApiException.badRequest("peer 声明不能为空");
+        }
+        if (peers.size() > MAX_PEERS_PER_VERSION) {
+            throw ApiException.badRequest(
+                    "每个制品版本最多声明 " + MAX_PEERS_PER_VERSION + " 条 peer 依赖");
+        }
+        Set<String> names = new HashSet<>();
+        for (DependencySpec peer : peers) {
+            if (peer.name() == null || peer.name().isBlank()) {
+                throw ApiException.badRequest("peer 名称不能为空");
+            }
+            String peerName = peer.name().trim();
+            if (peerName.equals(name)) {
+                throw ApiException.badRequest("peer 名称不能与制品自身同名: " + peerName);
+            }
+            if (peer.minimumVersion() > peer.maximumVersion()) {
+                throw ApiException.badRequest(
+                        "peer " + peerName + " 的最低版本不能高于最高版本");
+            }
+            if (!names.add(peerName)) {
+                throw ApiException.badRequest("peer 名称重复: " + peerName);
+            }
+        }
+    }
+
     private void validateRegisterRequest(RegisterArtifactRequest request) {
         if (request.name() == null || request.name().isBlank()) {
             throw ApiException.badRequest("name 不能为空");
@@ -295,9 +372,27 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
     }
 
-    private String canonicalDependencies(RegisterArtifactRequest request) {
-        return request.dependencies().stream()
-                .map(d -> d.name().trim() + ":" + d.minimumVersion() + ":" + d.maximumVersion())
+    /**
+     * 结构化参数编码：每个字段带长度前缀，避免不同字段组合产生碰撞；
+     * 数值先转为十进制规范形式（同值同参），文本按传入原样。
+     */
+    private static String canonicalFields(String... fields) {
+        StringBuilder sb = new StringBuilder();
+        for (String field : fields) {
+            String value = field == null ? "" : field;
+            sb.append(value.length()).append('#').append(value);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 依赖/peer 声明列表的规范编码：每条按字段长度前缀编码后排序拼接，
+     * 声明换序视为同参。
+     */
+    private static String canonicalRanges(List<DependencySpec> specs) {
+        return specs.stream()
+                .map(d -> canonicalFields(d.name().trim(), String.valueOf(d.minimumVersion()),
+                        String.valueOf(d.maximumVersion())))
                 .sorted()
                 .reduce((a, b) -> a + "," + b)
                 .orElse("");

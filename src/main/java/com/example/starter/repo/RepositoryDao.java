@@ -51,7 +51,7 @@ public class RepositoryDao {
     }
 
     /**
-     * 读取仓库一致性快照：全部制品版本（含撤回，版本号降序）及其依赖。
+     * 读取仓库一致性快照：全部制品版本（含撤回，版本号降序）及其普通依赖与 peer 声明。
      * 须在已持有 repository_state 行锁的事务内调用。
      */
     public RepositorySnapshot loadSnapshot() {
@@ -69,11 +69,21 @@ public class RepositoryDao {
                         Collectors.mapping(d -> new DependencyRange(d.name(), d.minimumVersion(), d.maximumVersion()),
                                 Collectors.toList())));
 
+        List<DepRow> peerRows = jdbcTemplate.query(
+                "SELECT artifact_id, name, minimum_version, maximum_version FROM artifact_peer",
+                (rs, n) -> new DepRow(rs.getLong("artifact_id"), rs.getString("name"),
+                        rs.getInt("minimum_version"), rs.getInt("maximum_version")));
+        Map<Long, List<DependencyRange>> peersByArtifact = peerRows.stream()
+                .collect(Collectors.groupingBy(DepRow::artifactId,
+                        Collectors.mapping(d -> new DependencyRange(d.name(), d.minimumVersion(), d.maximumVersion()),
+                                Collectors.toList())));
+
         Map<String, List<ArtifactVersion>> artifacts = new LinkedHashMap<>();
         for (ArtifactRow row : rows) {
             List<DependencyRange> deps = depsByArtifact.getOrDefault(row.id(), List.of());
+            List<DependencyRange> peers = peersByArtifact.getOrDefault(row.id(), List.of());
             ArtifactVersion version = new ArtifactVersion(row.id(), row.name(), row.version(),
-                    row.withdrawn(), List.copyOf(deps));
+                    row.withdrawn(), List.copyOf(deps), List.copyOf(peers));
             artifacts.computeIfAbsent(row.name(), k -> new ArrayList<>()).add(version);
         }
         return new RepositorySnapshot(getRepositoryVersion(), Map.copyOf(artifacts));
@@ -128,7 +138,22 @@ public class RepositoryDao {
                 artifactId, name, minimumVersion, maximumVersion);
     }
 
-    /** 读取单个制品版本（含依赖），不存在返回 null。 */
+    /** 为制品版本写入一条 peer 依赖声明（登记后不可改）。 */
+    public void insertPeer(long artifactId, String name, int minimumVersion, int maximumVersion) {
+        jdbcTemplate.update(
+                "INSERT INTO artifact_peer (artifact_id, name, minimum_version, maximum_version) "
+                        + "VALUES (?, ?, ?, ?)",
+                artifactId, name, minimumVersion, maximumVersion);
+    }
+
+    /** 指定制品版本已声明的 peer 数量。 */
+    public int countPeers(long artifactId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM artifact_peer WHERE artifact_id = ?", Integer.class, artifactId);
+        return count == null ? 0 : count;
+    }
+
+    /** 读取单个制品版本（含普通依赖与 peer 声明），不存在返回 null。 */
     public ArtifactVersion loadArtifact(String name, int version) {
         List<ArtifactRow> rows = jdbcTemplate.query(
                 "SELECT id, name, version, withdrawn FROM artifact WHERE name = ? AND version = ?",
@@ -144,8 +169,13 @@ public class RepositoryDao {
                 (rs, n) -> new DependencyRange(rs.getString("name"),
                         rs.getInt("minimum_version"), rs.getInt("maximum_version")),
                 row.id());
+        List<DependencyRange> peers = jdbcTemplate.query(
+                "SELECT name, minimum_version, maximum_version FROM artifact_peer WHERE artifact_id = ?",
+                (rs, n) -> new DependencyRange(rs.getString("name"),
+                        rs.getInt("minimum_version"), rs.getInt("maximum_version")),
+                row.id());
         return new ArtifactVersion(row.id(), row.name(), row.version(), row.withdrawn(),
-                List.copyOf(deps));
+                List.copyOf(deps), List.copyOf(peers));
     }
 
     /** 仓库版本号加一，返回加一后的版本号（须在持有行锁时调用）。 */

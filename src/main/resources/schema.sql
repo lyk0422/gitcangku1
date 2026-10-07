@@ -39,6 +39,22 @@ COMMENT ON COLUMN artifact_dependency.maximum_version IS '依赖最高版本（�
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_dep_artifact_name ON artifact_dependency (artifact_id, name);
 
+CREATE TABLE IF NOT EXISTS artifact_peer (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    artifact_id     BIGINT       NOT NULL,
+    name            VARCHAR(128) NOT NULL,
+    minimum_version INT          NOT NULL,
+    maximum_version INT          NOT NULL,
+    CONSTRAINT fk_peer_artifact FOREIGN KEY (artifact_id) REFERENCES artifact (id)
+);
+COMMENT ON TABLE artifact_peer IS '制品版本的 peer 依赖声明：仅约束普通依赖图已可达的同名宿主版本，不建立可达边；登记后不可改';
+COMMENT ON COLUMN artifact_peer.artifact_id IS '所属制品版本 ID';
+COMMENT ON COLUMN artifact_peer.name IS '宿主制品名称，不得与所属制品版本同名，同一制品版本内唯一';
+COMMENT ON COLUMN artifact_peer.minimum_version IS '宿主最低版本（含），正整数';
+COMMENT ON COLUMN artifact_peer.maximum_version IS '宿主最高版本（含），正整数';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_peer_artifact_name ON artifact_peer (artifact_id, name);
+
 CREATE TABLE IF NOT EXISTS lock_file (
     id                 BIGINT AUTO_INCREMENT PRIMARY KEY,
     root_name          VARCHAR(128) NOT NULL,

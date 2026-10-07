@@ -1,8 +1,10 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.DeclarePeersRequest;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
+import com.example.starter.api.dto.PeerDeclarationResponse;
 import com.example.starter.api.dto.RegisterArtifactRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Positive;
@@ -48,6 +50,17 @@ public class ArtifactController {
             @PathVariable String name,
             @PathVariable @Positive int version) {
         return artifactService.withdrawArtifact(requestId, name, version);
+    }
+
+    /** 为制品版本登记 peer 依赖（登记后不可改）。 */
+    @PostMapping("/{name}/versions/{version}/peers")
+    public ResponseEntity<PeerDeclarationResponse> declarePeers(
+            @RequestHeader("X-Request-Id") String requestId,
+            @PathVariable String name,
+            @PathVariable @Positive int version,
+            @Valid @RequestBody DeclarePeersRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(artifactService.declarePeers(requestId, name, version, request));
     }
 
     /** 创建锁文件。 */

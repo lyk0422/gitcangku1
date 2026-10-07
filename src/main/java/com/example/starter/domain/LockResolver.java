@@ -10,6 +10,9 @@ import java.util.TreeMap;
  * <p>规则：根版本固定；其余名称按字典序选择下一个尚未解析的依赖，
  * 候选版本从高到低尝试，遇冲突回退，取首个完整可行结果。
  * 已选制品之间必须互相满足区间约束，因此依赖图存在环时也会被正确校验。
+ *
+ * <p>peer 依赖：只约束普通依赖图已经可达的同名宿主版本，不建立可达边，
+ * 也不算作普通依赖环；完整候选缺宿主或宿主版本不满足区间时回退其他候选。
  */
 public final class LockResolver {
 
@@ -77,8 +80,8 @@ public final class LockResolver {
         }
 
         if (next == null) {
-            // 所有依赖均已解析为精确版本。
-            return true;
+            // 所有普通依赖均已解析为精确版本；最后统一核对 peer 宿主可达性与区间。
+            return peersSatisfied(chosen);
         }
         if (lo > hi) {
             // 多个已选制品对该名称的区间交集为空。
@@ -106,6 +109,7 @@ public final class LockResolver {
 
     /**
      * 校验候选制品声明的、指向已选名称的依赖区间均被已选精确版本满足。
+     * peer 声明的宿主若已选定则立即校验区间（提前剪枝），未选定留待完成时统一核对。
      */
     private static boolean satisfiesChosen(ArtifactVersion candidate,
                                            Map<String, ArtifactVersion> chosen) {
@@ -116,6 +120,34 @@ public final class LockResolver {
             }
             if (selected.version() < dep.minimumVersion() || selected.version() > dep.maximumVersion()) {
                 return false;
+            }
+        }
+        for (DependencyRange peer : candidate.peerDependencies()) {
+            ArtifactVersion host = chosen.get(peer.name());
+            if (host == null) {
+                continue;
+            }
+            if (host.version() < peer.minimumVersion() || host.version() > peer.maximumVersion()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 完整候选的 peer 核对：每个 peer 声明的宿主必须已在普通依赖图中可达
+     * （peer 不建立可达边，缺失即不可行），且已选宿主版本落在声明区间内。
+     */
+    private static boolean peersSatisfied(Map<String, ArtifactVersion> chosen) {
+        for (ArtifactVersion artifact : chosen.values()) {
+            for (DependencyRange peer : artifact.peerDependencies()) {
+                ArtifactVersion host = chosen.get(peer.name());
+                if (host == null) {
+                    return false;
+                }
+                if (host.version() < peer.minimumVersion() || host.version() > peer.maximumVersion()) {
+                    return false;
+                }
             }
         }
         return true;
