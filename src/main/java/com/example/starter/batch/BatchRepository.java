@@ -15,9 +15,11 @@ public class BatchRepository {
 
     /**
      * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
+     * batchKind 见 {@link BatchKind}；quantity 仅 SERIAL 批次非空，等于其序号区间总长度。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, String status, String createdAt,
+                           String batchKind, Integer quantity) {
     }
 
     /**
@@ -57,7 +59,8 @@ public class BatchRepository {
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
-            rs.getString("status"), rs.getString("created_at"));
+            rs.getString("status"), rs.getString("created_at"),
+            rs.getString("batch_kind"), rs.getObject("quantity", Integer.class));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("test_key"),
@@ -101,10 +104,10 @@ public class BatchRepository {
     }
 
     public void insertBatch(BatchRow row) {
-        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status,"
+                        + " created_at, batch_kind, quantity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(),
-                row.status(), row.createdAt());
+                row.status(), row.createdAt(), row.batchKind(), row.quantity());
     }
 
     public void insertRequiredTest(String batchKey, String testItem, int seq) {
@@ -200,6 +203,15 @@ public class BatchRepository {
         return jdbc.queryForList("SELECT parent_key FROM batch_lineage WHERE child_key = ?",
                         String.class, childKey)
                 .stream().findFirst();
+    }
+
+    /**
+     * 某批次的直接子批数量；大于 0 表示该批已拆分，其序号域仅作历史。
+     */
+    public int countChildren(String parentKey) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM batch_lineage WHERE parent_key = ?", Integer.class, parentKey);
+        return count == null ? 0 : count;
     }
 
     /**
