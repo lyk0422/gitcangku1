@@ -44,15 +44,27 @@ CREATE TABLE IF NOT EXISTS route_point (
     PRIMARY KEY (route_id, seq)
 ) COMMENT = '航线当前版本有序航点';
 
+-- 航段通信档案（当前版本，合成覆盖证明，不接真实基站）：
+-- 每段一条，段序号 seq 对应点 seq 到 seq+1 的航段；无记录表示旧无通信档案航线
+CREATE TABLE IF NOT EXISTS route_segment (
+    route_id     VARCHAR(64)  NOT NULL COMMENT '所属航线标识',
+    seq          INT          NOT NULL COMMENT '航段序号，从 0 开始，连接点 seq 与 seq+1',
+    duration_ms  INT          NOT NULL COMMENT '该段行驶时长，正整数，单位毫秒',
+    coverage     VARCHAR(255) NOT NULL COMMENT '位置刻度 0 至 10000 上的覆盖闭区间，格式 s-e,s-e（最多 10 条，可重叠）；空串表示全段失联',
+    PRIMARY KEY (route_id, seq)
+) COMMENT = '航线当前版本各航段通信档案（合成覆盖证明）';
+
 -- 审核不可变结果
 CREATE TABLE IF NOT EXISTS review (
     review_id         VARCHAR(64) PRIMARY KEY COMMENT '审核记录唯一标识（不可变）',
     route_id          VARCHAR(64) NOT NULL COMMENT '被审核航线标识',
     route_version     INT NOT NULL COMMENT '审核明确指定的航线版本',
     airspace_version  BIGINT NOT NULL COMMENT '审核明确指定的空域版本',
-    conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过或 BLOCKED 命中，永不改变',
+    conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过、BLOCKED 命中禁飞区或 LINK_BLOCKED 连续失联超限，永不改变',
     hit_zone_ids      CLOB NOT NULL COMMENT '命中的全部 zoneId，字典序去重后逗号拼接；未命中为空串',
     points_snapshot   VARCHAR(4000) NOT NULL COMMENT '审核时航点不可变快照，格式 x,y;x,y',
+    coverage_union    CLOB NULL COMMENT '审核时各航段合并覆盖并集 JSON（不可变）；旧无通信档案航线为 NULL',
+    link_gaps         CLOB NULL COMMENT '审核时全部连续失联段 JSON（含跨段缺口与精确失联毫秒）；无通信档案为 NULL',
     request_id        VARCHAR(64) NOT NULL COMMENT '提交审核的写操作请求标识',
     created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
 ) COMMENT = '审核不可变结果';

@@ -1,10 +1,13 @@
 package com.example.starter.repo;
 
+import com.example.starter.domain.CoverageInterval;
 import com.example.starter.domain.Point;
+import com.example.starter.domain.SegmentProfile;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -95,5 +98,61 @@ public class RouteRepository {
             jdbc.update("INSERT INTO route_point (route_id, seq, x, y) VALUES (?, ?, ?, ?)",
                     routeId, seq++, p.x(), p.y());
         }
+    }
+
+    // ============================ 航段通信档案 ============================
+
+    /**
+     * 查询航线当前版本各航段通信档案（按段序号升序）。
+     *
+     * @return 段档案列表；空列表表示旧无通信档案航线（不参与链路审查）
+     */
+    public List<SegmentProfile> findSegments(String routeId) {
+        return jdbc.query(
+                "SELECT seq, duration_ms, coverage FROM route_segment "
+                        + "WHERE route_id = ? ORDER BY seq",
+                (rs, n) -> new SegmentProfile(rs.getInt("duration_ms"),
+                        decodeCoverage(rs.getString("coverage"))),
+                routeId);
+    }
+
+    /** 批量写入航段通信档案（段序号从 0 开始，调用方负责事务）。 */
+    public void insertSegments(String routeId, List<SegmentProfile> segments) {
+        int seq = 0;
+        for (SegmentProfile segment : segments) {
+            jdbc.update("INSERT INTO route_segment (route_id, seq, duration_ms, coverage) "
+                            + "VALUES (?, ?, ?, ?)",
+                    routeId, seq++, segment.durationMs(), encodeCoverage(segment.coverage()));
+        }
+    }
+
+    /** 删除航线旧航段通信档案（调用方负责事务）。 */
+    public void deleteSegments(String routeId) {
+        jdbc.update("DELETE FROM route_segment WHERE route_id = ?", routeId);
+    }
+
+    /** 覆盖区间列表编码："s-e,s-e"；空列表编码为空串（全段失联）。 */
+    public static String encodeCoverage(List<CoverageInterval> coverage) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < coverage.size(); i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append(coverage.get(i).start()).append('-').append(coverage.get(i).end());
+        }
+        return sb.toString();
+    }
+
+    /** 覆盖区间列表解码，空串返回空列表。 */
+    public static List<CoverageInterval> decodeCoverage(String text) {
+        List<CoverageInterval> coverage = new ArrayList<>();
+        if (text != null && !text.isEmpty()) {
+            for (String pair : text.split(",")) {
+                String[] se = pair.split("-");
+                coverage.add(new CoverageInterval(
+                        Integer.parseInt(se[0]), Integer.parseInt(se[1])));
+            }
+        }
+        return coverage;
     }
 }

@@ -1,6 +1,8 @@
 package com.example.starter.service;
 
 import com.example.starter.api.ApiException;
+import com.example.starter.api.dto.CoverageIntervalDto;
+import com.example.starter.api.dto.LinkGapDto;
 import com.example.starter.api.dto.MutationResponse;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
@@ -8,12 +10,17 @@ import com.example.starter.api.dto.RouteCreateRequest;
 import com.example.starter.api.dto.RoutePointDto;
 import com.example.starter.api.dto.RouteReplaceRequest;
 import com.example.starter.api.dto.RouteResult;
+import com.example.starter.api.dto.SegmentProfileDto;
+import com.example.starter.api.dto.SegmentUnionDto;
 import com.example.starter.api.dto.ZoneCreateRequest;
 import com.example.starter.api.dto.ZoneResult;
 import com.example.starter.api.dto.ZoneRevokeRequest;
+import com.example.starter.domain.CoverageInterval;
 import com.example.starter.domain.Geometry;
+import com.example.starter.domain.LinkCoverage;
 import com.example.starter.domain.Point;
 import com.example.starter.domain.ReviewConclusion;
+import com.example.starter.domain.SegmentProfile;
 import com.example.starter.domain.ZoneStatus;
 import com.example.starter.repo.AirspaceRepository;
 import com.example.starter.repo.DedupPo;
@@ -23,9 +30,11 @@ import com.example.starter.repo.RoutePo;
 import com.example.starter.repo.RouteRepository;
 import com.example.starter.repo.ZonePo;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.DecimalNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.dao.DuplicateKeyException;
@@ -34,6 +43,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -133,11 +143,16 @@ public class AirspaceReviewService {
         return withIdempotency(request.requestId(), KIND_ROUTE_CREATE, canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
+            List<SegmentProfile> profiles = validateSegmentProfiles(
+                    request.segments(), points.size() - 1, request.operator());
             if (routeRepo.findRoute(request.routeId()) != null) {
                 throw new ApiException(HttpStatus.CONFLICT, "ROUTE_ALREADY_EXISTS",
                         "航线已存在: " + request.routeId());
             }
             routeRepo.insertRoute(request.routeId(), points);
+            if (profiles != null) {
+                routeRepo.insertSegments(request.routeId(), profiles);
+            }
             return new MutationResponse(request.requestId(), false,
                     new RouteResult(request.routeId(), 1));
         });
@@ -148,6 +163,8 @@ public class AirspaceReviewService {
         return withIdempotency(request.requestId(), KIND_ROUTE_REPLACE, canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
+            List<SegmentProfile> profiles = validateSegmentProfiles(
+                    request.segments(), points.size() - 1, request.operator());
             RoutePo route = routeRepo.findRoute(request.routeId());
             if (route == null) {
                 throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
@@ -167,6 +184,11 @@ public class AirspaceReviewService {
             }
             routeRepo.deletePoints(request.routeId());
             routeRepo.insertPoints(request.routeId(), points);
+            // 通信档案随新版本整体替换；新版本无档案时删除旧档案
+            routeRepo.deleteSegments(request.routeId());
+            if (profiles != null) {
+                routeRepo.insertSegments(request.routeId(), profiles);
+            }
             return new MutationResponse(request.requestId(), false,
                     new RouteResult(request.routeId(), request.expectedVersion() + 1));
         });
@@ -204,12 +226,20 @@ public class AirspaceReviewService {
                     hits.add(zone.zoneId());
                 }
             }
-            String conclusion = hits.isEmpty()
-                    ? ReviewConclusion.CLEAR.name()
-                    : ReviewConclusion.BLOCKED.name();
+            // 持锁状态下读取该版本的航段通信档案，与航线点列同属一个一致状态；
+            // 旧无通信档案航线为 null，不适用链路审查
+            LinkAssessment link = assessLink(request.routeId());
+            // 禁飞命中仍阻断，不让通信结论替代它；否则任一连续失联严格超限即 LINK_BLOCKED
+            String conclusion = !hits.isEmpty()
+                    ? ReviewConclusion.BLOCKED.name()
+                    : (link != null && link.blocked()
+                        ? ReviewConclusion.LINK_BLOCKED.name()
+                        : ReviewConclusion.CLEAR.name());
             String reviewId = "rv_" + UUID.randomUUID();
             ReviewPo po = new ReviewPo(reviewId, request.routeId(), route.version(), globalVersion,
                     conclusion, new ArrayList<>(hits), List.copyOf(route.points()),
+                    link == null ? null : writeJson(link.union()),
+                    link == null ? null : writeJson(link.gaps()),
                     request.requestId(), nowMillis());
             reviewRepo.insertReview(po);
             return new MutationResponse(request.requestId(), false, toDto(po, conclusion, true));
@@ -340,13 +370,132 @@ public class AirspaceReviewService {
                 "航线至少需要两个不同的点");
     }
 
-    private static ReviewResultDto toDto(ReviewPo po, String conclusion, Boolean current) {
+    private ReviewResultDto toDto(ReviewPo po, String conclusion, Boolean current) {
         List<RoutePointDto> snapshot = new ArrayList<>(po.pointsSnapshot().size());
         for (Point p : po.pointsSnapshot()) {
             snapshot.add(new RoutePointDto(p.x(), p.y()));
         }
+        List<SegmentUnionDto> union = readJsonOrNull(po.coverageUnionJson(),
+                new TypeReference<List<SegmentUnionDto>>() { });
+        List<LinkGapDto> gaps = readJsonOrNull(po.linkGapsJson(),
+                new TypeReference<List<LinkGapDto>>() { });
         return new ReviewResultDto(po.reviewId(), po.routeId(), po.routeVersion(),
-                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()), snapshot, current);
+                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()), snapshot, current,
+                union, gaps, maxLossMs(gaps));
+    }
+
+    /** 由失联段列表推导最长连续失联毫秒（精确小数）；无档案返回 null，全程覆盖返回 "0"。 */
+    private static String maxLossMs(List<LinkGapDto> gaps) {
+        if (gaps == null) {
+            return null;
+        }
+        BigDecimal max = BigDecimal.ZERO;
+        for (LinkGapDto gap : gaps) {
+            BigDecimal loss = new BigDecimal(gap.lossMs());
+            if (loss.compareTo(max) > 0) {
+                max = loss;
+            }
+        }
+        return max.stripTrailingZeros().toPlainString();
+    }
+
+    private <T> T readJsonOrNull(String json, TypeReference<T> type) {
+        if (json == null) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(json, type);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException("无法解析审核存档 JSON", ex);
+        }
+    }
+
+    // ============================ 通信覆盖档案 ============================
+
+    /** 链路评估结果（仅当被审航线版本登记了通信档案时存在）。 */
+    private record LinkAssessment(List<SegmentUnionDto> union, List<LinkGapDto> gaps,
+                                  boolean blocked) {
+    }
+
+    /**
+     * 校验并转换航段通信档案：段数必须等于航段数；每段时长为正整数；
+     * 覆盖区间最多 10 条、不反向且不越界（0..10000）；空覆盖合法（全段失联）；
+     * 携带档案的新写请求必须提供非空操作者。
+     *
+     * @return 转换后的段档案；segments 为 null（旧无档案航线）时返回 null
+     */
+    private List<SegmentProfile> validateSegmentProfiles(List<SegmentProfileDto> segments,
+                                                         int expectedCount, String operator) {
+        if (segments == null) {
+            // 旧无通信档案航线：不登记、不参与链路审查
+            return null;
+        }
+        if (operator == null || operator.isBlank()) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "OPERATOR_REQUIRED",
+                    "登记通信档案的写请求必须携带非空操作者 operator");
+        }
+        if (segments.size() != expectedCount) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "SEGMENT_COUNT_MISMATCH",
+                    "航段档案数必须等于航段数（点数减一）：expected=" + expectedCount
+                            + ", actual=" + segments.size());
+        }
+        List<SegmentProfile> profiles = new ArrayList<>(segments.size());
+        for (int i = 0; i < segments.size(); i++) {
+            SegmentProfileDto dto = segments.get(i);
+            if (dto == null || dto.durationMs() == null || dto.durationMs() <= 0) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_SEGMENT_DURATION",
+                        "航段 " + i + " 行驶时长必须是正整数毫秒");
+            }
+            List<CoverageIntervalDto> coverage = dto.coverage();
+            if (coverage == null) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "COVERAGE_REQUIRED",
+                        "航段 " + i + " 必须登记覆盖区间列表（空列表表示全段失联）");
+            }
+            if (coverage.size() > 10) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "COVERAGE_INTERVAL_LIMIT",
+                        "航段 " + i + " 覆盖区间最多 10 条：actual=" + coverage.size());
+            }
+            List<CoverageInterval> intervals = new ArrayList<>(coverage.size());
+            for (CoverageIntervalDto interval : coverage) {
+                if (interval == null || interval.start() == null || interval.end() == null
+                        || interval.start() < 0 || interval.end() > LinkCoverage.SCALE
+                        || interval.start() > interval.end()) {
+                    throw new ApiException(HttpStatus.BAD_REQUEST, "COVERAGE_INTERVAL_INVALID",
+                            "航段 " + i + " 覆盖区间反向或越界（须满足 0 <= start <= end <= 10000）");
+                }
+                intervals.add(new CoverageInterval(interval.start(), interval.end()));
+            }
+            profiles.add(new SegmentProfile(dto.durationMs(), List.copyOf(intervals)));
+        }
+        return profiles;
+    }
+
+    /**
+     * 读取当前版本通信档案并计算合并覆盖并集与连续失联（含跨段缺口）。
+     *
+     * @return 评估结果；旧无通信档案航线返回 null（不适用链路审查）
+     */
+    private LinkAssessment assessLink(String routeId) {
+        List<SegmentProfile> profiles = routeRepo.findSegments(routeId);
+        if (profiles.isEmpty()) {
+            // 旧无通信档案航线不适用链路审查
+            return null;
+        }
+        List<SegmentUnionDto> union = new ArrayList<>(profiles.size());
+        for (int i = 0; i < profiles.size(); i++) {
+            List<CoverageIntervalDto> merged = new ArrayList<>();
+            for (CoverageInterval interval : LinkCoverage.merge(profiles.get(i).coverage())) {
+                merged.add(new CoverageIntervalDto(interval.start(), interval.end()));
+            }
+            union.add(new SegmentUnionDto(i, List.copyOf(merged)));
+        }
+        List<LinkCoverage.LinkGap> losses = LinkCoverage.continuousLosses(profiles);
+        List<LinkGapDto> gaps = new ArrayList<>(losses.size());
+        for (LinkCoverage.LinkGap loss : losses) {
+            gaps.add(new LinkGapDto(loss.fromSegment(), loss.toSegment(), loss.lossMs()));
+        }
+        return new LinkAssessment(List.copyOf(union), List.copyOf(gaps),
+                LinkCoverage.anyBlocked(losses));
     }
 
     private long nowMillis() {
@@ -392,6 +541,10 @@ public class AirspaceReviewService {
             ArrayNode array = JsonNodeFactory.instance.arrayNode();
             node.forEach(child -> array.add(canonicalize(child)));
             return array;
+        }
+        if (node.isNumber()) {
+            // 十进制同值同参：1.0 与 1.00 归一化为同一数值再参与哈希
+            return new DecimalNode(node.decimalValue().stripTrailingZeros());
         }
         return node;
     }
