@@ -71,4 +71,30 @@ public class ExposureController {
                                     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate utcDate) {
         return exposureService.queryQuota(campaignId, visitorId, utcDate);
     }
+
+    /** 组合申请：一个访客一次预占 2～5 个不同公告，整组共用 60 秒截止，任一不足整组失败。 */
+    @PostMapping("/bundles")
+    public ResponseEntity<BundleResponse> applyBundle(@Valid @RequestBody ApplyBundleRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.applyBundle(request));
+    }
+
+    /** 组合明细（含成员）。 */
+    @GetMapping("/bundles/{bundleId}")
+    public BundleResponse getBundle(@PathVariable String bundleId) {
+        return exposureService.getBundle(bundleId);
+    }
+
+    /** 整组确认：必须在到期时刻之前，一次确认全部成员。 */
+    @PostMapping("/bundles/{bundleId}/confirm")
+    public BundleResponse confirmBundle(@PathVariable String bundleId,
+                                        @Valid @RequestBody BundleActionRequest request) {
+        return exposureService.confirmBundle(bundleId, request);
+    }
+
+    /** 整组取消：仅 RESERVED 可取消，一次释放全部成员两级额度。 */
+    @PostMapping("/bundles/{bundleId}/cancel")
+    public BundleResponse cancelBundle(@PathVariable String bundleId,
+                                       @Valid @RequestBody BundleActionRequest request) {
+        return exposureService.cancelBundle(bundleId, request);
+    }
 }

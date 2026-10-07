@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS quota_visitor_ledger (
 );
 
 -- 曝光预占单：utc_date 固定为申请时刻的 UTC 日期，expires_at_utc 为到期时刻（epoch 毫秒）
+-- bundle_id 非空表示该单是组合预占成员，只能随整组确认/取消/过期，不可用单条入口变更
 CREATE TABLE IF NOT EXISTS exposure_reservation (
     reservation_id  VARCHAR(64) NOT NULL,
     campaign_id     VARCHAR(64) NOT NULL,
@@ -38,12 +39,28 @@ CREATE TABLE IF NOT EXISTS exposure_reservation (
     created_at_utc  BIGINT      NOT NULL,
     expires_at_utc  BIGINT      NOT NULL,
     terminal_at_utc BIGINT,
+    bundle_id       VARCHAR(64),
     PRIMARY KEY (reservation_id)
 );
 CREATE INDEX IF NOT EXISTS idx_reservation_campaign_day
     ON exposure_reservation (campaign_id, utc_date, status);
 CREATE INDEX IF NOT EXISTS idx_reservation_expiry
     ON exposure_reservation (campaign_id, status, expires_at_utc);
+CREATE INDEX IF NOT EXISTS idx_reservation_bundle
+    ON exposure_reservation (bundle_id);
+
+-- 组合预占组：整组共用同一到期时刻与 UTC 日；version 为乐观锁版本，每次终态迁移 +1
+CREATE TABLE IF NOT EXISTS exposure_bundle (
+    bundle_id       VARCHAR(64) NOT NULL,
+    visitor_id      VARCHAR(64) NOT NULL,
+    utc_date        DATE        NOT NULL,
+    status          VARCHAR(16) NOT NULL,
+    version         BIGINT      NOT NULL DEFAULT 0,
+    created_at_utc  BIGINT      NOT NULL,
+    expires_at_utc  BIGINT      NOT NULL,
+    terminal_at_utc BIGINT,
+    PRIMARY KEY (bundle_id)
+);
 
 -- 写操作幂等记录：request_id 全局唯一，异参重放返回 409，失败不占键
 CREATE TABLE IF NOT EXISTS idempotency_record (

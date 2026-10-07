@@ -31,14 +31,15 @@ public class ReservationRepository {
             ReservationStatus.valueOf(rs.getString("status")),
             rs.getLong("created_at_utc"),
             rs.getLong("expires_at_utc"),
-            (Long) rs.getObject("terminal_at_utc"));
+            (Long) rs.getObject("terminal_at_utc"),
+            rs.getString("bundle_id"));
 
     private static final String COLUMNS =
             "reservation_id, campaign_id, visitor_id, utc_date, status, "
-                    + "created_at_utc, expires_at_utc, terminal_at_utc";
+                    + "created_at_utc, expires_at_utc, terminal_at_utc, bundle_id";
 
     public void insert(Reservation reservation) {
-        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 reservation.reservationId(),
                 reservation.campaignId(),
                 reservation.visitorId(),
@@ -46,7 +47,8 @@ public class ReservationRepository {
                 reservation.status().name(),
                 reservation.createdAtUtc(),
                 reservation.expiresAtUtc(),
-                reservation.terminalAtUtc());
+                reservation.terminalAtUtc(),
+                reservation.bundleId());
     }
 
     public Optional<Reservation> findById(String reservationId) {
@@ -67,12 +69,22 @@ public class ReservationRepository {
     }
 
     /**
-     * 行锁查询某公告下已到期（now &gt;= expires_at_utc）但仍为 RESERVED 的预占单。
+     * 无锁查询某公告下已到期（now &gt;= expires_at_utc）但仍为 RESERVED 的预占单。
+     * 调用方随后按单条或按组加锁结算，避免持成员行锁再取组行锁造成死锁。
      */
-    public List<Reservation> lockExpiredReserved(String campaignId, long nowUtc) {
+    public List<Reservation> findExpiredReserved(String campaignId, long nowUtc) {
         return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
-                        + "WHERE campaign_id = ? AND status = 'RESERVED' AND expires_at_utc <= ? FOR UPDATE",
+                        + "WHERE campaign_id = ? AND status = 'RESERVED' AND expires_at_utc <= ?",
                 MAPPER, campaignId, nowUtc);
+    }
+
+    /**
+     * 按组编号查询成员预占单，固定按公告号排序，保证加锁/释放顺序确定。
+     */
+    public List<Reservation> findByBundleId(String bundleId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
+                        + "WHERE bundle_id = ? ORDER BY campaign_id, reservation_id",
+                MAPPER, bundleId);
     }
 
     /**
