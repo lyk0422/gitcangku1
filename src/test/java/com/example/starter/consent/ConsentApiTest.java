@@ -48,6 +48,7 @@ class ConsentApiTest {
         jdbc.update("DELETE FROM consent_record");
         jdbc.update("DELETE FROM consent_grant");
         jdbc.update("DELETE FROM idempotency_request");
+        jdbc.update("DELETE FROM erasure_task");
     }
 
     private ResultActions grant(String requestId, String subjectKey, String purpose) throws Exception {
