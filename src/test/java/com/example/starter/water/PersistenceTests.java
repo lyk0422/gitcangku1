@@ -116,4 +116,62 @@ class PersistenceTests {
         assertEquals(0, cancelled.heldAmount().compareTo(BigDecimal.ZERO));
         assertEquals(0, repo.sumApprovedAmount(windowId).compareTo(BigDecimal.ZERO));
     }
+
+    @Test
+    void basinAndExecutionRowsAreReadableFromNewConnection() throws Exception {
+        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
+        SimpleDriverDataSource first = new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "");
+        try (Connection connection = first.getConnection()) {
+            ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
+        }
+        WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
+        long windowId = repo1.insertWindow("wk-gate", "ch-gate", 1_000L, 2_000L,
+                new BigDecimal("100.000"), 1L);
+        // 登记双池：面积 10/10，上池 30 [10,40]，下池 10 [0,30]
+        repo1.insertBasin(windowId, 10, 30, 10, 40, 10, 10, 0, 30, 2L);
+        repo1.insertAllocation("ak-gate", windowId, "user-1", new BigDecimal("30.000"), "alice", 3L);
+        AllocationRow allocation = repo1.findAllocationByKey("ak-gate");
+        repo1.updateAllocationStatus(allocation.id(), "APPROVED", 4L);
+        // 执行 5：上池 25、下池 15，版本前进到 1，申请累计已执行 5
+        repo1.updateBasinVolumes(windowId, 25, 15, 5L);
+        repo1.incrementExecutedAmount(allocation.id(), new BigDecimal("5"), 5L);
+        repo1.insertExecution("ek-gate", windowId, "ak-gate", 5, 30, 25, 10, 15,
+                new BigDecimal("3.000000000000"), new BigDecimal("2.500000000000"),
+                new BigDecimal("1.000000000000"), new BigDecimal("1.500000000000"),
+                1L, "gate-op", 5L);
+        // 取消：持有额度保留已执行量 5，仅未执行的 25 被释放
+        repo1.updateAllocationStatus(allocation.id(), "CANCELLED", 6L);
+
+        // 第二次读取：全新连接与仓储实例，同一 JVM 内数据仍在
+        WaterRepository repo2 = new WaterRepository(
+                new JdbcTemplate(new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "")));
+        WaterRepository.BasinRow basin = repo2.findBasinByWindowId(windowId);
+        assertNotNull(basin);
+        assertEquals(10, basin.upperAreaM2());
+        assertEquals(25, basin.upperVolumeM3());
+        assertEquals(15, basin.lowerVolumeM3());
+        assertEquals(1, basin.version());
+
+        AllocationRow cancelled = repo2.findAllocationByKey("ak-gate");
+        assertEquals("CANCELLED", cancelled.status());
+        assertEquals(new BigDecimal("30.000"), cancelled.amount());
+        assertEquals(0, cancelled.heldAmount().compareTo(new BigDecimal("5.000")));
+        assertEquals(0, cancelled.executedAmount().compareTo(new BigDecimal("5.000")));
+        // 已执行 5 仍计入窗口占用，未执行的 25 已释放
+        assertEquals(0, repo2.sumApprovedAmount(windowId).compareTo(new BigDecimal("5.000")));
+
+        java.util.List<WaterRepository.ExecutionRow> executions = repo2.listExecutionsByAllocation("ak-gate");
+        assertEquals(1, executions.size());
+        WaterRepository.ExecutionRow execution = executions.get(0);
+        assertEquals("ek-gate", execution.executionKey());
+        assertEquals(5, execution.volumeM3());
+        assertEquals(30, execution.upperVolumeBeforeM3());
+        assertEquals(25, execution.upperVolumeAfterM3());
+        assertEquals(10, execution.lowerVolumeBeforeM3());
+        assertEquals(15, execution.lowerVolumeAfterM3());
+        assertEquals(0, execution.upperLevelAfterM().compareTo(new BigDecimal("2.500000000000")));
+        assertEquals(1, execution.basinVersion());
+        assertEquals("gate-op", execution.actor());
+        assertNotNull(repo2.findExecutionByKey("ek-gate"));
+    }
 }

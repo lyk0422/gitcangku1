@@ -25,9 +25,9 @@ public class WaterRepository {
                             BigDecimal plannedVolume, long createdNanos) {
     }
 
-    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
+    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度，executedAmount 为累计已执行水量。 */
     public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
-                                BigDecimal heldAmount, String requester, String status,
+                                BigDecimal heldAmount, BigDecimal executedAmount, String requester, String status,
                                 long createdNanos, long updatedNanos) {
     }
 
@@ -46,6 +46,21 @@ public class WaterRepository {
                              long createdNanos) {
     }
 
+    /** 闸门窗口双池状态行；体积/界值单位立方米，面积单位平方米，version 每次成功执行加 1。 */
+    public record BasinRow(long windowId, long upperAreaM2, long upperVolumeM3, long upperMinM3, long upperMaxM3,
+                           long lowerAreaM2, long lowerVolumeM3, long lowerMinM3, long lowerMaxM3,
+                           long version, long createdNanos, long updatedNanos) {
+    }
+
+    /** 闸门执行明细行，创建后不可变；水位为显示舍入值（米），体积单位立方米。 */
+    public record ExecutionRow(long id, String executionKey, long windowId, String allocationKey, long volumeM3,
+                               long upperVolumeBeforeM3, long upperVolumeAfterM3,
+                               long lowerVolumeBeforeM3, long lowerVolumeAfterM3,
+                               BigDecimal upperLevelBeforeM, BigDecimal upperLevelAfterM,
+                               BigDecimal lowerLevelBeforeM, BigDecimal lowerLevelAfterM,
+                               long basinVersion, String actor, long createdNanos) {
+    }
+
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
@@ -54,11 +69,11 @@ public class WaterRepository {
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
             rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"),
-            rs.getString("requester"), rs.getString("status"),
+            rs.getBigDecimal("executed_amount"), rs.getString("requester"), rs.getString("status"),
             rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
 
     private static final String ALLOCATION_SELECT =
-            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status,"
+            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, executed_amount, requester, status,"
                     + " created_nanos, updated_nanos";
 
     private static final RowMapper<TransferRow> TRANSFER_MAPPER = (rs, n) -> new TransferRow(
@@ -74,6 +89,34 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+
+    private static final String BASIN_SELECT =
+            "SELECT window_id, upper_area_m2, upper_volume_m3, upper_min_m3, upper_max_m3,"
+                    + " lower_area_m2, lower_volume_m3, lower_min_m3, lower_max_m3,"
+                    + " version, created_nanos, updated_nanos";
+
+    private static final RowMapper<BasinRow> BASIN_MAPPER = (rs, n) -> new BasinRow(
+            rs.getLong("window_id"), rs.getLong("upper_area_m2"), rs.getLong("upper_volume_m3"),
+            rs.getLong("upper_min_m3"), rs.getLong("upper_max_m3"),
+            rs.getLong("lower_area_m2"), rs.getLong("lower_volume_m3"),
+            rs.getLong("lower_min_m3"), rs.getLong("lower_max_m3"),
+            rs.getLong("version"), rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
+
+    private static final String EXECUTION_SELECT =
+            "SELECT id, execution_key, window_id, allocation_key, volume_m3,"
+                    + " upper_volume_before_m3, upper_volume_after_m3,"
+                    + " lower_volume_before_m3, lower_volume_after_m3,"
+                    + " upper_level_before_m, upper_level_after_m, lower_level_before_m, lower_level_after_m,"
+                    + " basin_version, actor, created_nanos";
+
+    private static final RowMapper<ExecutionRow> EXECUTION_MAPPER = (rs, n) -> new ExecutionRow(
+            rs.getLong("id"), rs.getString("execution_key"), rs.getLong("window_id"),
+            rs.getString("allocation_key"), rs.getLong("volume_m3"),
+            rs.getLong("upper_volume_before_m3"), rs.getLong("upper_volume_after_m3"),
+            rs.getLong("lower_volume_before_m3"), rs.getLong("lower_volume_after_m3"),
+            rs.getBigDecimal("upper_level_before_m"), rs.getBigDecimal("upper_level_after_m"),
+            rs.getBigDecimal("lower_level_before_m"), rs.getBigDecimal("lower_level_after_m"),
+            rs.getLong("basin_version"), rs.getString("actor"), rs.getLong("created_nanos"));
 
     private final JdbcTemplate jdbc;
 
@@ -172,12 +215,12 @@ public class WaterRepository {
     }
 
     /**
-     * 更新申请状态与变更时间，并同步持有额度：批准时持有额度等于原申请水量，取消时归零，
-     * REQUESTED 保持当前持有额度不变。
+     * 更新申请状态与变更时间，并同步持有额度：批准时持有额度等于原申请水量，取消时保留已执行量
+     * （仅释放未执行额度，已执行水量不可取消返还），REQUESTED 保持当前持有额度不变。
      */
     public void updateAllocationStatus(long id, String status, long updatedNanos) {
         jdbc.update("UPDATE allocation SET status = ?, updated_nanos = ?,"
-                + " held_amount = CASE WHEN ? = 'APPROVED' THEN amount WHEN ? = 'CANCELLED' THEN 0"
+                + " held_amount = CASE WHEN ? = 'APPROVED' THEN amount WHEN ? = 'CANCELLED' THEN executed_amount"
                 + " ELSE held_amount END WHERE id = ?",
                 status, updatedNanos, status, status, id);
     }
@@ -188,10 +231,15 @@ public class WaterRepository {
                 delta, updatedNanos, id);
     }
 
-    /** 窗口当前所有 APPROVED 申请的当前持有额度之和（BigDecimal 精确求和），无则 0。 */
+    /**
+     * 窗口已占用额度汇总（BigDecimal 精确求和），无则 0。
+     * 计入 APPROVED 申请的当前持有额度，以及 CANCELLED 申请保留的已执行量（已执行水量不释放）；
+     * 普通窗口取消后持有额度为 0，口径与原先一致。
+     */
     public BigDecimal sumApprovedAmount(long windowId) {
         BigDecimal sum = jdbc.queryForObject(
-                "SELECT COALESCE(SUM(held_amount), 0) FROM allocation WHERE window_id = ? AND status = 'APPROVED'",
+                "SELECT COALESCE(SUM(held_amount), 0) FROM allocation"
+                        + " WHERE window_id = ? AND status IN ('APPROVED', 'CANCELLED')",
                 BigDecimal.class, windowId);
         return sum == null ? BigDecimal.ZERO : sum;
     }
@@ -303,5 +351,95 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 闸门双池与执行明细
+    // ------------------------------------------------------------------
+
+    /** 登记窗口双池状态（初始版本 0）。 */
+    public void insertBasin(long windowId, long upperAreaM2, long upperVolumeM3, long upperMinM3, long upperMaxM3,
+                            long lowerAreaM2, long lowerVolumeM3, long lowerMinM3, long lowerMaxM3,
+                            long nowNanos) {
+        jdbc.update("INSERT INTO gate_basin (window_id, upper_area_m2, upper_volume_m3, upper_min_m3, upper_max_m3,"
+                        + " lower_area_m2, lower_volume_m3, lower_min_m3, lower_max_m3, version,"
+                        + " created_nanos, updated_nanos) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                windowId, upperAreaM2, upperVolumeM3, upperMinM3, upperMaxM3,
+                lowerAreaM2, lowerVolumeM3, lowerMinM3, lowerMaxM3, nowNanos, nowNanos);
+    }
+
+    /** 按窗口查询双池状态；普通窗口无此行，返回 null。调用方须先锁定窗口行以串行化读写。 */
+    public BasinRow findBasinByWindowId(long windowId) {
+        try {
+            return jdbc.queryForObject(BASIN_SELECT + " FROM gate_basin WHERE window_id = ?",
+                    BASIN_MAPPER, windowId);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 执行成功后写回双池体积并递增版本号。 */
+    public void updateBasinVolumes(long windowId, long upperVolumeM3, long lowerVolumeM3, long updatedNanos) {
+        jdbc.update("UPDATE gate_basin SET upper_volume_m3 = ?, lower_volume_m3 = ?,"
+                        + " version = version + 1, updated_nanos = ? WHERE window_id = ?",
+                upperVolumeM3, lowerVolumeM3, updatedNanos, windowId);
+    }
+
+    /** 累加申请已执行水量（不得超过持有额度，由事务内校验保证）并记录变更时间。 */
+    public void incrementExecutedAmount(long id, BigDecimal delta, long updatedNanos) {
+        jdbc.update("UPDATE allocation SET executed_amount = executed_amount + ?, updated_nanos = ? WHERE id = ?",
+                delta, updatedNanos, id);
+    }
+
+    /** 插入不可变执行明细并返回主键。 */
+    public long insertExecution(String executionKey, long windowId, String allocationKey, long volumeM3,
+                                long upperBefore, long upperAfter, long lowerBefore, long lowerAfter,
+                                BigDecimal upperLevelBefore, BigDecimal upperLevelAfter,
+                                BigDecimal lowerLevelBefore, BigDecimal lowerLevelAfter,
+                                long basinVersion, String actor, long createdNanos) {
+        KeyHolder keys = new GeneratedKeyHolder();
+        jdbc.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO gate_execution (execution_key, window_id, allocation_key, volume_m3,"
+                            + " upper_volume_before_m3, upper_volume_after_m3,"
+                            + " lower_volume_before_m3, lower_volume_after_m3,"
+                            + " upper_level_before_m, upper_level_after_m,"
+                            + " lower_level_before_m, lower_level_after_m, basin_version, actor, created_nanos)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, executionKey);
+            ps.setLong(2, windowId);
+            ps.setString(3, allocationKey);
+            ps.setLong(4, volumeM3);
+            ps.setLong(5, upperBefore);
+            ps.setLong(6, upperAfter);
+            ps.setLong(7, lowerBefore);
+            ps.setLong(8, lowerAfter);
+            ps.setBigDecimal(9, upperLevelBefore);
+            ps.setBigDecimal(10, upperLevelAfter);
+            ps.setBigDecimal(11, lowerLevelBefore);
+            ps.setBigDecimal(12, lowerLevelAfter);
+            ps.setLong(13, basinVersion);
+            ps.setString(14, actor);
+            ps.setLong(15, createdNanos);
+            return ps;
+        }, keys);
+        return Objects.requireNonNull(keys.getKey()).longValue();
+    }
+
+    /** 按业务键查询执行明细，不存在返回 null。 */
+    public ExecutionRow findExecutionByKey(String executionKey) {
+        try {
+            return jdbc.queryForObject(EXECUTION_SELECT + " FROM gate_execution WHERE execution_key = ?",
+                    EXECUTION_MAPPER, executionKey);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 申请全部执行明细（不可变），按主键升序。 */
+    public List<ExecutionRow> listExecutionsByAllocation(String allocationKey) {
+        return jdbc.query(EXECUTION_SELECT + " FROM gate_execution WHERE allocation_key = ? ORDER BY id",
+                EXECUTION_MAPPER, allocationKey);
     }
 }

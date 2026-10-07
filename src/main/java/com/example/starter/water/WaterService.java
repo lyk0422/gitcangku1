@@ -1,13 +1,19 @@
 package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
+import com.example.starter.water.WaterRepository.BasinRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.ExecutionRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
+import com.example.starter.water.dto.Dtos.BasinResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.ExecutionListResponse;
+import com.example.starter.water.dto.Dtos.ExecutionResponse;
+import com.example.starter.water.dto.Dtos.GateWindowResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
@@ -19,6 +25,8 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.List;
@@ -44,6 +52,11 @@ public class WaterService {
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
     private static final Pattern AMOUNT_PATTERN = Pattern.compile("\\d{1,16}(\\.\\d{1,3})?");
     private static final Pattern KEY_PATTERN = Pattern.compile("[\\w.\\-:]{1,128}");
+    private static final Pattern INTEGER_PATTERN = Pattern.compile("\\d{1,16}");
+    /** 水位差上限，单位米；执行前后两池水位差绝对值均不得超过该值。 */
+    static final long MAX_LEVEL_DIFF_M = 2L;
+    /** 水位显示舍入的小数位数；门禁判断使用整数精确比对，不使用该舍入值。 */
+    private static final int LEVEL_SCALE = 12;
 
     private final WaterRepository repository;
     private final TransactionTemplate tx;
@@ -212,8 +225,10 @@ public class WaterService {
                 throw ApiException.conflict("SAME_USER", "转让双方必须属于不同用水户");
             }
             BigDecimal amount = lockedTarget.amount();
-            if (lockedSource.heldAmount().compareTo(amount) < 0) {
-                throw ApiException.quotaExceeded("源申请当前持有额度 " + fmt(lockedSource.heldAmount())
+            // 只能转未执行量：已执行水量不可转移
+            BigDecimal transferable = lockedSource.heldAmount().subtract(lockedSource.executedAmount());
+            if (transferable.compareTo(amount) < 0) {
+                throw ApiException.quotaExceeded("源申请未执行额度 " + fmt(transferable)
                         + " 不足，无法转让 " + fmt(amount));
             }
             long now = nowNanos();
@@ -316,6 +331,157 @@ public class WaterService {
     }
 
     // ------------------------------------------------------------------
+    // 闸门双池：登记、执行、查询
+    // ------------------------------------------------------------------
+
+    /**
+     * 登记闸门窗口：在普通窗口之外登记上下池。面积为固定正整数（平方米），
+     * 初始体积与体积上下界为整数（立方米），登记时两池水位差即不得超过 2 米。
+     */
+    public GateWindowResponse createGateWindow(String commandKey, String windowKey, String channelId,
+                                               String startUtc, String endUtc, String plannedVolume,
+                                               Long upperAreaM2, Long upperInitialVolumeM3,
+                                               Long upperMinVolumeM3, Long upperMaxVolumeM3,
+                                               Long lowerAreaM2, Long lowerInitialVolumeM3,
+                                               Long lowerMinVolumeM3, Long lowerMaxVolumeM3) {
+        requireKey("commandKey", commandKey);
+        requireKey("windowKey", windowKey);
+        requireKey("channelId", channelId);
+        long startNanos = parseInstant("startUtc", startUtc);
+        long endNanos = parseInstant("endUtc", endUtc);
+        if (startNanos >= endNanos) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "startUtc 必须早于 endUtc");
+        }
+        BigDecimal planned = parseAmount("plannedVolume", plannedVolume);
+        long upperArea = requirePositiveLong("upperAreaM2", upperAreaM2);
+        long upperInit = requireNonNegativeLong("upperInitialVolumeM3", upperInitialVolumeM3);
+        long upperMin = requireNonNegativeLong("upperMinVolumeM3", upperMinVolumeM3);
+        long upperMax = requireNonNegativeLong("upperMaxVolumeM3", upperMaxVolumeM3);
+        long lowerArea = requirePositiveLong("lowerAreaM2", lowerAreaM2);
+        long lowerInit = requireNonNegativeLong("lowerInitialVolumeM3", lowerInitialVolumeM3);
+        long lowerMin = requireNonNegativeLong("lowerMinVolumeM3", lowerMinVolumeM3);
+        long lowerMax = requireNonNegativeLong("lowerMaxVolumeM3", lowerMaxVolumeM3);
+        requireBounds("upper", upperMin, upperMax, upperInit);
+        requireBounds("lower", lowerMin, lowerMax, lowerInit);
+        if (!levelDiffWithin(upperInit, upperArea, lowerInit, lowerArea)) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "登记时两池水位差不得超过 2 米");
+        }
+        String params = "GATE_WINDOW_CREATE|" + windowKey + "|" + channelId + "|" + startNanos + "|" + endNanos
+                + "|" + planned.toPlainString() + "|" + upperArea + "|" + upperInit + "|" + upperMin + "|"
+                + upperMax + "|" + lowerArea + "|" + lowerInit + "|" + lowerMin + "|" + lowerMax;
+        return runCommand("GATE_WINDOW_CREATE", commandKey, params, GateWindowResponse.class, () -> {
+            if (repository.existsOverlappingWindow(channelId, startNanos, endNanos)) {
+                throw ApiException.conflict("WINDOW_OVERLAP", "同一渠道存在时间重叠的供水窗口");
+            }
+            long now = nowNanos();
+            long id = repository.insertWindow(windowKey, channelId, startNanos, endNanos, planned, now);
+            repository.insertBasin(id, upperArea, upperInit, upperMin, upperMax,
+                    lowerArea, lowerInit, lowerMin, lowerMax, now);
+            return new GateWindowResponse(id, windowKey, channelId, toIso(startNanos), toIso(endNanos),
+                    fmt(planned), toIso(now), toBasinResponse(repository.findBasinByWindowId(id)));
+        });
+    }
+
+    /** 查询窗口双池状态；普通窗口未登记双池返回 404。 */
+    public BasinResponse getBasins(long windowId) {
+        if (repository.findWindowById(windowId) == null) {
+            throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+        }
+        BasinRow basin = repository.findBasinByWindowId(windowId);
+        if (basin == null) {
+            throw ApiException.notFound("BASIN_NOT_CONFIGURED", "普通窗口不启用双池规则: " + windowId);
+        }
+        return toBasinResponse(basin);
+    }
+
+    /**
+     * 闸门执行：仅当前 APPROVED 申请可执行，累计执行不超过其批准量（持有额度）；
+     * 每次执行正整数水量 V，从上池扣 V、下池加 V，执行前后两池水位差均不得超过 2 米、体积均须在界内，
+     * 任一条件失败 422 且双池与执行账均不变。窗口行锁串行化执行/取消/转让，禁止分别检查后超灌。
+     */
+    public ExecutionResponse executeAllocation(String commandKey, String allocationKey, String executionKey,
+                                               String volume, Long expectedVersion, String actor) {
+        requireKey("commandKey", commandKey);
+        requireKey("executionKey", executionKey);
+        requireKey("X-Actor-Id", actor);
+        if (allocationKey == null || allocationKey.isBlank()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "allocationKey 不能为空");
+        }
+        long vol = parsePositiveInteger("volume", volume);
+        if (expectedVersion == null || expectedVersion < 0) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "expectedVersion 不能为空且必须为非负整数");
+        }
+        String params = "GATE_EXECUTE|" + allocationKey + "|" + executionKey + "|" + vol + "|"
+                + expectedVersion + "|" + actor;
+        return runCommand("GATE_EXECUTE", commandKey, params, ExecutionResponse.class, () -> {
+            if (repository.findExecutionByKey(executionKey) != null) {
+                throw ApiException.conflict("EXECUTION_KEY_REUSED", "executionKey 已被使用: " + executionKey);
+            }
+            AllocationRow allocation = repository.findAllocationByKey(allocationKey);
+            if (allocation == null) {
+                throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+            }
+            // 先锁窗口行，与批准、取消、转让、限供按事务提交顺序串行裁决
+            lockWindowOf(allocation);
+            // 窗口锁内重读申请，避免与取消/转让并发时使用过期状态与持有额度
+            allocation = repository.lockAllocationByKey(allocationKey);
+            BasinRow basin = repository.findBasinByWindowId(allocation.windowId());
+            if (basin == null) {
+                throw ApiException.unprocessable("GATE_NOT_ENABLED", "普通窗口不启用双池规则，不能执行");
+            }
+            if (basin.version() != expectedVersion) {
+                throw ApiException.conflict("VERSION_MISMATCH",
+                        "期望版本 " + expectedVersion + " 与当前双池版本 " + basin.version() + " 不一致");
+            }
+            if (!STATUS_APPROVED.equals(allocation.status())) {
+                throw ApiException.unprocessable("ALLOCATION_NOT_APPROVED",
+                        "只有 APPROVED 状态的申请可以执行，当前状态: " + allocation.status());
+            }
+            BigDecimal remaining = allocation.heldAmount().subtract(allocation.executedAmount());
+            if (remaining.compareTo(BigDecimal.valueOf(vol)) < 0) {
+                throw ApiException.quotaExceeded("累计执行将超过批准量，剩余可执行 " + fmt(remaining));
+            }
+            // 执行前：双池体积须在界内且水位差不得超过 2 米
+            requireBasinStateWithinLimits(basin.upperVolumeM3(), basin.lowerVolumeM3(), basin, "执行前");
+            long upperAfter = basin.upperVolumeM3() - vol;
+            long lowerAfter = basin.lowerVolumeM3() + vol;
+            // 执行后：体积界值与水位差门禁
+            requireBasinStateWithinLimits(upperAfter, lowerAfter, basin, "执行后");
+            long now = nowNanos();
+            repository.updateBasinVolumes(basin.windowId(), upperAfter, lowerAfter, now);
+            repository.incrementExecutedAmount(allocation.id(), BigDecimal.valueOf(vol), now);
+            long newVersion = basin.version() + 1;
+            try {
+                repository.insertExecution(executionKey, basin.windowId(), allocationKey, vol,
+                        basin.upperVolumeM3(), upperAfter, basin.lowerVolumeM3(), lowerAfter,
+                        level(basin.upperVolumeM3(), basin.upperAreaM2()),
+                        level(upperAfter, basin.upperAreaM2()),
+                        level(basin.lowerVolumeM3(), basin.lowerAreaM2()),
+                        level(lowerAfter, basin.lowerAreaM2()),
+                        newVersion, actor, now);
+            } catch (DuplicateKeyException e) {
+                // 并发复用同一 executionKey（换 commandKey）：事务回滚，双池与执行账均不变
+                throw ApiException.conflict("EXECUTION_KEY_REUSED", "executionKey 已被使用: " + executionKey);
+            }
+            return toExecutionResponse(repository.findExecutionByKey(executionKey),
+                    remaining.subtract(BigDecimal.valueOf(vol)));
+        });
+    }
+
+    /** 查询申请的全部执行明细与剩余可执行量。 */
+    public ExecutionListResponse listExecutions(String allocationKey) {
+        AllocationRow allocation = repository.findAllocationByKey(allocationKey);
+        if (allocation == null) {
+            throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+        }
+        BigDecimal remaining = allocation.heldAmount().subtract(allocation.executedAmount());
+        List<ExecutionResponse> executions = repository.listExecutionsByAllocation(allocationKey).stream()
+                .map(row -> toExecutionResponse(row, null)).toList();
+        return new ExecutionListResponse(allocationKey, allocation.windowId(), allocation.status(),
+                fmt(allocation.executedAmount()), fmt(remaining), executions);
+    }
+
+    // ------------------------------------------------------------------
     // 幂等命令框架
     // ------------------------------------------------------------------
 
@@ -378,7 +544,7 @@ public class WaterService {
 
     private AllocationResponse toAllocationResponse(AllocationRow row) {
         return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
-                fmt(row.heldAmount()), row.requester(), row.status(),
+                fmt(row.heldAmount()), fmt(row.executedAmount()), row.requester(), row.status(),
                 toIso(row.createdNanos()), toIso(row.updatedNanos()));
     }
 
@@ -390,6 +556,106 @@ public class WaterService {
     private CurtailmentResponse toCurtailmentResponse(CurtailmentRow row) {
         return new CurtailmentResponse(row.id(), row.windowId(), fmt(row.volume()), row.status(),
                 toIso(row.createdNanos()), row.cancelledNanos() == null ? null : toIso(row.cancelledNanos()));
+    }
+
+    private BasinResponse toBasinResponse(BasinRow row) {
+        return new BasinResponse(row.windowId(), row.upperAreaM2(), row.upperVolumeM3(),
+                row.upperMinM3(), row.upperMaxM3(), fmt(level(row.upperVolumeM3(), row.upperAreaM2())),
+                row.lowerAreaM2(), row.lowerVolumeM3(), row.lowerMinM3(), row.lowerMaxM3(),
+                fmt(level(row.lowerVolumeM3(), row.lowerAreaM2())), row.version(), toIso(row.updatedNanos()));
+    }
+
+    /** 执行明细视图；remaining 为该笔执行后的剩余可执行量，列表场景不关心时传 null。 */
+    private ExecutionResponse toExecutionResponse(ExecutionRow row, BigDecimal remaining) {
+        return new ExecutionResponse(row.executionKey(), row.allocationKey(), row.windowId(), row.volumeM3(),
+                row.upperVolumeBeforeM3(), row.upperVolumeAfterM3(),
+                fmt(row.upperLevelBeforeM()), fmt(row.upperLevelAfterM()),
+                row.lowerVolumeBeforeM3(), row.lowerVolumeAfterM3(),
+                fmt(row.lowerLevelBeforeM()), fmt(row.lowerLevelAfterM()),
+                row.basinVersion(), remaining == null ? null : fmt(remaining), row.actor(),
+                toIso(row.createdNanos()));
+    }
+
+    /** 水位 = 体积 / 面积，单位米；按显示精度舍入，仅用于展示与落库，不参与水位门禁。 */
+    private static BigDecimal level(long volumeM3, long areaM2) {
+        return BigDecimal.valueOf(volumeM3).divide(BigDecimal.valueOf(areaM2), LEVEL_SCALE, RoundingMode.HALF_UP);
+    }
+
+    /**
+     * 水位差门禁：|上池体积/上池面积 - 下池体积/下池面积| <= 2 米。
+     * 全部参数为整数，交叉相乘后按整数值精确比较，显示舍入不参与判断。
+     */
+    private static boolean levelDiffWithin(long upperVolumeM3, long upperAreaM2,
+                                           long lowerVolumeM3, long lowerAreaM2) {
+        BigInteger left = BigInteger.valueOf(upperVolumeM3).multiply(BigInteger.valueOf(lowerAreaM2))
+                .subtract(BigInteger.valueOf(lowerVolumeM3).multiply(BigInteger.valueOf(upperAreaM2))).abs();
+        BigInteger right = BigInteger.valueOf(MAX_LEVEL_DIFF_M)
+                .multiply(BigInteger.valueOf(upperAreaM2)).multiply(BigInteger.valueOf(lowerAreaM2));
+        return left.compareTo(right) <= 0;
+    }
+
+    /** 校验给定双池体积在界内且水位差不超过 2 米，否则 422 且整次执行失败。 */
+    private static void requireBasinStateWithinLimits(long upperVolumeM3, long lowerVolumeM3,
+                                                      BasinRow basin, String phase) {
+        if (upperVolumeM3 < basin.upperMinM3() || upperVolumeM3 > basin.upperMaxM3()) {
+            throw ApiException.unprocessable("BASIN_BOUND_EXCEEDED",
+                    phase + "上池体积 " + upperVolumeM3 + " 越出界值 [" + basin.upperMinM3() + ", "
+                            + basin.upperMaxM3() + "]");
+        }
+        if (lowerVolumeM3 < basin.lowerMinM3() || lowerVolumeM3 > basin.lowerMaxM3()) {
+            throw ApiException.unprocessable("BASIN_BOUND_EXCEEDED",
+                    phase + "下池体积 " + lowerVolumeM3 + " 越出界值 [" + basin.lowerMinM3() + ", "
+                            + basin.lowerMaxM3() + "]");
+        }
+        if (!levelDiffWithin(upperVolumeM3, basin.upperAreaM2(), lowerVolumeM3, basin.lowerAreaM2())) {
+            throw ApiException.unprocessable("WATER_LEVEL_EXCEEDED",
+                    phase + "两池水位差超过 " + MAX_LEVEL_DIFF_M + " 米");
+        }
+    }
+
+    /** 校验登记界值：min <= max 且初始体积在界内。 */
+    private static void requireBounds(String basin, long min, long max, long initial) {
+        if (max < min) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    basin + " 池体积上界 " + max + " 不得小于下界 " + min);
+        }
+        if (initial < min || initial > max) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    basin + " 池初始体积 " + initial + " 须在界值 [" + min + ", " + max + "] 内");
+        }
+    }
+
+    /** 校验正整数（面积等），空或非正返回 400。 */
+    private static long requirePositiveLong(String field, Long value) {
+        if (value == null || value <= 0) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 必须为正整数");
+        }
+        return value;
+    }
+
+    /** 校验非负整数（体积与界值），空或为负返回 400。 */
+    private static long requireNonNegativeLong(String field, Long value) {
+        if (value == null || value < 0) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 必须为非负整数");
+        }
+        return value;
+    }
+
+    /** 解析正整数水量（执行水量，单位立方米）。 */
+    private static long parsePositiveInteger(String field, String value) {
+        if (value == null || !INTEGER_PATTERN.matcher(value.trim()).matches()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 必须为正整数: " + value);
+        }
+        long parsed;
+        try {
+            parsed = Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 超出正整数范围: " + value);
+        }
+        if (parsed <= 0) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 必须为正整数: " + value);
+        }
+        return parsed;
     }
 
     static long nowNanos() {
