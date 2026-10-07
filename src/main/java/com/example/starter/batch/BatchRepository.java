@@ -14,10 +14,10 @@ import java.util.Optional;
 public class BatchRepository {
 
     /**
-     * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
+     * batch 表行记录；id 同时作为同批次事件的提交顺序依据；assayType 为批次检验类型。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, String status, String assayType, String createdAt) {
     }
 
     /**
@@ -25,6 +25,15 @@ public class BatchRepository {
      */
     public record TestRow(long id, String batchKey, String testKey, String testItem,
                           String outcome, String inspector, String createdAt) {
+    }
+
+    /**
+     * sequential_result 表行记录：冻结的单次合成序贯结果（精确分数与结论）。
+     */
+    public record SequentialResultRow(long id, String batchKey, String commandKey, int seq,
+                                      String sample, long numerator, long denominator,
+                                      String conclusion, String batchStatus,
+                                      String inspector, String createdAt) {
     }
 
     /**
@@ -57,12 +66,19 @@ public class BatchRepository {
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
-            rs.getString("status"), rs.getString("created_at"));
+            rs.getString("status"), rs.getString("assay_type"), rs.getString("created_at"));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("test_key"),
             rs.getString("test_item"), rs.getString("outcome"),
             rs.getString("inspector"), rs.getString("created_at"));
+
+    private static final RowMapper<SequentialResultRow> SEQUENTIAL_MAPPER = (rs, n) ->
+            new SequentialResultRow(rs.getLong("id"), rs.getString("batch_key"),
+                    rs.getString("command_key"), rs.getInt("seq"), rs.getString("sample"),
+                    rs.getLong("numerator"), rs.getLong("denominator"),
+                    rs.getString("conclusion"), rs.getString("batch_status"),
+                    rs.getString("inspector"), rs.getString("created_at"));
 
     private static final RowMapper<ApprovalRow> APPROVAL_MAPPER = (rs, n) -> new ApprovalRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("command_key"),
@@ -101,10 +117,10 @@ public class BatchRepository {
     }
 
     public void insertBatch(BatchRow row) {
-        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status,"
+                        + " assay_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(),
-                row.status(), row.createdAt());
+                row.status(), row.assayType(), row.createdAt());
     }
 
     public void insertRequiredTest(String batchKey, String testItem, int seq) {
@@ -208,5 +224,31 @@ public class BatchRepository {
     public List<String> findRecalledKeys() {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
+    }
+
+    /**
+     * 某批次全部合成序贯结果，按连续序号升序（即提交顺序）。
+     */
+    public List<SequentialResultRow> findSequentialResults(String batchKey) {
+        return jdbc.query("SELECT * FROM sequential_result WHERE batch_key = ? ORDER BY seq",
+                SEQUENTIAL_MAPPER, batchKey);
+    }
+
+    /**
+     * 某批次指定序号的合成序贯结果；序号不存在返回空。
+     */
+    public Optional<SequentialResultRow> findSequentialResult(String batchKey, int seq) {
+        return jdbc.query("SELECT * FROM sequential_result WHERE batch_key = ? AND seq = ?",
+                        SEQUENTIAL_MAPPER, batchKey, seq)
+                .stream().findFirst();
+    }
+
+    public void insertSequentialResult(SequentialResultRow row) {
+        jdbc.update("INSERT INTO sequential_result (batch_key, command_key, seq, sample,"
+                        + " numerator, denominator, conclusion, batch_status, inspector, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.commandKey(), row.seq(), row.sample(),
+                row.numerator(), row.denominator(), row.conclusion(), row.batchStatus(),
+                row.inspector(), row.createdAt());
     }
 }

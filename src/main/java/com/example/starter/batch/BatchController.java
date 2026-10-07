@@ -7,6 +7,7 @@ import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
+import com.example.starter.batch.dto.SubmitSequentialRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
@@ -50,6 +51,15 @@ public class BatchController {
     public ResponseEntity<String> submitTest(@PathVariable String batchKey,
                                              @Valid @RequestBody SubmitTestRequest request) {
         return stored(service.submitTest(batchKey, request));
+    }
+
+    /**
+     * 提交合成序贯检验样本结果（GOOD/BAD，序号从 1 连续，最多 10 个）。
+     */
+    @PostMapping("/{batchKey}/sequential-results")
+    public ResponseEntity<String> submitSequential(@PathVariable String batchKey,
+                                                   @Valid @RequestBody SubmitSequentialRequest request) {
+        return stored(service.submitSequential(batchKey, request));
     }
 
     /**

@@ -1,5 +1,6 @@
 package com.example.starter.batch.dto;
 
+import com.example.starter.batch.AssayType;
 import com.example.starter.batch.BatchStatus;
 
 import java.time.Instant;
@@ -7,7 +8,8 @@ import java.util.List;
 
 /**
  * 拆分响应。父批状态落定 SPLIT；子批初始 QUARANTINED，继承父批产品编码、
- * 生产 UTC 时间与必做检验项，不继承检验或批准记录。splitAt 为 UTC instant。
+ * 生产 UTC 时间、必做检验项与检验类型（SEQUENTIAL 子批似然比从 1 独立重检，不继承父比值），
+ * 不继承检验或批准记录。splitAt 为 UTC instant。
  */
 public record SplitResponse(
         String parentBatchKey,
@@ -26,7 +28,8 @@ public record SplitResponse(
             Instant producedAt,
             BatchStatus status,
             List<String> requiredTests,
-            Instant createdAt
+            Instant createdAt,
+            AssayType assayType
     ) {
     }
 }
