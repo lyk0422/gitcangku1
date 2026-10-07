@@ -2,7 +2,9 @@ package com.example.starter.race.persistence;
 
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
+import com.example.starter.race.domain.RaceMode;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.RulingStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -30,6 +32,16 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final PursuitPairRowMapper PURSUIT_PAIR_ROW_MAPPER = new PursuitPairRowMapper();
+    private static final TrajectoryRowMapper TRAJECTORY_ROW_MAPPER = new TrajectoryRowMapper();
+    private static final TrajectorySampleRowMapper TRAJECTORY_SAMPLE_ROW_MAPPER =
+            new TrajectorySampleRowMapper();
+    private static final PursuitRulingRowMapper PURSUIT_RULING_ROW_MAPPER =
+            new PursuitRulingRowMapper();
+    private static final SnapshotTrajectoryRowMapper SNAPSHOT_TRAJECTORY_ROW_MAPPER =
+            new SnapshotTrajectoryRowMapper();
+    private static final SnapshotRulingRowMapper SNAPSHOT_RULING_ROW_MAPPER =
+            new SnapshotRulingRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -40,7 +52,7 @@ public class RaceRepository {
     /** 按ID查询赛事。 */
     public Optional<RaceRow> findRace(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ?",
+                .query("SELECT race_id, version, status, mode, created_at FROM race WHERE race_id = ?",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -53,7 +65,7 @@ public class RaceRepository {
      */
     public Optional<RaceRow> findRaceForUpdate(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ? FOR UPDATE",
+                .query("SELECT race_id, version, status, mode, created_at FROM race WHERE race_id = ? FOR UPDATE",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -216,11 +228,19 @@ public class RaceRepository {
                 entries, checkpoints));
     }
 
-    /** 新建赛事，初始版本1、状态OPEN。 */
+    /** 新建赛事，初始版本1、状态OPEN、模式STANDARD。 */
     public void insertRace(String raceId, long now) {
         jdbcTemplate.update(
-                "INSERT INTO race (race_id, version, status, created_at) VALUES (?, 1, 'OPEN', ?)",
+                "INSERT INTO race (race_id, version, status, mode, created_at) "
+                        + "VALUES (?, 1, 'OPEN', 'STANDARD', ?)",
                 raceId, now);
+    }
+
+    /** 将赛事模式切换为 PURSUIT（仅允许在 OPEN 且无任何计时/轨迹数据前执行一次）。 */
+    public void markRacePursuit(String raceId) {
+        jdbcTemplate.update(
+                "UPDATE race SET mode = 'PURSUIT' WHERE race_id = ?",
+                raceId);
     }
 
     /** 登记选手；finishTimeMs 为 null 表示计时缺失。 */
@@ -368,12 +388,245 @@ public class RaceRepository {
                 responseStatus, responseBody, requestId);
     }
 
+    /** 查询赛事全部追逐对声明，按 pairId 字典序排列；非 PURSUIT 赛事为空列表。 */
+    public List<PursuitPairRow> findPursuitPairs(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, pair_id, pursuer_bib, pursued_bib, pursuer_start_mm, pursued_start_mm, "
+                        + "created_at FROM pursuit_pair WHERE race_id = ? ORDER BY pair_id",
+                PURSUIT_PAIR_ROW_MAPPER, raceId);
+    }
+
+    /** 按赛事与追逐对ID查询声明。 */
+    public Optional<PursuitPairRow> findPursuitPair(String raceId, String pairId) {
+        return jdbcTemplate
+                .query("SELECT race_id, pair_id, pursuer_bib, pursued_bib, pursuer_start_mm, "
+                                + "pursued_start_mm, created_at "
+                                + "FROM pursuit_pair WHERE race_id = ? AND pair_id = ?",
+                        PURSUIT_PAIR_ROW_MAPPER, raceId, pairId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 一次性写入追逐对声明（启用 PURSUIT 模式时固定，之后不可修改）。 */
+    public void insertPursuitPairs(List<PursuitPairRow> rows) {
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO pursuit_pair "
+                        + "(race_id, pair_id, pursuer_bib, pursued_bib, pursuer_start_mm, pursued_start_mm, "
+                        + "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rows,
+                rows.size(),
+                (ps, row) -> {
+                    ps.setString(1, row.raceId());
+                    ps.setString(2, row.pairId());
+                    ps.setString(3, row.pursuerBib());
+                    ps.setString(4, row.pursuedBib());
+                    ps.setLong(5, row.pursuerStartMm());
+                    ps.setLong(6, row.pursuedStartMm());
+                    ps.setLong(7, row.createdAt());
+                });
+    }
+
+    /** 按赛事与参赛号查询轨迹头。 */
+    public Optional<TrajectoryRow> findTrajectory(String raceId, String bib) {
+        return jdbcTemplate
+                .query("SELECT race_id, bib, version, sample_count, operator, updated_at "
+                                + "FROM trajectory WHERE race_id = ? AND bib = ?",
+                        TRAJECTORY_ROW_MAPPER, raceId, bib)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事全部轨迹头，按参赛号字典序排列。 */
+    public List<TrajectoryRow> findTrajectories(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, bib, version, sample_count, operator, updated_at "
+                        + "FROM trajectory WHERE race_id = ? ORDER BY bib",
+                TRAJECTORY_ROW_MAPPER, raceId);
+    }
+
+    /** 新建轨迹头（版本1）。 */
+    public void insertTrajectory(String raceId, String bib, int sampleCount, String operator, long now) {
+        jdbcTemplate.update(
+                "INSERT INTO trajectory (race_id, bib, version, sample_count, operator, updated_at) "
+                        + "VALUES (?, ?, 1, ?, ?, ?)",
+                raceId, bib, sampleCount, operator, now);
+    }
+
+    /** 推进轨迹版本并替换采样点数；返回受影响行数（0 表示轨迹不存在）。 */
+    public int bumpTrajectoryVersion(
+            String raceId, String bib, int expectedVersion, int sampleCount, String operator, long now) {
+        return jdbcTemplate.update(
+                "UPDATE trajectory SET version = version + 1, sample_count = ?, operator = ?, "
+                        + "updated_at = ? WHERE race_id = ? AND bib = ? AND version = ?",
+                sampleCount, operator, now, raceId, bib, expectedVersion);
+    }
+
+    /** 查询轨迹当前版本全部采样点，按 seq 升序。 */
+    public List<TrajectorySampleRow> findTrajectorySamples(String raceId, String bib) {
+        return jdbcTemplate.query(
+                "SELECT race_id, bib, seq, elapsed_ms, progress_mm "
+                        + "FROM trajectory_sample WHERE race_id = ? AND bib = ? ORDER BY seq",
+                TRAJECTORY_SAMPLE_ROW_MAPPER, raceId, bib);
+    }
+
+    /** 查询赛事全部轨迹采样点，按参赛号与 seq 升序（用于封榜固化完整点）。 */
+    public List<TrajectorySampleRow> findAllTrajectorySamples(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, bib, seq, elapsed_ms, progress_mm "
+                        + "FROM trajectory_sample WHERE race_id = ? ORDER BY bib, seq",
+                TRAJECTORY_SAMPLE_ROW_MAPPER, raceId);
+    }
+
+    /** 整体替换轨迹采样点（同事务内先删后插，旧版本采样不保留）。 */
+    public void replaceTrajectorySamples(String raceId, String bib, List<TrajectorySampleRow> rows) {
+        jdbcTemplate.update(
+                "DELETE FROM trajectory_sample WHERE race_id = ? AND bib = ?", raceId, bib);
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO trajectory_sample (race_id, bib, seq, elapsed_ms, progress_mm) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                rows,
+                rows.size(),
+                (ps, row) -> {
+                    ps.setString(1, row.raceId());
+                    ps.setString(2, row.bib());
+                    ps.setInt(3, row.seq());
+                    ps.setLong(4, row.elapsedMs());
+                    ps.setLong(5, row.progressMm());
+                });
+    }
+
+    /** 查询追逐对的当前有效裁定。 */
+    public Optional<PursuitRulingRow> findCurrentRuling(String raceId, String pairId) {
+        return jdbcTemplate
+                .query("SELECT ruling_id, race_id, pair_id, pursuer_trajectory_version, "
+                                + "pursued_trajectory_version, catch_time_num, catch_time_den, status, "
+                                + "operator, created_at "
+                                + "FROM pursuit_ruling WHERE race_id = ? AND pair_id = ? AND status = 'CURRENT'",
+                        PURSUIT_RULING_ROW_MAPPER, raceId, pairId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 按全局裁定ID查询裁定（用于 rulingId 幂等重放）。 */
+    public Optional<PursuitRulingRow> findRuling(String rulingId) {
+        return jdbcTemplate
+                .query("SELECT ruling_id, race_id, pair_id, pursuer_trajectory_version, "
+                                + "pursued_trajectory_version, catch_time_num, catch_time_den, status, "
+                                + "operator, created_at "
+                                + "FROM pursuit_ruling WHERE ruling_id = ?",
+                        PURSUIT_RULING_ROW_MAPPER, rulingId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询赛事全部当前有效裁定，按 pairId 字典序排列。 */
+    public List<PursuitRulingRow> findCurrentRulings(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT ruling_id, race_id, pair_id, pursuer_trajectory_version, "
+                        + "pursued_trajectory_version, catch_time_num, catch_time_den, status, "
+                        + "operator, created_at "
+                        + "FROM pursuit_ruling WHERE race_id = ? AND status = 'CURRENT' ORDER BY pair_id",
+                PURSUIT_RULING_ROW_MAPPER, raceId);
+    }
+
+    /** 新增裁定（初始状态 CURRENT）。 */
+    public void insertRuling(PursuitRulingRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO pursuit_ruling "
+                        + "(ruling_id, race_id, pair_id, pursuer_trajectory_version, "
+                        + "pursued_trajectory_version, catch_time_num, catch_time_den, status, "
+                        + "operator, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, 'CURRENT', ?, ?)",
+                row.rulingId(), row.raceId(), row.pairId(), row.pursuerTrajectoryVersion(),
+                row.pursuedTrajectoryVersion(), row.catchTimeNum(), row.catchTimeDen(),
+                row.operator(), row.createdAt());
+    }
+
+    /** 将追逐对的当前裁定置为 SUPERSEDED（轨迹更正时调用）；返回受影响行数。 */
+    public int supersedeCurrentRuling(String raceId, String pairId) {
+        return jdbcTemplate.update(
+                "UPDATE pursuit_ruling SET status = 'SUPERSEDED' "
+                        + "WHERE race_id = ? AND pair_id = ? AND status = 'CURRENT'",
+                raceId, pairId);
+    }
+
+    /** 将赛事内涉及指定选手的全部当前裁定置为 SUPERSEDED；返回受影响行数。 */
+    public int supersedeRulingsForBib(String raceId, String bib) {
+        return jdbcTemplate.update(
+                "UPDATE pursuit_ruling SET status = 'SUPERSEDED' "
+                        + "WHERE race_id = ? AND status = 'CURRENT' AND pair_id IN "
+                        + "(SELECT pair_id FROM pursuit_pair WHERE race_id = ? "
+                        + "AND (pursuer_bib = ? OR pursued_bib = ?))",
+                raceId, raceId, bib, bib);
+    }
+
+    /** 封榜同事务固化轨迹完整采样点。 */
+    public void insertSnapshotTrajectories(List<SnapshotTrajectoryRow> rows) {
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO result_snapshot_trajectory "
+                        + "(race_id, bib, trajectory_version, seq, elapsed_ms, progress_mm) "
+                        + "VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+                rows.size(),
+                (ps, row) -> {
+                    ps.setString(1, row.raceId());
+                    ps.setString(2, row.bib());
+                    ps.setInt(3, row.trajectoryVersion());
+                    ps.setInt(4, row.seq());
+                    ps.setLong(5, row.elapsedMs());
+                    ps.setLong(6, row.progressMm());
+                });
+    }
+
+    /** 封榜同事务固化追逐对当前裁定（交会分数）。 */
+    public void insertSnapshotRulings(List<SnapshotRulingRow> rows) {
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO result_snapshot_ruling "
+                        + "(race_id, pair_id, ruling_id, pursuer_trajectory_version, "
+                        + "pursued_trajectory_version, catch_time_num, catch_time_den) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rows,
+                rows.size(),
+                (ps, row) -> {
+                    ps.setString(1, row.raceId());
+                    ps.setString(2, row.pairId());
+                    ps.setString(3, row.rulingId());
+                    ps.setInt(4, row.pursuerTrajectoryVersion());
+                    ps.setInt(5, row.pursuedTrajectoryVersion());
+                    ps.setString(6, row.catchTimeNum());
+                    ps.setString(7, row.catchTimeDen());
+                });
+    }
+
+    /** 查询封榜固化的轨迹完整采样点，按参赛号与 seq 升序。 */
+    public List<SnapshotTrajectoryRow> findSnapshotTrajectories(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, bib, trajectory_version, seq, elapsed_ms, progress_mm "
+                        + "FROM result_snapshot_trajectory WHERE race_id = ? ORDER BY bib, seq",
+                SNAPSHOT_TRAJECTORY_ROW_MAPPER, raceId);
+    }
+
+    /** 查询封榜固化的追逐对裁定，按 pairId 字典序排列。 */
+    public List<SnapshotRulingRow> findSnapshotRulings(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, pair_id, ruling_id, pursuer_trajectory_version, "
+                        + "pursued_trajectory_version, catch_time_num, catch_time_den "
+                        + "FROM result_snapshot_ruling WHERE race_id = ? ORDER BY pair_id",
+                SNAPSHOT_RULING_ROW_MAPPER, raceId);
+    }
+
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM result_snapshot_ruling");
+        jdbcTemplate.update("DELETE FROM result_snapshot_trajectory");
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
+        jdbcTemplate.update("DELETE FROM pursuit_ruling");
+        jdbcTemplate.update("DELETE FROM trajectory_sample");
+        jdbcTemplate.update("DELETE FROM trajectory");
+        jdbcTemplate.update("DELETE FROM pursuit_pair");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
@@ -388,6 +641,7 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getInt("version"),
                     RaceStatus.valueOf(rs.getString("status")),
+                    RaceMode.valueOf(rs.getString("mode")),
                     rs.getLong("created_at"));
         }
     }
@@ -488,6 +742,90 @@ public class RaceRepository {
                     rs.getInt("response_status"),
                     rs.getString("response_body"),
                     rs.getLong("created_at"));
+        }
+    }
+
+    private static final class PursuitPairRowMapper implements RowMapper<PursuitPairRow> {
+        @Override
+        public PursuitPairRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new PursuitPairRow(
+                    rs.getString("race_id"),
+                    rs.getString("pair_id"),
+                    rs.getString("pursuer_bib"),
+                    rs.getString("pursued_bib"),
+                    rs.getLong("pursuer_start_mm"),
+                    rs.getLong("pursued_start_mm"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class TrajectoryRowMapper implements RowMapper<TrajectoryRow> {
+        @Override
+        public TrajectoryRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new TrajectoryRow(
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getInt("version"),
+                    rs.getInt("sample_count"),
+                    rs.getString("operator"),
+                    rs.getLong("updated_at"));
+        }
+    }
+
+    private static final class TrajectorySampleRowMapper implements RowMapper<TrajectorySampleRow> {
+        @Override
+        public TrajectorySampleRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new TrajectorySampleRow(
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getInt("seq"),
+                    rs.getLong("elapsed_ms"),
+                    rs.getLong("progress_mm"));
+        }
+    }
+
+    private static final class PursuitRulingRowMapper implements RowMapper<PursuitRulingRow> {
+        @Override
+        public PursuitRulingRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new PursuitRulingRow(
+                    rs.getString("ruling_id"),
+                    rs.getString("race_id"),
+                    rs.getString("pair_id"),
+                    rs.getInt("pursuer_trajectory_version"),
+                    rs.getInt("pursued_trajectory_version"),
+                    rs.getString("catch_time_num"),
+                    rs.getString("catch_time_den"),
+                    RulingStatus.valueOf(rs.getString("status")),
+                    rs.getString("operator"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class SnapshotTrajectoryRowMapper
+            implements RowMapper<SnapshotTrajectoryRow> {
+        @Override
+        public SnapshotTrajectoryRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new SnapshotTrajectoryRow(
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getInt("trajectory_version"),
+                    rs.getInt("seq"),
+                    rs.getLong("elapsed_ms"),
+                    rs.getLong("progress_mm"));
+        }
+    }
+
+    private static final class SnapshotRulingRowMapper implements RowMapper<SnapshotRulingRow> {
+        @Override
+        public SnapshotRulingRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new SnapshotRulingRow(
+                    rs.getString("race_id"),
+                    rs.getString("pair_id"),
+                    rs.getString("ruling_id"),
+                    rs.getInt("pursuer_trajectory_version"),
+                    rs.getInt("pursued_trajectory_version"),
+                    rs.getString("catch_time_num"),
+                    rs.getString("catch_time_den"));
         }
     }
 }

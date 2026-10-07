@@ -3,6 +3,8 @@ package com.example.starter.race.service;
 import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.EnablePursuitRequest;
+import com.example.starter.race.api.PursuitRulingsResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
@@ -10,6 +12,8 @@ import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.SubmitRulingRequest;
+import com.example.starter.race.api.SubmitSamplesRequest;
 import com.example.starter.race.api.SubmitTimingRequest;
 
 /**
@@ -59,4 +63,25 @@ public interface RaceService {
 
     /** 查询赛事全部选手缺失检查点汇总，按参赛号与检查点顺序稳定返回；只读。 */
     MissingCheckpointsResponse getMissingCheckpoints(String raceId);
+
+    /**
+     * 启用追逐赛（PURSUIT）模式：仅计时前可执行一次，固定1~5个追逐对及起始距离；
+     * 启用后旧单条成绩入口（登记带成绩/计时修订/分段提交）对该赛事一律拒绝。
+     */
+    ServiceResult enablePursuit(String raceId, EnablePursuitRequest request);
+
+    /**
+     * 提交/更正选手轨迹采样：整体替换采样集合并推进轨迹版本，
+     * 成功后该选手涉及的旧裁定失效；版本不匹配返回409。
+     */
+    ServiceResult submitSamples(String raceId, String bib, SubmitSamplesRequest request);
+
+    /**
+     * 显式裁定：按双方当前轨迹版本在公共区间内求最早交会时刻（精确有理数）；
+     * 未交会返回422且不产生裁定，轨迹版本不匹配返回409。
+     */
+    ServiceResult submitRuling(String raceId, SubmitRulingRequest request);
+
+    /** 查询赛事全部当前有效裁定，按 pairId 字典序稳定返回；只读。 */
+    PursuitRulingsResponse getPursuitRulings(String raceId);
 }

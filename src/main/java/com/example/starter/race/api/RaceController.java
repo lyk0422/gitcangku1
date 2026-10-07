@@ -113,6 +113,37 @@ public class RaceController {
         return raceService.getMissingCheckpoints(raceId);
     }
 
+    /** 启用追逐赛（PURSUIT）模式并固定追逐对。 */
+    @PostMapping("/{raceId}/pursuit")
+    public ResponseEntity<Object> enablePursuit(
+            @PathVariable String raceId,
+            @Valid @RequestBody EnablePursuitRequest request) {
+        return toResponse(raceService.enablePursuit(raceId, request));
+    }
+
+    /** 提交/更正选手轨迹采样（整体替换并推进轨迹版本）。 */
+    @PostMapping("/{raceId}/pursuit/trajectories/{bib}/samples")
+    public ResponseEntity<Object> submitSamples(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody SubmitSamplesRequest request) {
+        return toResponse(raceService.submitSamples(raceId, bib, request));
+    }
+
+    /** 提交追逐对显式裁定。 */
+    @PostMapping("/{raceId}/pursuit/rulings")
+    public ResponseEntity<Object> submitRuling(
+            @PathVariable String raceId,
+            @Valid @RequestBody SubmitRulingRequest request) {
+        return toResponse(raceService.submitRuling(raceId, request));
+    }
+
+    /** 查询赛事全部当前有效裁定。 */
+    @GetMapping("/{raceId}/pursuit/rulings")
+    public PursuitRulingsResponse getPursuitRulings(@PathVariable String raceId) {
+        return raceService.getPursuitRulings(raceId);
+    }
+
     private ResponseEntity<Object> toResponse(ServiceResult result) {
         return ResponseEntity.status(result.status()).body(result.body());
     }
