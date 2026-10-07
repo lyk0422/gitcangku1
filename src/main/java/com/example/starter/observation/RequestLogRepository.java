@@ -55,4 +55,11 @@ public class RequestLogRepository {
                 "UPDATE request_log SET response_status = ?, response_body = ? WHERE request_id = ?",
                 responseStatus, responseBody, requestId);
     }
+
+    /**
+     * 删除占位记录：仅用于圆弧合并冲突场景——冲突标记需随事务提交，但失败请求不得占用 requestId 键。
+     */
+    public void delete(String requestId) {
+        jdbcTemplate.update("DELETE FROM request_log WHERE request_id = ?", requestId);
+    }
 }

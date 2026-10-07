@@ -13,7 +13,7 @@ public class ApiException extends RuntimeException {
     private final List<String> conflictFields;
     private final Integer currentVersion;
 
-    private ApiException(HttpStatus status, String message, List<String> conflictFields, Integer currentVersion) {
+    protected ApiException(HttpStatus status, String message, List<String> conflictFields, Integer currentVersion) {
         super(message);
         this.status = status;
         this.conflictFields = conflictFields;
@@ -67,5 +67,12 @@ public class ApiException extends RuntimeException {
      */
     public static ApiException gone(String message) {
         return new ApiException(HttpStatus.GONE, message, null, null);
+    }
+
+    /**
+     * 422：业务规则拒绝（圆弧交集为空且不留裁定、引用墓碑或存在未解决冲突的观测、基线为墓碑版本）。
+     */
+    public static ApiException unprocessableEntity(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message, null, null);
     }
 }

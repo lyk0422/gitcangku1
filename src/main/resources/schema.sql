@@ -29,9 +29,9 @@ CREATE TABLE IF NOT EXISTS observation_version (
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
     fingerprint VARCHAR(128) NOT NULL COMMENT '请求操作与参数的指纹，同键异参时判定 409',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：CREATE / MERGE / DELETE / RESOLVE / ARC_CREATE / ARC_MERGE / ARC_DELETE / ARC_RESOLVE / ARC_ADJUDICATE',
     response_status INT NULL COMMENT '成功响应的 HTTP 状态码；提交过程中暂为 NULL',
-    response_body VARCHAR(4000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
+    response_body VARCHAR(16000) NULL COMMENT '成功响应体（JSON 原文），用于同键同参重放；提交过程中暂为 NULL',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '请求记录创建时间（服务器时区）',
     PRIMARY KEY (request_id)
 );
@@ -58,4 +58,71 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 不设置指向 observation_current 的外键：观测记录删除仅置墓碑（当前行保留），
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
+);
+
+-- 圆弧观测记录当前状态表：方位误差区间（圆周区间）类型观测，每条记录一行，version 从 1 开始单调递增。
+CREATE TABLE IF NOT EXISTS arc_observation_current (
+    observation_id VARCHAR(64) NOT NULL COMMENT '圆弧观测记录唯一标识',
+    version INT NOT NULL COMMENT '当前版本号，从 1 开始',
+    deleted BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已删除：TRUE 表示当前状态为删除墓碑',
+    conflict_pending BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否存在未解决冲突：TRUE 时禁止参与裁定，人工裁决后清除',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次变更时间（服务器时区，Asia/Shanghai）',
+    PRIMARY KEY (observation_id)
+);
+
+-- 圆弧观测版本头表：每次成功变更（创建/合并/删除/人工裁决）追加一行，历史永不删除。
+CREATE TABLE IF NOT EXISTS arc_observation_version (
+    observation_id VARCHAR(64) NOT NULL COMMENT '圆弧观测记录唯一标识',
+    version INT NOT NULL COMMENT '版本号，从 1 开始，与 arc_observation_current.version 对应',
+    deleted BOOLEAN NOT NULL COMMENT '该版本是否为删除墓碑：TRUE 时无圆弧分量行',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '该版本生成时间（服务器时区）',
+    PRIMARY KEY (observation_id, version)
+);
+
+-- 圆弧分量表：每个版本的全部圆弧分量，按起始角升序存储；每条圆弧是完整字段组，不可拆分。
+CREATE TABLE IF NOT EXISTS arc_observation_arc (
+    observation_id VARCHAR(64) NOT NULL COMMENT '圆弧观测记录唯一标识',
+    version INT NOT NULL COMMENT '版本号，与 arc_observation_version 对应',
+    arc_index INT NOT NULL COMMENT '版本内分量序号，按起始角升序从 0 开始',
+    start_angle INT NOT NULL COMMENT '圆弧起始角，单位千分之一度，取值 0 至 359999',
+    arc_length INT NOT NULL COMMENT '正向弧长，单位千分之一度，取值 1 至 180000；区间含两端，按模 360000 绕回',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '分量落库时间（服务器时区）',
+    PRIMARY KEY (observation_id, version, arc_index)
+);
+
+-- 圆弧裁定记录表：一次裁定的不可变结果头，成功裁定后原子写入，后续修订不倒改。
+CREATE TABLE IF NOT EXISTS arc_adjudication (
+    adjudication_id VARCHAR(128) NOT NULL COMMENT '全局唯一裁定标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '生成该裁定的请求标识（requestId）',
+    operator VARCHAR(128) NOT NULL COMMENT '执行裁定的操作者标识（非空）',
+    adjudicated_at_utc TIMESTAMP NOT NULL COMMENT '裁定完成时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (adjudication_id)
+);
+
+-- 裁定引用源表：裁定引用的全部当前版本，字段身份与源版本不可省，不可变。
+CREATE TABLE IF NOT EXISTS arc_adjudication_source (
+    adjudication_id VARCHAR(128) NOT NULL COMMENT '裁定标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '引用的圆弧观测记录唯一标识（字段身份）',
+    source_version INT NOT NULL COMMENT '引用的源版本号，裁定时等于该记录当前版本',
+    PRIMARY KEY (adjudication_id, observation_id)
+);
+
+-- 裁定源圆弧冻结表：裁定时各引用版本的原始圆弧分量完整快照，不可变。
+CREATE TABLE IF NOT EXISTS arc_adjudication_source_arc (
+    adjudication_id VARCHAR(128) NOT NULL COMMENT '裁定标识',
+    observation_id VARCHAR(64) NOT NULL COMMENT '引用的圆弧观测记录唯一标识',
+    arc_index INT NOT NULL COMMENT '源版本内分量序号，按起始角升序从 0 开始',
+    start_angle INT NOT NULL COMMENT '源圆弧起始角，单位千分之一度，0 至 359999',
+    arc_length INT NOT NULL COMMENT '源圆弧正向弧长，单位千分之一度，1 至 180000',
+    PRIMARY KEY (adjudication_id, observation_id, arc_index)
+);
+
+-- 裁定交集分量表：全部圆弧交集的分量，相接的跨零片段已合为一个圆弧，按起始角升序，不可变。
+CREATE TABLE IF NOT EXISTS arc_adjudication_component (
+    adjudication_id VARCHAR(128) NOT NULL COMMENT '裁定标识',
+    component_index INT NOT NULL COMMENT '交集分量序号，按起始角升序从 0 开始',
+    start_angle INT NOT NULL COMMENT '交集分量起始角，单位千分之一度，0 至 359999',
+    arc_length INT NOT NULL COMMENT '交集分量正向弧长，单位千分之一度；退化单点为 1，区间含两端按模 360000 绕回',
+    PRIMARY KEY (adjudication_id, component_index)
 );
