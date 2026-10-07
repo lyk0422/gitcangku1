@@ -214,6 +214,16 @@ public class PlanRepository {
     }
 
     /**
+     * 统计计划内指定实际状态的占用条数，用于取消/改签前校验。
+     */
+    public int countOccupanciesByActualStatus(long planId, String actualStatus) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM rail_plan_occupancy WHERE plan_id = ? AND actual_status = ?",
+                Integer.class, planId, actualStatus);
+        return count == null ? 0 : count;
+    }
+
+    /**
      * 获取发布全局互斥锁（单行 FOR UPDATE），串行化所有发布事务。
      */
     public void acquirePublishLock() {

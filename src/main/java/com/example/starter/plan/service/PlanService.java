@@ -174,6 +174,8 @@ public class PlanService {
 
     /**
      * 取消已发布计划：时隙立即释放，历史计划与占用保留不改写。
+     * 含 INSIDE 占用的计划不能取消；含 EXITED 的计划可取消，仅撤销未进入部分，
+     * 实际进出轨迹保留不删除。与进入/驶出/改签共用全局发布锁串行校验。
      */
     public PlanResponse cancel(String scheduleKey, String requestKey) {
         String hash = hashAction(OP_CANCEL, scheduleKey);
@@ -183,11 +185,16 @@ public class PlanService {
         }
         try {
             return tx.execute(status -> {
+                planRepo.acquirePublishLock();
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.PUBLISHED) {
                     throw conflict("PLAN_STATE_CONFLICT",
                             "仅已发布计划可取消，当前状态: " + plan.status());
+                }
+                if (planRepo.countOccupanciesByActualStatus(plan.id(), "INSIDE") > 0) {
+                    throw conflict("PLAN_HAS_INSIDE_OCCUPANCY",
+                            "计划存在未驶出占用，不能取消: " + scheduleKey);
                 }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.CANCELLED, now);
@@ -243,6 +250,14 @@ public class PlanService {
                 if (!oldPlan.opDate().equals(newPlan.opDate())) {
                     throw conflict("OP_DATE_MISMATCH",
                             "新旧计划运营日必须相同: 旧=" + oldPlan.opDate() + " 新=" + newPlan.opDate());
+                }
+                if (planRepo.countOccupanciesByActualStatus(oldPlan.id(), "INSIDE") > 0) {
+                    throw conflict("PLAN_HAS_INSIDE_OCCUPANCY",
+                            "旧计划存在未驶出占用，不能改签: " + oldScheduleKey);
+                }
+                if (planRepo.countOccupanciesByActualStatus(oldPlan.id(), "EXITED") > 0) {
+                    throw conflict("PLAN_HAS_EXITED_OCCUPANCY",
+                            "旧计划存在已驶出占用，不能改签: " + oldScheduleKey);
                 }
                 if (planRepo.findLinkByPredecessor(oldPlan.id()).isPresent()) {
                     throw conflict("LINK_CONFLICT", "旧计划已存在直接后继: " + oldScheduleKey);
