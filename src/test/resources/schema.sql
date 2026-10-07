@@ -99,3 +99,27 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS task_guardians (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    guardian_one VARCHAR(128) NOT NULL,
+    guardian_two VARCHAR(128) NOT NULL,
+    version INT NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_task_guardian UNIQUE (task_id)
+);
+
+CREATE TABLE IF NOT EXISTS task_attendance (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    guardian VARCHAR(128) NOT NULL,
+    generation INT NOT NULL,
+    issued_at TIMESTAMP(6) NOT NULL,
+    expires_at TIMESTAMP(6) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    revoked_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_task_attendance_generation UNIQUE (task_id, guardian, generation)
+);

@@ -78,4 +78,19 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /**
+     * 在场凭证视图：generation 从 1 开始；有效期为 [issuedAt, expiresAt)（60 秒，左闭右开）；
+     * revokedAt 仅 REVOKED 有值；FROZEN 的签发/到期时刻保持不变作为完成证据。
+     */
+    public record AttendanceView(String guardian, int generation, Instant issuedAt,
+                                 Instant expiresAt, String status, Instant revokedAt) {
+    }
+
+    /**
+     * 双人监护配置视图：attendances 为双方全部代次凭证，按监护人、代次升序返回。
+     */
+    public record GuardianView(String taskKey, String guardianOne, String guardianTwo,
+                               int version, List<AttendanceView> attendances) {
+    }
 }

@@ -1,18 +1,24 @@
 package com.example.starter.incident;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.AttendanceRevokeRequest;
+import com.example.starter.incident.dto.Requests.AttendanceSignRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.GuardianEnableRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
+import com.example.starter.incident.dto.Requests.TaskCompleteRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.AttendanceView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
+import com.example.starter.incident.dto.Responses.GuardianView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
@@ -170,12 +176,13 @@ public class IncidentController {
     }
 
     /**
-     * 完成任务（仅当前指挥人；全部阻塞解除后才可完成）。
+     * 完成任务（仅当前指挥人；全部阻塞解除后才可完成）。双人监护任务须在请求体中
+     * 显式给出 expectedVersion 与双方当前 attendances 代次；非监护任务可只给 commandKey。
      */
     @PostMapping("/{incidentKey}/tasks/{taskKey}/complete")
     public TaskView completeTask(@PathVariable String incidentKey, @PathVariable String taskKey,
                                  @RequestHeader("X-Actor-Id") String actor,
-                                 @RequestBody TaskActionRequest req) {
+                                 @RequestBody TaskCompleteRequest req) {
         return service.completeTask(incidentKey, taskKey, actor, req);
     }
 
@@ -187,5 +194,48 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 为 OPEN 任务启用双人监护（仅当前指挥人；固定两个不同合成操作者，版本从 1 开始）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/guardians")
+    public GuardianView enableGuardianship(@PathVariable String incidentKey,
+                                           @PathVariable String taskKey,
+                                           @RequestHeader("X-Actor-Id") String actor,
+                                           @RequestBody GuardianEnableRequest req) {
+        return service.enableGuardianship(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 查询任务双人监护配置与双方全部代次在场凭证（只读）。
+     */
+    @GetMapping("/{incidentKey}/tasks/{taskKey}/guardians")
+    public GuardianView getGuardianship(@PathVariable String incidentKey,
+                                        @PathVariable String taskKey) {
+        return service.getGuardianship(incidentKey, taskKey);
+    }
+
+    /**
+     * 在场签到（仅固定监护人本人；签发服务器 UTC 时刻起 60 秒有效凭证，
+     * 区间左闭右开，重新签到推进本人代次并使前代失效）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/attendance/sign")
+    public AttendanceView signAttendance(@PathVariable String incidentKey,
+                                         @PathVariable String taskKey,
+                                         @RequestHeader("X-Actor-Id") String actor,
+                                         @RequestBody AttendanceSignRequest req) {
+        return service.signAttendance(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 撤销在场凭证（仅当前指挥人；被撤销监护人的当前 ACTIVE 凭证立即永久失效）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/attendance/revoke")
+    public AttendanceView revokeAttendance(@PathVariable String incidentKey,
+                                           @PathVariable String taskKey,
+                                           @RequestHeader("X-Actor-Id") String actor,
+                                           @RequestBody AttendanceRevokeRequest req) {
+        return service.revokeAttendance(incidentKey, taskKey, actor, req);
     }
 }

@@ -55,4 +55,35 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 启用双人监护请求：两个固定合成操作者必须非空且互不相同；启用后不可更换。
+     */
+    public record GuardianEnableRequest(String commandKey, String guardianOne, String guardianTwo) {
+    }
+
+    /** 在场签到请求：操作人由 X-Actor-Id 指定且必须为固定监护人本人。 */
+    public record AttendanceSignRequest(String commandKey) {
+    }
+
+    /**
+     * 撤销在场凭证请求：guardian 为被撤销的固定监护人；操作人由 X-Actor-Id 指定
+     * 且必须为当前指挥人。
+     */
+    public record AttendanceRevokeRequest(String commandKey, String guardian) {
+    }
+
+    /**
+     * 完成时引用的单方当前凭证：guardian 为固定监护人，generation 为其当前凭证代次。
+     */
+    public record AttendanceRef(String guardian, Integer generation) {
+    }
+
+    /**
+     * 双人监护任务完成请求：expectedVersion 为监护配置期望版本（当前固定为 1），
+     * attendances 须显式引用双方当前代次；非监护任务两者均留空。
+     */
+    public record TaskCompleteRequest(String commandKey, Integer expectedVersion,
+                                      List<AttendanceRef> attendances) {
+    }
 }

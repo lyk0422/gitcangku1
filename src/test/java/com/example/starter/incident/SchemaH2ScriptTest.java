@@ -108,6 +108,56 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 双人监护配置：task_id 唯一，版本从 1 开始
+                st.execute("INSERT INTO task_guardians (task_id, guardian_one, guardian_two,"
+                        + " version, created_by, created_at) VALUES (1,'synth-exec','synth-watch',"
+                        + "1,'alice','" + Timestamp.from(now) + "')");
+                boolean duplicateGuardianRejected = false;
+                try {
+                    st.execute("INSERT INTO task_guardians (task_id, guardian_one, guardian_two,"
+                            + " version, created_by, created_at) VALUES (1,'a','b',1,'alice','"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateGuardianRejected = true;
+                }
+                assertThat(duplicateGuardianRejected).isTrue();
+
+                // 在场凭证：(task_id, guardian, generation) 唯一；有效期左闭右开
+                st.execute("INSERT INTO task_attendance (task_id, guardian, generation, issued_at,"
+                        + " expires_at, status, revoked_at, created_at) VALUES (1,'synth-exec',1,'"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now.plusSeconds(60))
+                        + "','ACTIVE',NULL,'" + Timestamp.from(now) + "')");
+                boolean duplicateGenerationRejected = false;
+                try {
+                    st.execute("INSERT INTO task_attendance (task_id, guardian, generation,"
+                            + " issued_at, expires_at, status, revoked_at, created_at) VALUES"
+                            + " (1,'synth-exec',1,'" + Timestamp.from(now) + "','"
+                            + Timestamp.from(now.plusSeconds(60)) + "','ACTIVE',NULL,'"
+                            + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    duplicateGenerationRejected = true;
+                }
+                assertThat(duplicateGenerationRejected).isTrue();
+                // 条件冻结只作用于 ACTIVE：撤销后再冻结 0 行
+                int revoked = st.executeUpdate("UPDATE task_attendance SET status = 'REVOKED',"
+                        + " revoked_at = '" + Timestamp.from(now) + "'"
+                        + " WHERE task_id = 1 AND guardian = 'synth-exec' AND status = 'ACTIVE'");
+                assertThat(revoked).isEqualTo(1);
+                int freezeAfterRevoke = st.executeUpdate(
+                        "UPDATE task_attendance SET status = 'FROZEN' WHERE task_id = 1"
+                                + " AND guardian = 'synth-exec' AND generation = 1"
+                                + " AND status = 'ACTIVE'");
+                assertThat(freezeAfterRevoke).isZero();
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT status, issued_at, expires_at FROM task_attendance"
+                                + " WHERE task_id = 1 AND guardian = 'synth-exec'")) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getString("status")).isEqualTo("REVOKED");
+                    assertThat(rs.getTimestamp("issued_at").toInstant()).isEqualTo(now);
+                    assertThat(rs.getTimestamp("expires_at").toInstant())
+                            .isEqualTo(now.plusSeconds(60));
+                }
             }
         }
     }

@@ -100,3 +100,27 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS task_guardians (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id；每个启用监护的任务至多一条',
+    guardian_one VARCHAR(128) NOT NULL COMMENT '第一监护人（合成操作者 X-Actor-Id），启用时固定，与 guardian_two 不同',
+    guardian_two VARCHAR(128) NOT NULL COMMENT '第二监护人（合成操作者 X-Actor-Id），启用时固定，与 guardian_one 不同',
+    version INT NOT NULL COMMENT '监护配置版本，启用时从 1 开始；完成时调用方须显式引用该期望版本',
+    created_by VARCHAR(128) NOT NULL COMMENT '启用监护的当前指挥人',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '启用 UTC 时间',
+    CONSTRAINT uk_task_guardian UNIQUE (task_id)
+) COMMENT='任务双人监护配置表（高危任务执行人与监护人实时共同在场）';
+
+CREATE TABLE IF NOT EXISTS task_attendance (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id',
+    guardian VARCHAR(128) NOT NULL COMMENT '签到监护人（X-Actor-Id），必须为 task_guardians 固定两人之一',
+    generation INT NOT NULL COMMENT '凭证代次，同一监护人首次签到为 1，每次重新签到加 1；完成时须引用双方当前代次',
+    issued_at TIMESTAMP(6) NOT NULL COMMENT '签发 UTC 时刻（取服务端注入 Clock 的当前时刻），有效期区间左边界（含）',
+    expires_at TIMESTAMP(6) NOT NULL COMMENT '到期 UTC 时刻（issued_at + 60 秒），有效期区间右边界（不含），左闭右开',
+    status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 当前有效 / SUPERSEDED 本人重新签到被取代 / REVOKED 当前指挥撤销 / FROZEN 任务 DONE 时冻结；仅 ACTIVE 且在有效期内可用于完成',
+    revoked_at TIMESTAMP(6) NULL COMMENT '撤销 UTC 时刻；仅 REVOKED 有值，其余状态为空',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '签到 UTC 时间',
+    CONSTRAINT uk_task_attendance_generation UNIQUE (task_id, guardian, generation)
+) COMMENT='限时在场凭证表（60 秒有效，左闭右开，代次推进使前代失效）';
