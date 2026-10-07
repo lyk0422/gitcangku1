@@ -51,3 +51,37 @@ CREATE TABLE IF NOT EXISTS release_record (
     released_at DATETIME(6) NOT NULL COMMENT '放行时间（UTC）',
     KEY idx_release_measurement (measurement_id)
 ) COMMENT='放行历史';
+
+-- 参考点线性拟合记录：提交时冻结参考点、系数与残差；批准后登记证书 ID。
+-- 拟合历史只增不改，证书撤销不回写本表。
+CREATE TABLE IF NOT EXISTS reference_fit (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '拟合记录 ID，自增',
+    request_id VARCHAR(64) NOT NULL COMMENT '提交请求的全局请求 ID（幂等键）',
+    instrument_id VARCHAR(64) NOT NULL COMMENT '仪器 ID',
+    valid_from DATETIME(6) NOT NULL COMMENT '有效期起点（UTC，左闭，含该时刻）',
+    valid_to DATETIME(6) NOT NULL COMMENT '有效期终点（UTC，右开，不含该时刻）',
+    max_residual DECIMAL(38,6) NOT NULL COMMENT '允许的最大绝对残差上限（非负，最多 6 位小数）',
+    coeff_a DECIMAL(38,6) NOT NULL COMMENT '拟合系数 a（精确值，最多 6 位小数）',
+    coeff_b DECIMAL(38,6) NOT NULL COMMENT '拟合偏移 b（精确值，最多 6 位小数）',
+    max_abs_residual DECIMAL(38,12) NOT NULL COMMENT '各参考点绝对残差的最大值（精确值，最多 12 位小数）',
+    points_json CLOB NOT NULL COMMENT '冻结的参考点及残差（JSON 数组，x/y/residual 为十进制字符串）',
+    submitted_by VARCHAR(64) NOT NULL COMMENT '拟合提交人',
+    status VARCHAR(16) NOT NULL COMMENT '状态：PENDING=待批准，APPROVED=已批准',
+    certificate_id BIGINT NULL COMMENT '批准时创建的证书 ID；未批准为 NULL，撤证不改写',
+    approved_by VARCHAR(64) NULL COMMENT '批准人（须不同于提交人）；未批准为 NULL',
+    approved_at DATETIME(6) NULL COMMENT '批准时间（UTC）；未批准为 NULL',
+    created_at DATETIME(6) NOT NULL COMMENT '提交时间（UTC）',
+    CONSTRAINT uk_fit_request UNIQUE (request_id)
+) COMMENT='参考点线性拟合记录';
+
+-- 幂等去重记录：全局 requestId 唯一，成功响应快照与业务写入同事务提交；失败请求不占键。
+CREATE TABLE IF NOT EXISTS idempotency_record (
+    request_id VARCHAR(64) NOT NULL PRIMARY KEY COMMENT '全局请求 ID（幂等键）',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：FIT_SUBMIT / FIT_APPROVE',
+    resource VARCHAR(128) NOT NULL COMMENT '操作资源标识（如仪器 ID、拟合 ID）',
+    fingerprint VARCHAR(2048) NOT NULL COMMENT '规范化参数指纹：十进制按值、文本原样，含期望版本',
+    actor VARCHAR(64) NOT NULL COMMENT '操作者（非空）',
+    response_status INT NOT NULL COMMENT '首次响应 HTTP 状态码',
+    response_body CLOB NOT NULL COMMENT '首次完整响应体（JSON）',
+    created_at DATETIME(6) NOT NULL COMMENT '记录创建时间（UTC）'
+) COMMENT='幂等去重记录';
