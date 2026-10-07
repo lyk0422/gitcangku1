@@ -60,12 +60,43 @@ CREATE TABLE IF NOT EXISTS loan_record (
     KEY idx_loan_borrower_status (borrower_id, status)
 );
 
+-- 证物存储介质：数字证物的介质副本；首个介质登记即为 ACTIVE，保存合成内容的 SHA-256。
+-- 介质编号与摘要入库后不可修改，仅状态随迁移流转；RETIRED 介质保留历史元数据，不作当前读取来源。
+CREATE TABLE IF NOT EXISTS evidence_media (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    media_no VARCHAR(64) NOT NULL COMMENT '介质编号，证物内唯一，入库后不可修改',
+    sha256 VARCHAR(64) NOT NULL COMMENT '介质内容 SHA-256（小写十六进制，64 字符）；验证通过后为已确认摘要',
+    status VARCHAR(20) NOT NULL COMMENT '介质状态：ACTIVE 当前读取来源 / UNVERIFIED 已收到合成内容待见证 / VERIFIED 摘要已见证待切换 / RETIRED 已作废（保留历史）',
+    created_at DATETIME(6) NOT NULL COMMENT '登记时间，Asia/Shanghai',
+    updated_at DATETIME(6) NOT NULL COMMENT '最近一次状态变更时间，Asia/Shanghai',
+    CONSTRAINT uk_media_evidence_no UNIQUE (evidence_key, media_no),
+    KEY idx_media_evidence (evidence_key)
+);
+
+-- 介质迁移记录：只追加；每件证物至多一条 PENDING 迁移，由证物行锁与服务层校验保证。
+-- 创建时固定源介质版本与新介质；切换时冻结两介质摘要与见证人；取消不改变源副本。
+CREATE TABLE IF NOT EXISTS media_migration (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    source_media_id BIGINT NOT NULL COMMENT '固定的源介质（创建迁移时的 ACTIVE 介质）',
+    target_media_id BIGINT NOT NULL COMMENT '新介质（创建时为 UNVERIFIED）',
+    status VARCHAR(20) NOT NULL COMMENT '迁移状态：PENDING 待完成 / COMPLETED 已切换 / CANCELLED 已取消',
+    created_by VARCHAR(64) NOT NULL COMMENT '发起迁移的当前保管人',
+    witness_id VARCHAR(64) NULL COMMENT '提交验证摘要的非保管人见证者；NULL 表示尚未验证',
+    source_sha256 VARCHAR(64) NULL COMMENT '切换时冻结的源介质摘要；NULL 表示尚未切换',
+    target_sha256 VARCHAR(64) NULL COMMENT '切换时冻结的新介质摘要；NULL 表示尚未切换',
+    created_at DATETIME(6) NOT NULL COMMENT '迁移创建时间，Asia/Shanghai',
+    decided_at DATETIME(6) NULL COMMENT '切换或取消时间；NULL 表示仍待完成',
+    KEY idx_migration_evidence (evidence_key)
+);
+
 -- 幂等命令日志：command_key 全局唯一；同键同参重放返回首次结果，同键改参返回 409。
 CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/MEDIA_REGISTER/MIGRATION_CREATE/MIGRATION_VERIFY/MIGRATION_SWITCH/MIGRATION_CANCEL',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',

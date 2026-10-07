@@ -46,6 +46,7 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final MediaMigrationRepository migrationRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +55,7 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           MediaMigrationRepository migrationRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,6 +63,7 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.migrationRepository = migrationRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -111,6 +114,7 @@ public class EvidenceService {
         if (evidence.status() == EvidenceStatus.BORROWED) {
             throw ApiException.conflict("借出期间禁止发起交接: " + evidenceKey);
         }
+        requireNoPendingMigration(evidenceKey, "发起交接");
         LocalDateTime now = LocalDateTime.now();
         transferRepository.insert(evidenceKey, actorId, request.toCustodian(), now);
         evidenceRepository.updateStatus(evidenceKey, EvidenceStatus.TRANSFER_PENDING, now);
@@ -247,6 +251,7 @@ public class EvidenceService {
         if (evidence.status() == EvidenceStatus.BORROWED) {
             throw ApiException.conflict("证物已存在未归还借出: " + evidenceKey);
         }
+        requireNoPendingMigration(evidenceKey, "借出");
         LocalDateTime nowUtc = clock.nowUtc();
         if (!request.dueAt().isAfter(nowUtc)) {
             throw ApiException.badRequest("应还时刻须晚于服务端当前时刻");
@@ -374,6 +379,15 @@ public class EvidenceService {
         }
         return transferRepository.findPendingByEvidenceKey(evidenceKey)
                 .orElseThrow(() -> ApiException.conflict("证物不存在待接收交接: " + evidenceKey));
+    }
+
+    /**
+     * 介质迁移期间禁止原借出与交接（调用前必须已锁定证物行）。
+     */
+    private void requireNoPendingMigration(String evidenceKey, String operation) {
+        if (migrationRepository.findPendingByEvidenceKey(evidenceKey).isPresent()) {
+            throw ApiException.conflict("介质迁移期间禁止" + operation + ": " + evidenceKey);
+        }
     }
 
     private Optional<StoredResponse> checkReplay(String commandKey, String requestHash) {
