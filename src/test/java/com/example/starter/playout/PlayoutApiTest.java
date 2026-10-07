@@ -276,50 +276,50 @@ class PlayoutApiTest {
 
         // 409：草稿版本不符
         postJson("/api/channels/" + channel + "/drafts/" + DAY + "/publish",
-                        Map.of("requestId", "req-" + p + "-p0", "draftVersion", 9,
-                                "expectedPublishedVersion", 0))
+                        Map.of("requestId", "req-" + p + "-p0", "operator", "tester",
+                                "draftVersion", 9, "expectedPublishedVersion", 0))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.error").value("DRAFT_VERSION_CONFLICT"));
 
         // 发布主流程
         postJson("/api/channels/" + channel + "/drafts/" + DAY + "/publish",
-                        Map.of("requestId", "req-" + p + "-p1", "draftVersion", 1,
-                                "expectedPublishedVersion", 0))
+                        Map.of("requestId", "req-" + p + "-p1", "operator", "tester",
+                                "draftVersion", 1, "expectedPublishedVersion", 0))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.publishedVersion").value(1))
                 .andExpect(jsonPath("$.draftVersion").value(1));
 
         // 幂等重试：返回原结果，不重复增版本
         postJson("/api/channels/" + channel + "/drafts/" + DAY + "/publish",
-                        Map.of("requestId", "req-" + p + "-p1", "draftVersion", 1,
-                                "expectedPublishedVersion", 0))
+                        Map.of("requestId", "req-" + p + "-p1", "operator", "tester",
+                                "draftVersion", 1, "expectedPublishedVersion", 0))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.publishedVersion").value(1));
         // 同 requestId 改参数：409
         postJson("/api/channels/" + channel + "/drafts/" + DAY + "/publish",
-                        Map.of("requestId", "req-" + p + "-p1", "draftVersion", 1,
-                                "expectedPublishedVersion", 1))
+                        Map.of("requestId", "req-" + p + "-p1", "operator", "tester",
+                                "draftVersion", 1, "expectedPublishedVersion", 1))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.error").value("REQUEST_ID_CONFLICT"));
 
         // 409：发布版本冲突（已发布过版本 1）
         postJson("/api/channels/" + channel + "/drafts/" + DAY + "/publish",
-                        Map.of("requestId", "req-" + p + "-p2", "draftVersion", 1,
-                                "expectedPublishedVersion", 0))
+                        Map.of("requestId", "req-" + p + "-p2", "operator", "tester",
+                                "draftVersion", 1, "expectedPublishedVersion", 0))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.error").value("PUBLISHED_VERSION_CONFLICT"));
 
         // 同一份草稿可再次发布为下一版本
         postJson("/api/channels/" + channel + "/drafts/" + DAY + "/publish",
-                        Map.of("requestId", "req-" + p + "-p3", "draftVersion", 1,
-                                "expectedPublishedVersion", 1))
+                        Map.of("requestId", "req-" + p + "-p3", "operator", "tester",
+                                "draftVersion", 1, "expectedPublishedVersion", 1))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.publishedVersion").value(2));
 
         // 404：草稿不存在
         postJson("/api/channels/" + channel + "/drafts/2026-09-23/publish",
-                        Map.of("requestId", "req-" + p + "-p4", "draftVersion", 1,
-                                "expectedPublishedVersion", 0))
+                        Map.of("requestId", "req-" + p + "-p4", "operator", "tester",
+                                "draftVersion", 1, "expectedPublishedVersion", 0))
                 .andExpect(status().isNotFound());
     }
 
@@ -337,38 +337,38 @@ class PlayoutApiTest {
 
         // 撤销主流程（先提交）
         postJson("/api/grants/" + grantId + "/revoke",
-                        Map.of("requestId", "req-" + p + "-rv"))
+                        Map.of("requestId", "req-" + p + "-rv", "operator", "tester"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.revoked").value(true));
         // 幂等重试：返回原结果
         postJson("/api/grants/" + grantId + "/revoke",
-                        Map.of("requestId", "req-" + p + "-rv"))
+                        Map.of("requestId", "req-" + p + "-rv", "operator", "tester"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.revoked").value(true));
         // 同 requestId 作用于不同授权：409
         long otherGrant = createGrant(channel, p + "movie");
         postJson("/api/grants/" + otherGrant + "/revoke",
-                        Map.of("requestId", "req-" + p + "-rv"))
+                        Map.of("requestId", "req-" + p + "-rv", "operator", "tester"))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.error").value("REQUEST_ID_CONFLICT"));
         // 新 requestId 重复撤销：409
         postJson("/api/grants/" + grantId + "/revoke",
-                        Map.of("requestId", "req-" + p + "-rv2"))
+                        Map.of("requestId", "req-" + p + "-rv2", "operator", "tester"))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.error").value("GRANT_ALREADY_REVOKED"));
         // 404：授权不存在
-        postJson("/api/grants/999999/revoke", Map.of("requestId", "req-" + p + "-rv3"))
+        postJson("/api/grants/999999/revoke", Map.of("requestId", "req-" + p + "-rv3", "operator", "tester"))
                 .andExpect(status().isNotFound());
 
         // 撤销第二条授权，使片段不再被任何未撤销授权覆盖
         postJson("/api/grants/" + otherGrant + "/revoke",
-                        Map.of("requestId", "req-" + p + "-rv4"))
+                        Map.of("requestId", "req-" + p + "-rv4", "operator", "tester"))
                 .andExpect(status().isOk());
 
         // 撤销先提交 → 发布失败（422 授权失效）
         postJson("/api/channels/" + channel + "/drafts/" + DAY + "/publish",
-                        Map.of("requestId", "req-" + p + "-pub", "draftVersion", 1,
-                                "expectedPublishedVersion", 0))
+                        Map.of("requestId", "req-" + p + "-pub", "operator", "tester",
+                                "draftVersion", 1, "expectedPublishedVersion", 0))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error").value("GRANT_INVALID"));
     }
@@ -385,8 +385,8 @@ class PlayoutApiTest {
 
         // 发布先提交 → 成功
         postJson("/api/channels/" + channel + "/drafts/" + DAY + "/publish",
-                        Map.of("requestId", "req-" + p + "-pub", "draftVersion", 1,
-                                "expectedPublishedVersion", 0))
+                        Map.of("requestId", "req-" + p + "-pub", "operator", "tester",
+                                "draftVersion", 1, "expectedPublishedVersion", 0))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.publishedVersion").value(1));
 
@@ -398,7 +398,7 @@ class PlayoutApiTest {
 
         // 之后撤销授权：历史快照不被改写，但播出查询应用撤销结果
         postJson("/api/grants/" + grantId + "/revoke",
-                        Map.of("requestId", "req-" + p + "-rv"))
+                        Map.of("requestId", "req-" + p + "-rv", "operator", "tester"))
                 .andExpect(status().isOk());
         getJson("/api/channels/" + channel + "/playout", "2026-09-22T10:30:00.000+08:00")
                 .andExpect(status().isOk())
@@ -429,8 +429,8 @@ class PlayoutApiTest {
                                 segment(p + "seg-1", p + "movie", T_10, T_11)))
                 .andExpect(status().isOk());
         postJson("/api/channels/" + channel + "/drafts/" + DAY + "/publish",
-                        Map.of("requestId", "req-" + p + "-pub", "draftVersion", 1,
-                                "expectedPublishedVersion", 0))
+                        Map.of("requestId", "req-" + p + "-pub", "operator", "tester",
+                                "draftVersion", 1, "expectedPublishedVersion", 0))
                 .andExpect(status().isOk());
 
         // 命中片段（边界：起点含、终点不含）
@@ -528,6 +528,7 @@ class PlayoutApiTest {
                                                         List<Map<String, Object>> segments) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("requestId", requestId);
+        body.put("operator", "tester");
         body.put("expectedDraftVersion", expectedVersion);
         body.put("segments", segments);
         return body;

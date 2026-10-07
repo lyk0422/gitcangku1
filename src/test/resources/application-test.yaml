@@ -9,6 +9,8 @@ spring:
       mode: always
       encoding: UTF-8
       schema-locations: classpath:schema-h2.sql
+      # 测试库不加载本地演示种子数据，各用例自建合成数据、按唯一前缀相互隔离
+      data-locations: optional:classpath:data-test.sql
   jackson:
     time-zone: Asia/Shanghai
 

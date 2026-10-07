@@ -92,7 +92,7 @@ class EmergencyOverrideApiTest {
 
         // 取消
         postJson("/api/emergency-overrides/" + ctx.key("ov-1") + "/cancel",
-                        Map.of("requestId", "req-cancel"))
+                        Map.of("requestId", "req-cancel", "operator", "tester"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("CANCELLED"))
                 .andExpect(jsonPath("$.cancelRequestId").value("req-cancel"))
@@ -195,7 +195,7 @@ class EmergencyOverrideApiTest {
                 .andExpect(status().isNotFound());
         getOverrideRaw(ctx.prefix + "ghost").andExpect(status().isNotFound());
         postJson("/api/emergency-overrides/" + ctx.prefix + "ghost/cancel",
-                        Map.of("requestId", "nf-5"))
+                        Map.of("requestId", "nf-5", "operator", "tester"))
                 .andExpect(status().isNotFound());
 
         // 422：授权不属于该频道
@@ -226,7 +226,7 @@ class EmergencyOverrideApiTest {
 
         // 422：指定授权已撤销（撤销先提交）
         long revokedGrant = createGrant(ctx.channel, ctx.alertAsset, GRANT_FROM, GRANT_TO);
-        postJson("/api/grants/" + revokedGrant + "/revoke", Map.of("requestId", "rv-g"))
+        postJson("/api/grants/" + revokedGrant + "/revoke", Map.of("requestId", "rv-g", "operator", "tester"))
                 .andExpect(status().isOk());
         createOverrideRaw("rv-1", ctx.key("rv1"), ctx.channel, ctx.alertAsset,
                         revokedGrant, 5, T_1020, T_1030)
@@ -252,10 +252,10 @@ class EmergencyOverrideApiTest {
 
         // 409：取消 ACTIVE 后再次取消
         postJson("/api/emergency-overrides/" + ctx.key("nf1") + "/cancel",
-                        Map.of("requestId", "cancel-nf1"))
+                        Map.of("requestId", "cancel-nf1", "operator", "tester"))
                 .andExpect(status().isOk());
         postJson("/api/emergency-overrides/" + ctx.key("nf1") + "/cancel",
-                        Map.of("requestId", "cancel-nf1-again"))
+                        Map.of("requestId", "cancel-nf1-again", "operator", "tester"))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.error").value("OVERRIDE_NOT_ACTIVE"));
     }
@@ -300,16 +300,16 @@ class EmergencyOverrideApiTest {
 
         // 取消幂等：同 requestId 重放返回首次的 CANCELLED 明细
         postJson("/api/emergency-overrides/" + ctx.key("rk") + "/cancel",
-                        Map.of("requestId", "cancel-rk"))
+                        Map.of("requestId", "cancel-rk", "operator", "tester"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("CANCELLED"));
         postJson("/api/emergency-overrides/" + ctx.key("rk") + "/cancel",
-                        Map.of("requestId", "cancel-rk"))
+                        Map.of("requestId", "cancel-rk", "operator", "tester"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("CANCELLED"));
         // 同 requestId 用于取消其他插播：409
         postJson("/api/emergency-overrides/" + ctx.key("io") + "/cancel",
-                        Map.of("requestId", "cancel-rk"))
+                        Map.of("requestId", "cancel-rk", "operator", "tester"))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.error").value("REQUEST_ID_CONFLICT"));
 
@@ -347,7 +347,7 @@ class EmergencyOverrideApiTest {
                 .andExpect(jsonPath("$.overrideKey").value(ctx.key("high")));
 
         // 高优先级授权撤销：落到仍有效的低优先级；插播状态不被查询改变、不换绑授权
-        postJson("/api/grants/" + ctx.newsGrant + "/revoke", Map.of("requestId", "rv-news"))
+        postJson("/api/grants/" + ctx.newsGrant + "/revoke", Map.of("requestId", "rv-news", "operator", "tester"))
                 .andExpect(status().isOk());
         playout(ctx, T_1030)
                 .andExpect(jsonPath("$.source").value("EMERGENCY"))
@@ -358,7 +358,7 @@ class EmergencyOverrideApiTest {
                 .andExpect(jsonPath("$.grantId").value(ctx.newsGrant));
 
         // 低优先级授权也撤销：无候选，沿用原节目
-        postJson("/api/grants/" + ctx.alertGrant + "/revoke", Map.of("requestId", "rv-alert"))
+        postJson("/api/grants/" + ctx.alertGrant + "/revoke", Map.of("requestId", "rv-alert", "operator", "tester"))
                 .andExpect(status().isOk());
         playout(ctx, T_1030)
                 .andExpect(jsonPath("$.source").value("PROGRAM"))
@@ -369,7 +369,7 @@ class EmergencyOverrideApiTest {
         Ctx bare = newContext();
         createOverride(bare, "only", "only", bare.newsAsset, bare.newsGrant, 5, T_1020, T_1040)
                 .andExpect(status().isOk());
-        postJson("/api/grants/" + bare.newsGrant + "/revoke", Map.of("requestId", "rv-only"))
+        postJson("/api/grants/" + bare.newsGrant + "/revoke", Map.of("requestId", "rv-only", "operator", "tester"))
                 .andExpect(status().isOk());
         playout(bare, T_1030)
                 .andExpect(jsonPath("$.source").value("FALLBACK"))
@@ -444,7 +444,7 @@ class EmergencyOverrideApiTest {
                 start.await(5, TimeUnit.SECONDS);
                 return mvc.perform(post("/api/grants/" + ctx.newsGrant + "/revoke")
                                 .contentType(MediaType.APPLICATION_JSON)
-                                .content(objectMapper.writeValueAsString(Map.of("requestId", "race-rv"))))
+                                .content(objectMapper.writeValueAsString(Map.of("requestId", "race-rv", "operator", "tester"))))
                         .andReturn().getResponse().getStatus();
             });
             ready.await(5, TimeUnit.SECONDS);
@@ -530,6 +530,7 @@ class EmergencyOverrideApiTest {
         segments.add(segment);
         Map<String, Object> draftBody = new LinkedHashMap<>();
         draftBody.put("requestId", "draft-" + ctx.prefix + segmentId);
+        draftBody.put("operator", "tester");
         draftBody.put("expectedDraftVersion", 0);
         draftBody.put("segments", segments);
         mvc.perform(put("/api/channels/" + ctx.channel + "/drafts/" + DAY)
@@ -537,7 +538,7 @@ class EmergencyOverrideApiTest {
                         .content(objectMapper.writeValueAsString(draftBody)))
                 .andExpect(status().isOk());
         postJson("/api/channels/" + ctx.channel + "/drafts/" + DAY + "/publish",
-                        Map.of("requestId", "pub-" + ctx.prefix + segmentId,
+                        Map.of("requestId", "pub-" + ctx.prefix + segmentId, "operator", "tester",
                                 "draftVersion", 1, "expectedPublishedVersion", 0))
                 .andExpect(status().isOk());
     }
@@ -570,6 +571,7 @@ class EmergencyOverrideApiTest {
                                                     int priority, String start, String end) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("requestId", requestId);
+        body.put("operator", "tester");
         body.put("overrideKey", overrideKey);
         body.put("channelId", channelId);
         body.put("assetId", assetId);

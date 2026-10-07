@@ -134,18 +134,20 @@ public class PlayoutService {
 
     /** 撤销授权；幂等：同 requestId 同参数返回原结果，改参数返回 409。 */
     @Transactional
-    public GrantResponse revokeGrant(long grantId, String requestId) {
-        String hash = sha256(OP_REVOKE_GRANT + "|" + grantId);
-        return idempotent(requestId, OP_REVOKE_GRANT, hash, GrantResponse.class, () -> {
-            GrantRow grant = repo.findGrant(grantId)
-                    .orElseThrow(() -> ApiException.notFound("授权不存在: " + grantId));
-            int updated = repo.revokeGrant(grantId, requestId, nowMs());
-            if (updated == 0) {
-                throw ApiException.conflict("GRANT_ALREADY_REVOKED", "授权已撤销: " + grantId);
-            }
-            return new GrantResponse(grant.id(), grant.channelId(), grant.assetId(),
-                    atMs(grant.validFromMs()), atMs(grant.validToMs()), true);
-        });
+    public GrantResponse revokeGrant(long grantId, String requestId, String operator) {
+        String resource = "grant:" + grantId;
+        String hash = sha256(OP_REVOKE_GRANT + "|" + resource);
+        return idempotent(requestId, operator, OP_REVOKE_GRANT, resource, hash,
+                GrantResponse.class, () -> {
+                    GrantRow grant = repo.findGrant(grantId)
+                            .orElseThrow(() -> ApiException.notFound("授权不存在: " + grantId));
+                    int updated = repo.revokeGrant(grantId, requestId, nowMs());
+                    if (updated == 0) {
+                        throw ApiException.conflict("GRANT_ALREADY_REVOKED", "授权已撤销: " + grantId);
+                    }
+                    return new GrantResponse(grant.id(), grant.channelId(), grant.assetId(),
+                            atMs(grant.validFromMs()), atMs(grant.validToMs()), true);
+                });
     }
 
     // ---------- 草稿 ----------
@@ -157,36 +159,43 @@ public class PlayoutService {
         repo.findChannel(channelId)
                 .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
 
-        String hash = sha256(OP_REPLACE_DRAFT + "|" + channelId + "|" + businessDay
-                + "|" + request.expectedDraftVersion() + "|" + canonicalSegments(request.segments()));
-        return idempotent(request.requestId(), OP_REPLACE_DRAFT, hash, DraftResponse.class, () -> {
-            List<ValidatedSegment> segments = validateSegments(channelId, businessDay, request.segments());
-            long newVersion;
-            if (request.expectedDraftVersion() == 0) {
-                try {
-                    repo.insertDraft(channelId, businessDay, nowMs());
-                } catch (DuplicateKeyException e) {
-                    throw ApiException.conflict("DRAFT_VERSION_CONFLICT",
-                            "草稿已存在，expectedDraftVersion 不能为 0");
-                }
-                newVersion = 1;
-            } else {
-                int updated = repo.bumpDraftVersion(channelId, businessDay,
-                        request.expectedDraftVersion(), nowMs());
-                if (updated == 0) {
-                    throw ApiException.conflict("DRAFT_VERSION_CONFLICT",
-                            "草稿版本不符，期望 " + request.expectedDraftVersion());
-                }
-                newVersion = request.expectedDraftVersion() + 1;
-            }
-            repo.deleteDraftSegments(channelId, businessDay);
-            for (ValidatedSegment segment : segments) {
-                repo.insertDraftSegment(segment.id(), channelId, businessDay,
-                        segment.assetId(), segment.startMs(), segment.endMs());
-            }
-            return new DraftResponse(channelId, businessDay.toString(), newVersion,
-                    segments.stream().map(ValidatedSegment::toResponse).toList());
-        });
+        // 先规范化（含速率/源区间规则校验），再对规范化结果做幂等哈希：
+        // 速率按约分值、时长按推导值参与比较，2/4 与 1/2 视为同参。
+        List<NormalizedSegment> normalized = normalizeSegments(request.segments());
+        String resource = channelId + "|" + businessDay;
+        String hash = sha256(OP_REPLACE_DRAFT + "|" + resource
+                + "|" + request.expectedDraftVersion() + "|" + canonicalSegments(normalized));
+        return idempotent(request.requestId(), request.operator(), OP_REPLACE_DRAFT, resource, hash,
+                DraftResponse.class, () -> {
+                    List<ValidatedSegment> segments = validateSegments(channelId, businessDay, normalized);
+                    long newVersion;
+                    if (request.expectedDraftVersion() == 0) {
+                        try {
+                            repo.insertDraft(channelId, businessDay, nowMs());
+                        } catch (DuplicateKeyException e) {
+                            throw ApiException.conflict("DRAFT_VERSION_CONFLICT",
+                                    "草稿已存在，expectedDraftVersion 不能为 0");
+                        }
+                        newVersion = 1;
+                    } else {
+                        int updated = repo.bumpDraftVersion(channelId, businessDay,
+                                request.expectedDraftVersion(), nowMs());
+                        if (updated == 0) {
+                            throw ApiException.conflict("DRAFT_VERSION_CONFLICT",
+                                    "草稿版本不符，期望 " + request.expectedDraftVersion());
+                        }
+                        newVersion = request.expectedDraftVersion() + 1;
+                    }
+                    repo.deleteDraftSegments(channelId, businessDay);
+                    for (ValidatedSegment segment : segments) {
+                        repo.insertDraftSegment(segment.id(), channelId, businessDay,
+                                segment.assetId(), segment.startMs(), segment.endMs(),
+                                segment.sourceStartMs(), segment.sourceEndMs(),
+                                segment.rateP(), segment.rateQ());
+                    }
+                    return new DraftResponse(channelId, businessDay.toString(), newVersion,
+                            segments.stream().map(ValidatedSegment::toResponse).toList());
+                });
     }
 
     // ---------- 发布 ----------
@@ -200,9 +209,11 @@ public class PlayoutService {
         repo.findChannel(channelId)
                 .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
 
-        String hash = sha256(OP_PUBLISH + "|" + channelId + "|" + businessDay
+        String resource = channelId + "|" + businessDay;
+        String hash = sha256(OP_PUBLISH + "|" + resource
                 + "|" + request.draftVersion() + "|" + request.expectedPublishedVersion());
-        return idempotent(request.requestId(), OP_PUBLISH, hash, PublishResponse.class, () -> {
+        return idempotent(request.requestId(), request.operator(), OP_PUBLISH, resource, hash,
+                PublishResponse.class, () -> {
             DraftRow draft = repo.findDraft(channelId, businessDay)
                     .orElseThrow(() -> ApiException.notFound("草稿不存在: " + channelId + " " + businessDay));
             List<SegmentRow> segments = repo.findDraftSegments(channelId, businessDay);
@@ -231,8 +242,11 @@ public class PlayoutService {
             }
             for (int i = 0; i < segments.size(); i++) {
                 SegmentRow segment = segments.get(i);
+                // 发布冻结源区间、约分速率与授权，历史快照不随后续草稿或速率变化更新
                 repo.insertPublicationSegment(publicationId, segment.id(), segment.assetId(),
-                        grantIds.get(i), segment.startMs(), segment.endMs());
+                        grantIds.get(i), segment.startMs(), segment.endMs(),
+                        segment.sourceStartMs(), segment.sourceEndMs(),
+                        segment.rateP(), segment.rateQ());
             }
             return new PublishResponse(publicationId, channelId, businessDay.toString(),
                     newVersion, draft.version());
@@ -257,7 +271,8 @@ public class PlayoutService {
         if (override.isPresent()) {
             OverrideRow hit = override.get();
             return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
-                    DecisionSource.EMERGENCY, null, null, null, hit.overrideKey());
+                    DecisionSource.EMERGENCY, null, null, null, hit.overrideKey(),
+                    null, null, null);
         }
 
         LocalDate businessDay = at.atZoneSameInstant(ZONE).toLocalDate();
@@ -281,11 +296,39 @@ public class PlayoutService {
             return new PlayoutDecisionResponse(channelId, at, channel.fallbackAssetId(),
                     DecisionSource.FALLBACK,
                     FallbackReason.GRANT_REVOKED,
-                    publication.get().id(), hit.segmentId(), null);
+                    publication.get().id(), hit.segmentId(), null, null, null, null);
         }
+        // 源偏移 = 源起点 + (at - 片段播放起点) × p/q，按墙钟映射，插播期间不暂停源时间；
+        // 精确分数与向下取整显示毫秒同时返回，越界判断基于精确分数而非显示值。
+        long[] offset = sourceOffset(hit, atMs);
         return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
                 DecisionSource.PROGRAM, null,
-                publication.get().id(), hit.segmentId(), null);
+                publication.get().id(), hit.segmentId(), null,
+                offset[0], offset[1], offset[2]);
+    }
+
+    /**
+     * 计算时刻 atMs 在已发布片段上的源内容偏移：返回 {约分分子, 约分分母, 向下取整毫秒}。
+     * 精确值为 sourceStart + (atMs - startMs) × rateP / rateQ，全程整数运算。
+     */
+    private static long[] sourceOffset(PublicationSegmentRow segment, long atMs) {
+        long numerator = segment.sourceStartMs() * segment.rateQ()
+                + (atMs - segment.startMs()) * segment.rateP();
+        long denominator = segment.rateQ();
+        long floorMs = Math.floorDiv(numerator, denominator);
+        long gcd = gcd(numerator, denominator);
+        return new long[]{numerator / gcd, denominator / gcd, floorMs};
+    }
+
+    private static long gcd(long a, long b) {
+        a = Math.abs(a);
+        b = Math.abs(b);
+        while (b != 0) {
+            long t = a % b;
+            a = b;
+            b = t;
+        }
+        return a == 0 ? 1 : a;
     }
 
     /**
@@ -312,10 +355,11 @@ public class PlayoutService {
      */
     @Transactional
     public EmergencyOverrideResponse createEmergencyOverride(CreateEmergencyOverrideRequest request) {
-        String hash = sha256(OP_CREATE_OVERRIDE + "|" + request.overrideKey() + "|"
+        String resource = "override:" + request.overrideKey();
+        String hash = sha256(OP_CREATE_OVERRIDE + "|" + resource + "|"
                 + request.channelId() + "|" + request.assetId() + "|" + request.grantId() + "|"
                 + request.priority() + "|" + toMs(request.start()) + "|" + toMs(request.end()));
-        return idempotent(request.requestId(), OP_CREATE_OVERRIDE, hash,
+        return idempotent(request.requestId(), request.operator(), OP_CREATE_OVERRIDE, resource, hash,
                 EmergencyOverrideResponse.class, () -> doCreateOverride(request));
     }
 
@@ -395,9 +439,12 @@ public class PlayoutService {
      * 失败不占键。
      */
     @Transactional
-    public EmergencyOverrideResponse cancelEmergencyOverride(String overrideKey, String requestId) {
-        String hash = sha256(OP_CANCEL_OVERRIDE + "|" + overrideKey);
-        return idempotent(requestId, OP_CANCEL_OVERRIDE, hash, EmergencyOverrideResponse.class, () -> {
+    public EmergencyOverrideResponse cancelEmergencyOverride(String overrideKey, String requestId,
+                                                             String operator) {
+        String resource = "override:" + overrideKey;
+        String hash = sha256(OP_CANCEL_OVERRIDE + "|" + resource);
+        return idempotent(requestId, operator, OP_CANCEL_OVERRIDE, resource, hash,
+                EmergencyOverrideResponse.class, () -> {
             // 先在频道锁上与同频道创建/取消串行，取消提交后并发创建即可复用该区间。
             OverrideRow existing = repo.findOverride(overrideKey)
                     .orElseThrow(() -> ApiException.notFound("紧急插播不存在: " + overrideKey));
@@ -430,32 +477,100 @@ public class PlayoutService {
 
     // ---------- 内部方法 ----------
 
-    /** 校验并规范化草稿片段：非空、区间内、不跨日、不重叠、素材存在且被单条未撤销授权完整覆盖。 */
-    private List<ValidatedSegment> validateSegments(String channelId, LocalDate businessDay,
-                                                    List<SegmentInput> inputs) {
-        long dayStartMs = businessDay.atStartOfDay(ZONE).toInstant().toEpochMilli();
-        long dayEndMs = businessDay.plusDays(1).atStartOfDay(ZONE).toInstant().toEpochMilli();
-
-        List<ValidatedSegment> segments = new ArrayList<>();
+    /**
+     * 规范化草稿片段输入（不访问数据库）：普通片段速率恒 1/1、源区间 [0, 播放时长)；
+     * 变速片段校验速率与源区间规则并推导播放终点。结构性问题 400，速率/源区间/时长规则 422。
+     */
+    private List<NormalizedSegment> normalizeSegments(List<SegmentInput> inputs) {
+        List<NormalizedSegment> result = new ArrayList<>();
         for (SegmentInput input : inputs) {
-            if (input.start() == null || input.end() == null) {
-                throw ApiException.badRequest("片段开始与结束时间不能为空");
+            if (input.start() == null) {
+                throw ApiException.badRequest("片段开始时间不能为空");
             }
             if (input.assetId() == null || input.assetId().isBlank()) {
                 throw ApiException.badRequest("片段素材 ID 不能为空");
             }
             long startMs = toMs(input.start());
-            long endMs = toMs(input.end());
-            if (endMs <= startMs) {
-                throw ApiException.badRequest("片段结束时间必须大于开始时间");
+            boolean rateSpec = input.sourceStartMs() != null || input.sourceEndMs() != null
+                    || input.rateP() != null || input.rateQ() != null;
+            if (!rateSpec) {
+                if (input.end() == null) {
+                    throw ApiException.badRequest("片段结束时间不能为空");
+                }
+                long endMs = toMs(input.end());
+                if (endMs <= startMs) {
+                    throw ApiException.badRequest("片段结束时间必须大于开始时间");
+                }
+                result.add(new NormalizedSegment(input.id(), input.assetId(), startMs, endMs,
+                        0, endMs - startMs, 1, 1, false));
+                continue;
             }
-            if (startMs < dayStartMs || endMs > dayEndMs) {
+            if (input.sourceStartMs() == null || input.sourceEndMs() == null
+                    || input.rateP() == null || input.rateQ() == null) {
+                throw ApiException.badRequest(
+                        "变速片段须同时提供 sourceStartMs/sourceEndMs/rateP/rateQ");
+            }
+            long sourceStart = input.sourceStartMs();
+            long sourceEnd = input.sourceEndMs();
+            int p = input.rateP();
+            int q = input.rateQ();
+            if (p < 1 || p > 10 || q < 1 || q > 10 || p * 2 < q || q * 2 < p) {
+                throw ApiException.unprocessable("INVALID_RATE",
+                        "速率 p/q 须为 1～10 整数且比率在 1/2 至 2 之间: " + p + "/" + q);
+            }
+            if (sourceStart < 0 || sourceEnd <= sourceStart) {
+                throw ApiException.unprocessable("INVALID_SOURCE_INTERVAL",
+                        "源区间须满足 0 <= sourceStartMs < sourceEndMs: "
+                                + sourceStart + " ~ " + sourceEnd);
+            }
+            long sourceLen = sourceEnd - sourceStart;
+            if (sourceLen * q % p != 0) {
+                throw ApiException.unprocessable("NON_INTEGER_DURATION",
+                        "播放时长（源长度乘 q 除 p）不是正整数毫秒: " + sourceLen + "*" + q + "/" + p);
+            }
+            long durationMs = sourceLen * q / p;
+            long endMs = startMs + durationMs;
+            if (input.end() != null && toMs(input.end()) != endMs) {
+                throw ApiException.unprocessable("INVALID_PLAY_INTERVAL",
+                        "片段结束时间与速率推导时长不一致，期望结束偏移 " + durationMs + " 毫秒");
+            }
+            int g = (int) gcd(p, q);
+            result.add(new NormalizedSegment(input.id(), input.assetId(), startMs, endMs,
+                    sourceStart, sourceEnd, p / g, q / g, true));
+        }
+        return result;
+    }
+
+    /** 校验并规范化草稿片段：非空、区间内、不跨日、不重叠、素材存在且被单条未撤销授权完整覆盖。 */
+    private List<ValidatedSegment> validateSegments(String channelId, LocalDate businessDay,
+                                                    List<NormalizedSegment> inputs) {
+        long dayStartMs = businessDay.atStartOfDay(ZONE).toInstant().toEpochMilli();
+        long dayEndMs = businessDay.plusDays(1).atStartOfDay(ZONE).toInstant().toEpochMilli();
+
+        List<ValidatedSegment> segments = new ArrayList<>();
+        for (NormalizedSegment input : inputs) {
+            if (input.startMs() < dayStartMs || input.endMs() > dayEndMs) {
                 throw ApiException.unprocessable("SEGMENT_CROSSES_DAY",
-                        "片段不得跨业务日: " + input.start() + " ~ " + input.end());
+                        "片段不得跨业务日: " + atMs(input.startMs()) + " ~ " + atMs(input.endMs()));
+            }
+            var asset = repo.findAsset(input.assetId())
+                    .orElseThrow(() -> ApiException.notFound("素材不存在: " + input.assetId()));
+            if (input.explicitRate()) {
+                // 仅变速片段校验源区间与播放时长边界；普通片段速率恒 1，不做该限制
+                if (input.sourceEndMs() > asset.durationMs()) {
+                    throw ApiException.unprocessable("INVALID_SOURCE_INTERVAL",
+                            "源区间超出素材总长 " + asset.durationMs() + " 毫秒: " + input.assetId());
+                }
+                if (input.endMs() - input.startMs() > asset.durationMs()) {
+                    throw ApiException.unprocessable("DURATION_EXCEEDS_ASSET",
+                            "播放时长不得超过素材原总长 " + asset.durationMs() + " 毫秒: "
+                                    + input.assetId());
+                }
             }
             String id = input.id() == null || input.id().isBlank()
                     ? UUID.randomUUID().toString() : input.id();
-            segments.add(new ValidatedSegment(id, input.assetId(), startMs, endMs));
+            segments.add(new ValidatedSegment(id, input.assetId(), input.startMs(), input.endMs(),
+                    input.sourceStartMs(), input.sourceEndMs(), input.rateP(), input.rateQ()));
         }
 
         List<ValidatedSegment> sorted = segments.stream()
@@ -470,9 +585,6 @@ public class PlayoutService {
         }
 
         for (ValidatedSegment segment : segments) {
-            if (repo.findAsset(segment.assetId()).isEmpty()) {
-                throw ApiException.notFound("素材不存在: " + segment.assetId());
-            }
             List<GrantRow> covering = repo.findCoveringGrants(channelId, segment.assetId(),
                     segment.startMs(), segment.endMs());
             if (covering.isEmpty()) {
@@ -495,26 +607,30 @@ public class PlayoutService {
     }
 
     /**
-     * 幂等执行：去重记录与业务结果同事务提交；同 requestId 同参数返回原结果，
-     * 同 requestId 不同参数返回 409；业务失败抛异常回滚，不占用 requestId。
+     * 幂等执行：去重记录与业务结果同事务提交；同 requestId 按操作、资源、全参数哈希结构化比较，
+     * 三者一致返回首次完整结果，任一不同返回 409；业务失败抛异常回滚，不占用 requestId；
+     * 并发同键由唯一约束串行化，读取已提交记录后按同规则比较，不报唯一键 500。
      */
-    private <T> T idempotent(String requestId, String operation, String paramsHash,
-                             Class<T> type, Supplier<T> action) {
+    private <T> T idempotent(String requestId, String operator, String operation, String resource,
+                             String paramsHash, Class<T> type, Supplier<T> action) {
         if (requestId == null || requestId.isBlank()) {
             throw ApiException.badRequest("requestId 不能为空");
         }
+        if (operator == null || operator.isBlank()) {
+            throw ApiException.badRequest("operator 不能为空");
+        }
         Optional<RequestRow> existing = repo.findRequestForUpdate(requestId);
         if (existing.isPresent()) {
-            return replay(existing.get(), operation, paramsHash, type);
+            return replay(existing.get(), operation, resource, paramsHash, type);
         }
         try {
-            repo.insertRequest(requestId, operation, paramsHash, nowMs());
+            repo.insertRequest(requestId, operator, operation, resource, paramsHash, nowMs());
         } catch (DuplicateKeyException e) {
             // 并发同 requestId：等待对方事务结束后读取已提交记录
             RequestRow committed = repo.findRequestForUpdate(requestId)
                     .orElseThrow(() -> ApiException.conflict("REQUEST_ID_CONFLICT",
                             "requestId 并发冲突: " + requestId));
-            return replay(committed, operation, paramsHash, type);
+            return replay(committed, operation, resource, paramsHash, type);
         }
         T result = action.get();
         try {
@@ -525,8 +641,10 @@ public class PlayoutService {
         return result;
     }
 
-    private <T> T replay(RequestRow row, String operation, String paramsHash, Class<T> type) {
-        if (!row.operation().equals(operation) || !row.paramsHash().equals(paramsHash)) {
+    private <T> T replay(RequestRow row, String operation, String resource, String paramsHash,
+                         Class<T> type) {
+        if (!row.operation().equals(operation) || !row.resource().equals(resource)
+                || !row.paramsHash().equals(paramsHash)) {
             throw ApiException.conflict("REQUEST_ID_CONFLICT",
                     "requestId 已使用且参数不一致: " + row.requestId());
         }
@@ -541,13 +659,18 @@ public class PlayoutService {
         }
     }
 
-    private static String canonicalSegments(List<SegmentInput> segments) {
+    /** 规范化片段的幂等参数串：速率已约分、时长为推导值，文本原样拼接。 */
+    private static String canonicalSegments(List<NormalizedSegment> segments) {
         StringBuilder sb = new StringBuilder();
-        for (SegmentInput s : segments) {
+        for (NormalizedSegment s : segments) {
             sb.append(s.id() == null ? "" : s.id()).append(',')
                     .append(s.assetId()).append(',')
-                    .append(s.start() == null ? "" : toMs(s.start())).append(',')
-                    .append(s.end() == null ? "" : toMs(s.end())).append(';');
+                    .append(s.startMs()).append(',')
+                    .append(s.endMs()).append(',')
+                    .append(s.sourceStartMs()).append(',')
+                    .append(s.sourceEndMs()).append(',')
+                    .append(s.rateP()).append(',')
+                    .append(s.rateQ()).append(';');
         }
         return sb.toString();
     }
@@ -555,7 +678,7 @@ public class PlayoutService {
     private PlayoutDecisionResponse fallback(String channelId, OffsetDateTime at, String assetId,
                                              FallbackReason reason) {
         return new PlayoutDecisionResponse(channelId, at, assetId,
-                DecisionSource.FALLBACK, reason, null, null, null);
+                DecisionSource.FALLBACK, reason, null, null, null, null, null, null);
     }
 
     private static long toMs(OffsetDateTime time) {
@@ -585,10 +708,18 @@ public class PlayoutService {
         }
     }
 
+    /** 规范化后的片段输入：播放区间、源区间与约分速率均已确定。 */
+    private record NormalizedSegment(String id, String assetId, long startMs, long endMs,
+                                     long sourceStartMs, long sourceEndMs, int rateP, int rateQ,
+                                     boolean explicitRate) {
+    }
+
     /** 校验后的片段。 */
-    private record ValidatedSegment(String id, String assetId, long startMs, long endMs) {
+    private record ValidatedSegment(String id, String assetId, long startMs, long endMs,
+                                    long sourceStartMs, long sourceEndMs, int rateP, int rateQ) {
         SegmentResponse toResponse() {
-            return new SegmentResponse(id, assetId, atMs(startMs), atMs(endMs));
+            return new SegmentResponse(id, assetId, atMs(startMs), atMs(endMs),
+                    sourceStartMs, sourceEndMs, rateP, rateQ);
         }
     }
 }

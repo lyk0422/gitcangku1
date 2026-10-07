@@ -39,12 +39,16 @@ CREATE TABLE IF NOT EXISTS playout_draft (
 ) COMMENT = '播出草稿表，每个频道+业务日一份';
 
 CREATE TABLE IF NOT EXISTS playout_draft_segment (
-    id           VARCHAR(64) NOT NULL COMMENT '片段 ID，客户端指定或系统生成',
-    channel_id   VARCHAR(64) NOT NULL COMMENT '所属频道 ID',
-    business_day DATE        NOT NULL COMMENT '所属业务日，Asia/Shanghai 日历日',
-    asset_id     VARCHAR(64) NOT NULL COMMENT '播出素材 ID',
-    start_ms     BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒，不得跨日',
-    end_ms       BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒，不得跨日',
+    id              VARCHAR(64) NOT NULL COMMENT '片段 ID，客户端指定或系统生成',
+    channel_id      VARCHAR(64) NOT NULL COMMENT '所属频道 ID',
+    business_day    DATE        NOT NULL COMMENT '所属业务日，Asia/Shanghai 日历日',
+    asset_id        VARCHAR(64) NOT NULL COMMENT '播出素材 ID',
+    start_ms        BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒，不得跨日',
+    end_ms          BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒，不得跨日；变速片段为起点加源长度乘 q 除 p',
+    source_start_ms BIGINT      NOT NULL COMMENT '源内容区间起点（含），素材内毫秒偏移；普通片段为 0',
+    source_end_ms   BIGINT      NOT NULL COMMENT '源内容区间终点（不含），素材内毫秒偏移，区间左闭右开；普通片段为播放时长',
+    rate_p          INT         NOT NULL COMMENT '播放速率分子（已约分），1～10；普通片段为 1',
+    rate_q          INT         NOT NULL COMMENT '播放速率分母（已约分），1～10；普通片段为 1；p/q 介于 1/2 与 2 之间',
     PRIMARY KEY (id),
     KEY idx_draft_segment (channel_id, business_day)
 ) COMMENT = '草稿片段表，随草稿整份替换而整体重建';
@@ -61,25 +65,31 @@ CREATE TABLE IF NOT EXISTS playout_publication (
 ) COMMENT = '发布快照表，快照只读，授权撤销不改写历史快照';
 
 CREATE TABLE IF NOT EXISTS playout_publication_segment (
-    id             BIGINT      NOT NULL AUTO_INCREMENT COMMENT '快照片段自增 ID',
-    publication_id BIGINT      NOT NULL COMMENT '所属发布快照 ID',
-    segment_id     VARCHAR(64) NOT NULL COMMENT '来源草稿片段 ID',
-    asset_id       VARCHAR(64) NOT NULL COMMENT '播出素材 ID',
-    grant_id       BIGINT      NOT NULL COMMENT '发布时完整覆盖该片段的授权 ID，播出查询据此实时判定撤销状态',
-    start_ms       BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒',
-    end_ms         BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒',
+    id              BIGINT      NOT NULL AUTO_INCREMENT COMMENT '快照片段自增 ID',
+    publication_id  BIGINT      NOT NULL COMMENT '所属发布快照 ID',
+    segment_id      VARCHAR(64) NOT NULL COMMENT '来源草稿片段 ID',
+    asset_id        VARCHAR(64) NOT NULL COMMENT '播出素材 ID',
+    grant_id        BIGINT      NOT NULL COMMENT '发布时完整覆盖该片段的授权 ID，播出查询据此实时判定撤销状态',
+    start_ms        BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒',
+    end_ms          BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒',
+    source_start_ms BIGINT      NOT NULL COMMENT '发布时冻结的源内容区间起点（含），素材内毫秒偏移',
+    source_end_ms   BIGINT      NOT NULL COMMENT '发布时冻结的源内容区间终点（不含），素材内毫秒偏移',
+    rate_p          INT         NOT NULL COMMENT '发布时冻结的已约分速率分子，1～10',
+    rate_q          INT         NOT NULL COMMENT '发布时冻结的已约分速率分母，1～10',
     PRIMARY KEY (id),
     KEY idx_pub_segment (publication_id)
-) COMMENT = '发布快照片段表，只读';
+) COMMENT = '发布快照片段表，只读；源区间与约分速率在发布时冻结，历史不更新';
 
 CREATE TABLE IF NOT EXISTS playout_request (
-    request_id    VARCHAR(64)  NOT NULL COMMENT '幂等请求 ID，客户端生成',
+    request_id    VARCHAR(64)  NOT NULL COMMENT '幂等请求 ID，客户端生成，全局唯一',
+    operator      VARCHAR(64)  NOT NULL COMMENT '操作者标识，非空；仅记录审计，不参与去重比较',
     operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE',
-    params_hash   VARCHAR(64)  NOT NULL COMMENT '业务参数（不含 requestId）的 SHA-256，十六进制',
+    resource      VARCHAR(128) NOT NULL COMMENT '操作作用的资源标识，如 频道|业务日、授权 ID、插播键',
+    params_hash   VARCHAR(64)  NOT NULL COMMENT '全参数（含期望版本，不含 requestId 与 operator）的 SHA-256，十六进制；速率按约分值、文本原样',
     response_body TEXT         NULL COMMENT '成功时的响应 JSON；失败请求回滚不占用 requestId',
     created_at_ms BIGINT       NOT NULL COMMENT '记录创建时间，UTC 纪元毫秒',
     PRIMARY KEY (request_id)
-) COMMENT = '幂等去重表，与业务结果同事务提交';
+) COMMENT = '幂等去重表，与业务结果同事务提交；同 requestId 按操作、资源、参数哈希结构化比较';
 
 CREATE TABLE IF NOT EXISTS playout_emergency_override (
     override_key      VARCHAR(64)  NOT NULL COMMENT '紧急插播全局唯一键，客户端指定，创建后不变',

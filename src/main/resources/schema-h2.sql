@@ -36,12 +36,16 @@ CREATE TABLE IF NOT EXISTS playout_draft (
 );
 
 CREATE TABLE IF NOT EXISTS playout_draft_segment (
-    id           VARCHAR(64) NOT NULL PRIMARY KEY,
-    channel_id   VARCHAR(64) NOT NULL,
-    business_day DATE        NOT NULL,
-    asset_id     VARCHAR(64) NOT NULL,
-    start_ms     BIGINT      NOT NULL,
-    end_ms       BIGINT      NOT NULL
+    id              VARCHAR(64) NOT NULL PRIMARY KEY,
+    channel_id      VARCHAR(64) NOT NULL,
+    business_day    DATE        NOT NULL,
+    asset_id        VARCHAR(64) NOT NULL,
+    start_ms        BIGINT      NOT NULL,
+    end_ms          BIGINT      NOT NULL,
+    source_start_ms BIGINT      NOT NULL,
+    source_end_ms   BIGINT      NOT NULL,
+    rate_p          INT         NOT NULL,
+    rate_q          INT         NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_draft_segment ON playout_draft_segment (channel_id, business_day);
 
@@ -57,22 +61,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS uk_publication_version
     ON playout_publication (channel_id, business_day, published_version);
 
 CREATE TABLE IF NOT EXISTS playout_publication_segment (
-    id             BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    publication_id BIGINT      NOT NULL,
-    segment_id     VARCHAR(64) NOT NULL,
-    asset_id       VARCHAR(64) NOT NULL,
-    grant_id       BIGINT      NOT NULL,
-    start_ms       BIGINT      NOT NULL,
-    end_ms         BIGINT      NOT NULL
+    id              BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    publication_id  BIGINT      NOT NULL,
+    segment_id      VARCHAR(64) NOT NULL,
+    asset_id        VARCHAR(64) NOT NULL,
+    grant_id        BIGINT      NOT NULL,
+    start_ms        BIGINT      NOT NULL,
+    end_ms          BIGINT      NOT NULL,
+    source_start_ms BIGINT      NOT NULL,
+    source_end_ms   BIGINT      NOT NULL,
+    rate_p          INT         NOT NULL,
+    rate_q          INT         NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pub_segment ON playout_publication_segment (publication_id);
 
 CREATE TABLE IF NOT EXISTS playout_request (
-    request_id    VARCHAR(64) NOT NULL PRIMARY KEY,
-    operation     VARCHAR(32) NOT NULL,
-    params_hash   VARCHAR(64) NOT NULL,
-    response_body TEXT        NULL,
-    created_at_ms BIGINT      NOT NULL
+    request_id    VARCHAR(64)  NOT NULL PRIMARY KEY,
+    operator      VARCHAR(64)  NOT NULL,
+    operation     VARCHAR(32)  NOT NULL,
+    resource      VARCHAR(128) NOT NULL,
+    params_hash   VARCHAR(64)  NOT NULL,
+    response_body TEXT         NULL,
+    created_at_ms BIGINT       NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS playout_emergency_override (

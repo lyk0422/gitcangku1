@@ -70,7 +70,7 @@ public class PlayoutController {
     @PostMapping("/grants/{grantId}/revoke")
     public GrantResponse revokeGrant(@PathVariable long grantId,
                                      @Valid @RequestBody RevokeGrantRequest request) {
-        return service.revokeGrant(grantId, request.requestId());
+        return service.revokeGrant(grantId, request.requestId(), request.operator());
     }
 
     /** 整份替换频道某业务日草稿（乐观锁 + 幂等）。 */
@@ -110,7 +110,7 @@ public class PlayoutController {
     public EmergencyOverrideResponse cancelEmergencyOverride(
             @PathVariable @NotBlank String overrideKey,
             @Valid @RequestBody CancelEmergencyOverrideRequest request) {
-        return service.cancelEmergencyOverride(overrideKey, request.requestId());
+        return service.cancelEmergencyOverride(overrideKey, request.requestId(), request.operator());
     }
 
     /** 查询紧急插播明细，ACTIVE/CANCELLED 均返回，保留取消情况与原授权关联。 */
