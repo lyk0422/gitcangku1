@@ -35,6 +35,7 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_file_edge");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
@@ -139,7 +140,8 @@ class ArtifactControllerHttpTest {
                 new HttpEntity<>(registerBody("lib", 2),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
 
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":3}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,"
+                + "\"expectedRepositoryVersion\":3,\"budgetBytes\":1000}";
         ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
@@ -172,7 +174,8 @@ class ArtifactControllerHttpTest {
         restTemplate.postForEntity("/api/artifacts",
                 new HttpEntity<>(registerBody("app", 1),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":0}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,"
+                + "\"expectedRepositoryVersion\":0,\"budgetBytes\":1000}";
         ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
@@ -187,7 +190,8 @@ class ArtifactControllerHttpTest {
         restTemplate.postForEntity("/api/artifacts",
                 new HttpEntity<>(registerBody("lib", 1),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":2}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,"
+                + "\"expectedRepositoryVersion\":2,\"budgetBytes\":1000}";
         ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
@@ -211,11 +215,151 @@ class ArtifactControllerHttpTest {
         assertThat(withdrawn.getBody().path("repositoryVersion").asLong()).isEqualTo(2L);
 
         // 撤回后锁定撤回的根 → 409。
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":2}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,"
+                + "\"expectedRepositoryVersion\":2,\"budgetBytes\":1000}";
         ResponseEntity<JsonNode> lockOnWithdrawn = restTemplate.postForEntity(
                 "/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
         assertThat(lockOnWithdrawn.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    // ------------------------------------------------------------------
+    // 体积预算
+    // ------------------------------------------------------------------
+
+    private String sizedRegisterBody(String name, int version, long sizeBytes,
+                                     Object... dependencies) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("name", name);
+        body.put("version", version);
+        body.put("sizeBytes", sizeBytes);
+        body.put("dependencies", List.of(dependencies));
+        return toJson(body);
+    }
+
+    @Test
+    void budgetLockViaHttpSelectsSmallerVersionAndReturnsFrozenTotals() {
+        // 题干合成场景：root(2B) -> a[1,2]、b[1,1]；a2=9B/a1=5B -> b[1,1]；b=3B。
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(sizedRegisterBody("root", 1, 2L,
+                        dependency("a", 1, 2), dependency("b", 1, 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(sizedRegisterBody("a", 2, 9L, dependency("b", 1, 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(sizedRegisterBody("a", 1, 5L, dependency("b", 1, 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(sizedRegisterBody("b", 1, 3L),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+
+        String lockBody = "{\"rootName\":\"root\",\"rootVersion\":1,"
+                + "\"expectedRepositoryVersion\":4,\"budgetBytes\":10}";
+        ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(lock.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        JsonNode body = lock.getBody();
+        assertThat(body.path("budgetBytes").asLong()).isEqualTo(10L);
+        assertThat(body.path("totalSizeBytes").asLong()).isEqualTo(10L);
+        assertThat(body.path("entries")).hasSize(3);
+        // a2 组合 14B 超预算，回退 a1。
+        assertThat(body.path("entries").get(0).path("name").asText()).isEqualTo("a");
+        assertThat(body.path("entries").get(0).path("version").asInt()).isEqualTo(1);
+        assertThat(body.path("entries").get(0).path("sizeBytes").asLong()).isEqualTo(5L);
+        assertThat(body.path("edges")).hasSize(3);
+
+        // 历史查询同样返回冻结的预算与总量。
+        ResponseEntity<JsonNode> one = restTemplate.getForEntity(
+                "/api/artifacts/locks/{id}", JsonNode.class, body.path("id").asLong());
+        assertThat(one.getBody().path("totalSizeBytes").asLong()).isEqualTo(10L);
+        assertThat(one.getBody().path("budgetBytes").asLong()).isEqualTo(10L);
+    }
+
+    @Test
+    void overBudgetLockViaHttpReturns422() {
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(sizedRegisterBody("app", 1, 8L, dependency("lib", 1, 1)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(sizedRegisterBody("lib", 1, 5L),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,"
+                + "\"expectedRepositoryVersion\":2,\"budgetBytes\":10}";
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+    }
+
+    @Test
+    void negativeBudgetReturns400() {
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("app", 1),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,"
+                + "\"expectedRepositoryVersion\":1,\"budgetBytes\":-1}";
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void nonIntegerBudgetReturns400() {
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,"
+                + "\"expectedRepositoryVersion\":0,\"budgetBytes\":10.5}";
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void missingBudgetReturns400() {
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,"
+                + "\"expectedRepositoryVersion\":0}";
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void negativeSizeBytesRegisterReturns400() {
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(sizedRegisterBody("app", 1, -5L),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void nonIntegerSizeBytesRegisterReturns400() {
+        String body = "{\"name\":\"app\",\"version\":1,\"sizeBytes\":\"abc\",\"dependencies\":[]}";
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(body, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void sameRequestIdWithChangedBudgetReturns409ViaHttp() {
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("app", 1),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        String rid = UUID.randomUUID().toString();
+        String first = "{\"rootName\":\"app\",\"rootVersion\":1,"
+                + "\"expectedRepositoryVersion\":1,\"budgetBytes\":100}";
+        ResponseEntity<JsonNode> created = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(first, jsonHeaders(rid)), JsonNode.class);
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        String changed = "{\"rootName\":\"app\",\"rootVersion\":1,"
+                + "\"expectedRepositoryVersion\":1,\"budgetBytes\":200}";
+        ResponseEntity<JsonNode> conflict = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(changed, jsonHeaders(rid)), JsonNode.class);
+        assertThat(conflict.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
     }
 }

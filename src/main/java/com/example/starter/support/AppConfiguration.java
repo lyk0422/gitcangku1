@@ -1,5 +1,7 @@
 package com.example.starter.support;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import org.springframework.boot.autoconfigure.jackson.Jackson2ObjectMapperBuilderCustomizer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -15,5 +17,11 @@ public class AppConfiguration {
     @Bean
     public Clock clock() {
         return Clock.systemUTC();
+    }
+
+    /** 非整数 JSON 数值（如 10.5）不得截断为整型，按请求不合法（400）处理。 */
+    @Bean
+    public Jackson2ObjectMapperBuilderCustomizer strictIntegralCoercion() {
+        return builder -> builder.featuresToDisable(DeserializationFeature.ACCEPT_FLOAT_AS_INT);
     }
 }

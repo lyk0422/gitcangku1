@@ -24,14 +24,18 @@ class LockResolverTest {
             List<TestVersion> versions = (List<TestVersion>) groups[i + 1];
             List<ArtifactVersion> list = versions.stream()
                     .map(v -> new ArtifactVersion(id.getAndIncrement(), name, v.version(),
-                            v.withdrawn(), v.deps()))
+                            v.withdrawn(), v.deps(), v.sizeBytes()))
                     .toList();
             map.put(name, list);
         }
         return new RepositorySnapshot(version, map);
     }
 
-    private record TestVersion(int version, boolean withdrawn, List<DependencyRange> deps) {
+    private record TestVersion(int version, boolean withdrawn, List<DependencyRange> deps,
+                               long sizeBytes) {
+        private TestVersion(int version, boolean withdrawn, List<DependencyRange> deps) {
+            this(version, withdrawn, deps, 0L);
+        }
     }
 
     private static TestVersion v(int version, DependencyRange... deps) {
@@ -40,6 +44,11 @@ class LockResolverTest {
 
     private static TestVersion w(int version, DependencyRange... deps) {
         return new TestVersion(version, true, List.of(deps));
+    }
+
+    /** 带体积的候选版本。 */
+    private static TestVersion vs(int version, long sizeBytes, DependencyRange... deps) {
+        return new TestVersion(version, false, List.of(deps), sizeBytes);
     }
 
     private static DependencyRange dep(String name, int min, int max) {
@@ -182,5 +191,75 @@ class LockResolverTest {
         Map<String, Integer> result = LockResolver.resolve(s, "root", 1);
         assertThat(result).isNotNull();
         assertThat(result.keySet()).containsExactly("alib", "root", "zlib");
+    }
+
+    // ------------------------------------------------------------------
+    // 体积预算
+    // ------------------------------------------------------------------
+
+    @Test
+    void overBudgetCandidateFallsBackToSmallerVersion() {
+        // root(2B) -> a[1,2]；a2=9B 时 2+9=11 超预算 10，回退 a1=5B（2+5=7）。
+        RepositorySnapshot s = snapshot(0,
+                "root", List.of(vs(1, 2, dep("a", 1, 2))),
+                "a", List.of(vs(2, 9), vs(1, 5)));
+        assertThat(LockResolver.resolve(s, "root", 1, 10))
+                .isEqualTo(Map.of("root", 1, "a", 1));
+    }
+
+    @Test
+    void sharedDependencyCountedOnceTowardsBudget() {
+        // root(2B) 与 a1(5B) 都依赖 b；b(3B) 只计一次：2+5+3=10，预算 10 可行、9 不可行。
+        RepositorySnapshot s = snapshot(0,
+                "root", List.of(vs(1, 2, dep("a", 1, 1), dep("b", 1, 1))),
+                "a", List.of(vs(1, 5, dep("b", 1, 1))),
+                "b", List.of(vs(1, 3)));
+        assertThat(LockResolver.resolve(s, "root", 1, 10))
+                .isEqualTo(Map.of("root", 1, "a", 1, "b", 1));
+        assertThat(LockResolver.resolve(s, "root", 1, 9)).isNull();
+    }
+
+    @Test
+    void allCombinationsOverBudgetReturnNull() {
+        RepositorySnapshot s = snapshot(0,
+                "root", List.of(vs(1, 2, dep("a", 1, 2))),
+                "a", List.of(vs(2, 9), vs(1, 5)));
+        // 最小组合 2+5=7 仍超预算 6。
+        assertThat(LockResolver.resolve(s, "root", 1, 6)).isNull();
+    }
+
+    @Test
+    void rootAloneExceedingBudgetReturnsNull() {
+        RepositorySnapshot s = snapshot(0, "root", List.of(vs(1, 5)));
+        assertThat(LockResolver.resolve(s, "root", 1, 4)).isNull();
+        assertThat(LockResolver.resolve(s, "root", 1, 5))
+                .isEqualTo(Map.of("root", 1));
+    }
+
+    @Test
+    void zeroBudgetAllowsAllZeroSizeGraph() {
+        RepositorySnapshot s = snapshot(0,
+                "root", List.of(v(1, dep("a", 1, 1))),
+                "a", List.of(v(1)));
+        assertThat(LockResolver.resolve(s, "root", 1, 0))
+                .isEqualTo(Map.of("root", 1, "a", 1));
+    }
+
+    @Test
+    void exactTotalOverflowingLongIsTreatedAsOverBudget() {
+        // 两个制品体积均接近 long 上限，精确总和溢出；必须视为预算不足而非溢出变负通过。
+        RepositorySnapshot s = snapshot(0,
+                "root", List.of(vs(1, Long.MAX_VALUE - 1, dep("a", 1, 1))),
+                "a", List.of(vs(1, Long.MAX_VALUE - 1)));
+        assertThat(LockResolver.resolve(s, "root", 1, Long.MAX_VALUE)).isNull();
+    }
+
+    @Test
+    void budgetEqualToExactTotalResolves() {
+        RepositorySnapshot s = snapshot(0,
+                "root", List.of(vs(1, 2, dep("a", 1, 1))),
+                "a", List.of(vs(1, 8)));
+        assertThat(LockResolver.resolve(s, "root", 1, 10))
+                .isEqualTo(Map.of("root", 1, "a", 1));
     }
 }

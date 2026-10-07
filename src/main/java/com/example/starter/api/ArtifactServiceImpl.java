@@ -3,6 +3,7 @@ package com.example.starter.api;
 import com.example.starter.api.dto.ArtifactResponse;
 import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.DependencyView;
+import com.example.starter.api.dto.LockEdgeResponse;
 import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
@@ -70,7 +71,7 @@ public class ArtifactServiceImpl implements ArtifactService {
         requireRequestId(requestId);
         validateRegisterRequest(request);
         String hash = sha256(OP_REGISTER + "|" + request.name().trim() + "|" + request.version() + "|"
-                + canonicalDependencies(request));
+                + request.sizeBytes() + "|" + canonicalDependencies(request));
         return executeIdempotent(requestId, OP_REGISTER, hash, 201,
                 () -> doRegister(request), ArtifactResponse.class);
     }
@@ -92,8 +93,14 @@ public class ArtifactServiceImpl implements ArtifactService {
         if (request.rootName() == null || request.rootName().isBlank()) {
             throw ApiException.badRequest("rootName 不能为空");
         }
+        if (request.budgetBytes() == null) {
+            throw ApiException.badRequest("budgetBytes 不能为空");
+        }
+        if (request.budgetBytes() < 0) {
+            throw ApiException.badRequest("budgetBytes 不能为负数");
+        }
         String hash = sha256(OP_LOCK + "|" + request.rootName().trim() + "|" + request.rootVersion()
-                + "|" + request.expectedRepositoryVersion());
+                + "|" + request.expectedRepositoryVersion() + "|" + request.budgetBytes());
         return executeIdempotent(requestId, OP_LOCK, hash, 201,
                 () -> doLock(request), LockFileResponse.class);
     }
@@ -138,7 +145,7 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
 
         Instant now = Instant.now(clock);
-        long artifactId = repositoryDao.insertArtifact(name, version, now);
+        long artifactId = repositoryDao.insertArtifact(name, version, request.sizeBytes(), now);
         for (var dep : request.dependencies()) {
             repositoryDao.insertDependency(artifactId, dep.name().trim(),
                     dep.minimumVersion(), dep.maximumVersion());
@@ -146,7 +153,7 @@ public class ArtifactServiceImpl implements ArtifactService {
         long repositoryVersion = repositoryDao.incrementRepositoryVersion();
 
         return new ArtifactResponse(name, version, false, repositoryVersion, now,
-                toDependencyViews(request.dependencies()));
+                toDependencyViews(request.dependencies()), request.sizeBytes());
     }
 
     private ArtifactResponse doWithdraw(String name, int version) {
@@ -164,7 +171,8 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
         long repositoryVersion = repositoryDao.incrementRepositoryVersion();
         return new ArtifactResponse(name, version, true, repositoryVersion,
-                Instant.now(clock), toDependencyViews(artifact.dependencies()));
+                Instant.now(clock), toDependencyViews(artifact.dependencies()),
+                artifact.sizeBytes());
     }
 
     private LockFileResponse doLock(LockRequest request) {
@@ -187,20 +195,45 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
 
         RepositorySnapshot snapshot = repositoryDao.loadSnapshot();
-        Map<String, Integer> solution = LockResolver.resolve(snapshot, rootName, rootVersion);
+        long budgetBytes = request.budgetBytes();
+        Map<String, Integer> solution = LockResolver.resolve(snapshot, rootName, rootVersion,
+                budgetBytes);
         if (solution == null) {
             throw ApiException.unprocessable(
-                    "不存在满足全部依赖区间的未撤回版本组合，无法锁定");
+                    "不存在满足全部依赖区间且体积总和不超过预算的未撤回版本组合，无法锁定");
+        }
+
+        // 冻结各选中制品当时的体积与依赖边；同名只计一次，总和已通过预算校验，不会溢出。
+        Map<String, ArtifactVersion> selected = new TreeMap<>();
+        solution.forEach((name, version) -> snapshot.artifacts().get(name).stream()
+                .filter(a -> a.version() == version)
+                .findFirst()
+                .ifPresent(a -> selected.put(name, a)));
+        long totalSizeBytes = 0L;
+        for (ArtifactVersion artifact : selected.values()) {
+            totalSizeBytes += artifact.sizeBytes();
         }
 
         Instant now = Instant.now(clock);
         long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, currentVersion,
-                currentRequestId.get(), now);
-        solution.forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
+                budgetBytes, totalSizeBytes, currentRequestId.get(), now);
+        selected.forEach((name, artifact) -> repositoryDao.insertLockEntry(
+                lockFileId, name, artifact.version(), artifact.sizeBytes()));
+        List<LockEdgeResponse> edges = new ArrayList<>();
+        selected.forEach((name, artifact) -> artifact.dependencies().stream()
+                .sorted((d1, d2) -> d1.name().compareTo(d2.name()))
+                .forEach(dep -> {
+                    repositoryDao.insertLockEdge(lockFileId, name, dep.name(),
+                            dep.minimumVersion(), dep.maximumVersion());
+                    edges.add(new LockEdgeResponse(name, dep.name(),
+                            dep.minimumVersion(), dep.maximumVersion()));
+                }));
 
         List<LockEntryResponse> entries = new ArrayList<>();
-        solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
-        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
+        selected.forEach((name, artifact) -> entries.add(
+                new LockEntryResponse(name, artifact.version(), artifact.sizeBytes())));
+        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion,
+                budgetBytes, totalSizeBytes, now, entries, edges);
     }
 
     // ------------------------------------------------------------------
@@ -275,6 +308,9 @@ public class ArtifactServiceImpl implements ArtifactService {
         if (request.name() == null || request.name().isBlank()) {
             throw ApiException.badRequest("name 不能为空");
         }
+        if (request.sizeBytes() == null || request.sizeBytes() < 0) {
+            throw ApiException.badRequest("sizeBytes 不能为负数");
+        }
         List<DependencySpec> deps = request.dependencies();
         if (deps.size() > 10) {
             throw ApiException.badRequest("每个制品版本最多声明 10 条依赖");
@@ -319,10 +355,15 @@ public class ArtifactServiceImpl implements ArtifactService {
 
     private LockFileResponse toLockResponse(LockFileRow row, List<LockEntryRow> entries) {
         List<LockEntryResponse> entryViews = entries.stream()
-                .map(e -> new LockEntryResponse(e.name(), e.version()))
+                .map(e -> new LockEntryResponse(e.name(), e.version(), e.sizeBytes()))
+                .toList();
+        List<LockEdgeResponse> edgeViews = repositoryDao.listLockEdges(row.id()).stream()
+                .map(e -> new LockEdgeResponse(e.fromName(), e.toName(),
+                        e.minimumVersion(), e.maximumVersion()))
                 .toList();
         return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(),
-                row.repositoryVersion(), row.createdAt(), entryViews);
+                row.repositoryVersion(), row.budgetBytes(), row.totalSizeBytes(),
+                row.createdAt(), entryViews, edgeViews);
     }
 
     private void requireRequestId(String requestId) {

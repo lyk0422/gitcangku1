@@ -12,12 +12,14 @@ CREATE TABLE IF NOT EXISTS artifact (
     name       VARCHAR(128) NOT NULL,
     version    INT          NOT NULL,
     withdrawn  TINYINT      NOT NULL DEFAULT 0,
+    size_bytes BIGINT       NOT NULL DEFAULT 0,
     created_at TIMESTAMP(6) NOT NULL
 );
 COMMENT ON TABLE artifact IS '软件制品版本，name 与 version 联合唯一，撤回不删除';
 COMMENT ON COLUMN artifact.name IS '制品名称';
 COMMENT ON COLUMN artifact.version IS '制品版本号，正整数';
 COMMENT ON COLUMN artifact.withdrawn IS '撤回状态：0=有效，1=已撤回（记录保留）';
+COMMENT ON COLUMN artifact.size_bytes IS '制品体积，单位字节，非负整数；历史未声明版本按 0 处理';
 COMMENT ON COLUMN artifact.created_at IS '登记时间，UTC 时间戳';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_artifact_name_version ON artifact (name, version);
@@ -44,6 +46,8 @@ CREATE TABLE IF NOT EXISTS lock_file (
     root_name          VARCHAR(128) NOT NULL,
     root_version       INT          NOT NULL,
     repository_version BIGINT       NOT NULL,
+    budget_bytes       BIGINT       NOT NULL,
+    total_size_bytes   BIGINT       NOT NULL,
     request_id         VARCHAR(64)  NOT NULL,
     created_at         TIMESTAMP(6) NOT NULL
 );
@@ -51,6 +55,8 @@ COMMENT ON TABLE lock_file IS '锁定文件：一次成功锁定的根、精确�
 COMMENT ON COLUMN lock_file.root_name IS '根制品名称（精确版本，锁定时固定）';
 COMMENT ON COLUMN lock_file.root_version IS '根制品版本号，正整数';
 COMMENT ON COLUMN lock_file.repository_version IS '锁定时读取的仓库版本号';
+COMMENT ON COLUMN lock_file.budget_bytes IS '锁定时声明的体积预算，单位字节，非负长整型';
+COMMENT ON COLUMN lock_file.total_size_bytes IS '锁定时冻结的选中制品体积精确总和（同名只计一次），单位字节';
 COMMENT ON COLUMN lock_file.request_id IS '触发锁定的全局唯一请求 ID';
 COMMENT ON COLUMN lock_file.created_at IS '锁定生成时间，UTC 时间戳';
 
@@ -62,14 +68,34 @@ CREATE TABLE IF NOT EXISTS lock_file_entry (
     lock_file_id BIGINT       NOT NULL,
     name         VARCHAR(128) NOT NULL,
     version      INT          NOT NULL,
+    size_bytes   BIGINT       NOT NULL,
     CONSTRAINT fk_entry_lock FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
 );
 COMMENT ON TABLE lock_file_entry IS '锁文件中的精确制品版本，每个名称仅一个版本';
 COMMENT ON COLUMN lock_file_entry.lock_file_id IS '所属锁文件 ID';
 COMMENT ON COLUMN lock_file_entry.name IS '被锁定制品名称';
 COMMENT ON COLUMN lock_file_entry.version IS '被锁定的精确版本号，正整数';
+COMMENT ON COLUMN lock_file_entry.size_bytes IS '锁定时冻结的制品体积，单位字节，不随后续元数据变化';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_entry_lock_name ON lock_file_entry (lock_file_id, name);
+
+CREATE TABLE IF NOT EXISTS lock_file_edge (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_file_id    BIGINT       NOT NULL,
+    from_name       VARCHAR(128) NOT NULL,
+    to_name         VARCHAR(128) NOT NULL,
+    minimum_version INT          NOT NULL,
+    maximum_version INT          NOT NULL,
+    CONSTRAINT fk_edge_lock FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
+);
+COMMENT ON TABLE lock_file_edge IS '锁定时冻结的选中制品间依赖边（声明区间），不随后续元数据变化';
+COMMENT ON COLUMN lock_file_edge.lock_file_id IS '所属锁文件 ID';
+COMMENT ON COLUMN lock_file_edge.from_name IS '声明依赖的选中制品名称';
+COMMENT ON COLUMN lock_file_edge.to_name IS '被依赖的选中制品名称';
+COMMENT ON COLUMN lock_file_edge.minimum_version IS '依赖最低版本（含），正整数';
+COMMENT ON COLUMN lock_file_edge.maximum_version IS '依赖最高版本（含），正整数';
+
+CREATE INDEX IF NOT EXISTS idx_edge_lock ON lock_file_edge (lock_file_id);
 
 CREATE TABLE IF NOT EXISTS idempotent_request (
     request_id     VARCHAR(64)  NOT NULL PRIMARY KEY,
