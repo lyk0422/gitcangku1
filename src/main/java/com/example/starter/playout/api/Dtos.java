@@ -60,27 +60,43 @@ public final class Dtos {
     public record RevokeGrantRequest(@NotBlank String requestId) {
     }
 
-    /** 草稿片段输入；id 为空时由系统生成。 */
+    /**
+     * 草稿片段输入；id 为空时由系统生成。
+     *
+     * <p>普通片段不携带源区间与速率，速率视为 1/1，源区间为 [0, 播放时长)。
+     * 变速片段须同时给出 sourceStartMs/sourceEndMs/rateP/rateQ：源区间左闭右开且落在素材时长内，
+     * p、q 为 1~10 整数且比率在 1/2~2 之间；播放时长（end-start）必须等于源长度乘 q 除 p
+     * 的正整数毫秒，且不超过素材原总长。
+     */
     public record SegmentInput(
             String id,
             @NotBlank String assetId,
             @NotNull OffsetDateTime start,
-            @NotNull OffsetDateTime end) {
+            @NotNull OffsetDateTime end,
+            Long sourceStartMs,
+            Long sourceEndMs,
+            Integer rateP,
+            Integer rateQ) {
     }
 
-    /** 整份替换草稿请求。 */
+    /** 整份替换草稿请求；operator 为非空操作者标识，参与幂等参数比较。 */
     public record ReplaceDraftRequest(
             @NotBlank String requestId,
+            @NotBlank String operator,
             @NotNull @PositiveOrZero Long expectedDraftVersion,
             @NotNull List<@NotNull SegmentInput> segments) {
     }
 
-    /** 草稿片段响应。 */
+    /** 草稿片段响应；rateP/rateQ 为约分后的速率，普通片段为 1/1。 */
     public record SegmentResponse(
             String id,
             String assetId,
             OffsetDateTime start,
-            OffsetDateTime end) {
+            OffsetDateTime end,
+            long sourceStartMs,
+            long sourceEndMs,
+            int rateP,
+            int rateQ) {
     }
 
     /** 草稿响应。 */
@@ -91,9 +107,10 @@ public final class Dtos {
             List<SegmentResponse> segments) {
     }
 
-    /** 发布请求。 */
+    /** 发布请求；operator 为非空操作者标识，参与幂等参数比较。 */
     public record PublishRequest(
             @NotBlank String requestId,
+            @NotBlank String operator,
             @NotNull @Positive Long draftVersion,
             @NotNull @PositiveOrZero Long expectedPublishedVersion) {
     }
@@ -117,7 +134,21 @@ public final class Dtos {
         NO_PUBLISHED_SCHEDULE, GAP, GRANT_REVOKED
     }
 
-    /** 播出决定响应；source 为 FALLBACK 时 reason 非空；source 为 EMERGENCY 时 overrideKey 非空。 */
+    /**
+     * 源内容偏移：时刻 t 的源偏移 = 源起点 + (t - 片段播放起点) * p / q。
+     * numerator/denominator 为约分后的精确分数（单位毫秒），displayMs 为其向下取整的显示毫秒；
+     * 显示毫秒仅用于展示，不作为越界判断依据。
+     */
+    public record SourceOffsetResponse(
+            long numerator,
+            long denominator,
+            long displayMs) {
+    }
+
+    /**
+     * 播出决定响应；source 为 FALLBACK 时 reason 非空；source 为 EMERGENCY 时 overrideKey 非空；
+     * source 为 PROGRAM 时 sourceOffset 非空（按发布冻结的源区间与约分速率、以墙钟计算）。
+     */
     public record PlayoutDecisionResponse(
             String channelId,
             OffsetDateTime at,
@@ -126,7 +157,8 @@ public final class Dtos {
             FallbackReason reason,
             Long publicationId,
             String segmentId,
-            String overrideKey) {
+            String overrideKey,
+            SourceOffsetResponse sourceOffset) {
     }
 
     /** 紧急插播状态：创建即 ACTIVE，取消后为 CANCELLED，均为终态语义（ACTIVE 只能转为 CANCELLED）。 */

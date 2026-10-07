@@ -41,7 +41,11 @@ CREATE TABLE IF NOT EXISTS playout_draft_segment (
     business_day DATE        NOT NULL,
     asset_id     VARCHAR(64) NOT NULL,
     start_ms     BIGINT      NOT NULL,
-    end_ms       BIGINT      NOT NULL
+    end_ms       BIGINT      NOT NULL,
+    source_start_ms BIGINT   NOT NULL,
+    source_end_ms   BIGINT   NOT NULL,
+    rate_p       INT         NOT NULL DEFAULT 1,
+    rate_q       INT         NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_draft_segment ON playout_draft_segment (channel_id, business_day);
 
@@ -63,7 +67,11 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
     asset_id       VARCHAR(64) NOT NULL,
     grant_id       BIGINT      NOT NULL,
     start_ms       BIGINT      NOT NULL,
-    end_ms         BIGINT      NOT NULL
+    end_ms         BIGINT      NOT NULL,
+    source_start_ms BIGINT     NOT NULL,
+    source_end_ms   BIGINT     NOT NULL,
+    rate_p         INT         NOT NULL DEFAULT 1,
+    rate_q         INT         NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_pub_segment ON playout_publication_segment (publication_id);
 
@@ -72,6 +80,7 @@ CREATE TABLE IF NOT EXISTS playout_request (
     operation     VARCHAR(32) NOT NULL,
     params_hash   VARCHAR(64) NOT NULL,
     response_body TEXT        NULL,
+    operator      VARCHAR(64) NULL,
     created_at_ms BIGINT      NOT NULL
 );
 

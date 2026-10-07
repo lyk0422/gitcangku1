@@ -530,6 +530,7 @@ class EmergencyOverrideApiTest {
         segments.add(segment);
         Map<String, Object> draftBody = new LinkedHashMap<>();
         draftBody.put("requestId", "draft-" + ctx.prefix + segmentId);
+        draftBody.put("operator", "tester");
         draftBody.put("expectedDraftVersion", 0);
         draftBody.put("segments", segments);
         mvc.perform(put("/api/channels/" + ctx.channel + "/drafts/" + DAY)
@@ -537,7 +538,7 @@ class EmergencyOverrideApiTest {
                         .content(objectMapper.writeValueAsString(draftBody)))
                 .andExpect(status().isOk());
         postJson("/api/channels/" + ctx.channel + "/drafts/" + DAY + "/publish",
-                        Map.of("requestId", "pub-" + ctx.prefix + segmentId,
+                        Map.of("requestId", "pub-" + ctx.prefix + segmentId, "operator", "tester",
                                 "draftVersion", 1, "expectedPublishedVersion", 0))
                 .andExpect(status().isOk());
     }

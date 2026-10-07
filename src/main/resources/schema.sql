@@ -45,9 +45,13 @@ CREATE TABLE IF NOT EXISTS playout_draft_segment (
     asset_id     VARCHAR(64) NOT NULL COMMENT '播出素材 ID',
     start_ms     BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒，不得跨日',
     end_ms       BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒，不得跨日',
+    source_start_ms BIGINT   NOT NULL COMMENT '源内容起点（含），素材内毫秒偏移；普通片段为 0',
+    source_end_ms   BIGINT   NOT NULL COMMENT '源内容终点（不含），素材内毫秒偏移，区间左闭右开；普通片段等于播放时长',
+    rate_p       INT         NOT NULL DEFAULT 1 COMMENT '播放速率分子 p，1~10 整数，与 rate_q 约分存储，比率须在 1/2~2；普通片段为 1',
+    rate_q       INT         NOT NULL DEFAULT 1 COMMENT '播放速率分母 q，1~10 整数；普通片段为 1',
     PRIMARY KEY (id),
     KEY idx_draft_segment (channel_id, business_day)
-) COMMENT = '草稿片段表，随草稿整份替换而整体重建';
+) COMMENT = '草稿片段表，随草稿整份替换而整体重建；播放时长须等于源长度乘 rate_q 除 rate_p';
 
 CREATE TABLE IF NOT EXISTS playout_publication (
     id                BIGINT      NOT NULL AUTO_INCREMENT COMMENT '发布快照自增 ID',
@@ -68,15 +72,20 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
     grant_id       BIGINT      NOT NULL COMMENT '发布时完整覆盖该片段的授权 ID，播出查询据此实时判定撤销状态',
     start_ms       BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒',
     end_ms         BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒',
+    source_start_ms BIGINT     NOT NULL COMMENT '发布时冻结的源内容起点（含），素材内毫秒偏移',
+    source_end_ms   BIGINT     NOT NULL COMMENT '发布时冻结的源内容终点（不含），素材内毫秒偏移，区间左闭右开',
+    rate_p         INT         NOT NULL DEFAULT 1 COMMENT '发布时冻结的约分速率分子 p；历史快照不随后续草稿更新',
+    rate_q         INT         NOT NULL DEFAULT 1 COMMENT '发布时冻结的约分速率分母 q',
     PRIMARY KEY (id),
     KEY idx_pub_segment (publication_id)
-) COMMENT = '发布快照片段表，只读';
+) COMMENT = '发布快照片段表，只读；源区间与约分速率在发布时冻结';
 
 CREATE TABLE IF NOT EXISTS playout_request (
     request_id    VARCHAR(64)  NOT NULL COMMENT '幂等请求 ID，客户端生成',
     operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE',
     params_hash   VARCHAR(64)  NOT NULL COMMENT '业务参数（不含 requestId）的 SHA-256，十六进制',
     response_body TEXT         NULL COMMENT '成功时的响应 JSON；失败请求回滚不占用 requestId',
+    operator      VARCHAR(64)  NULL COMMENT '操作者标识，新增写操作必填非空；早期无操作者的记录为 NULL',
     created_at_ms BIGINT       NOT NULL COMMENT '记录创建时间，UTC 纪元毫秒',
     PRIMARY KEY (request_id)
 ) COMMENT = '幂等去重表，与业务结果同事务提交';
