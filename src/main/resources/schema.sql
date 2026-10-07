@@ -61,10 +61,31 @@ CREATE TABLE IF NOT EXISTS bag_event (
     UNIQUE (bag_tag, seq)
 );
 
+-- 航段待装队列：一个航段至多一个队列；队列存在即视为该航段已启用队列，禁止普通直接装载
+CREATE TABLE IF NOT EXISTS leg_queue (
+    leg_id     VARCHAR(64) NOT NULL COMMENT '启用待装队列的航段标识',
+    version    INT         NOT NULL DEFAULT 1 COMMENT '队列版本，初始 1，入队/撤队/出队成功各加一',
+    next_seq   INT         NOT NULL DEFAULT 1 COMMENT '下一个待分配队列序号，只增不减；撤队保留序号历史，不重排不重用',
+    created_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    PRIMARY KEY (leg_id)
+);
+
+-- 队列成员：序号在航段内唯一且历史保留；同一行李在同一航段至多一个 WAITING 有效位置
+CREATE TABLE IF NOT EXISTS queue_member (
+    leg_id      VARCHAR(64) NOT NULL COMMENT '航段标识',
+    seq         INT         NOT NULL COMMENT '队列序号，按入队请求给定顺序递增分配，撤队/出队后保留不重排',
+    bag_tag     VARCHAR(64) NOT NULL COMMENT '行李牌号',
+    status      VARCHAR(16) NOT NULL DEFAULT 'WAITING' COMMENT '成员状态：WAITING 待装/DEQUEUED 已出队/CANCELLED 已撤队',
+    enqueued_by VARCHAR(64) NOT NULL COMMENT '入队操作者，非空',
+    created_at  TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '入队时间',
+    updated_at  TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次状态变更时间',
+    PRIMARY KEY (leg_id, seq)
+);
+
 -- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER/QUEUE_ENQUEUE/QUEUE_DEQUEUE/QUEUE_CANCEL',
     request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',

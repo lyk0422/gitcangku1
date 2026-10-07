@@ -14,13 +14,20 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.CancelRequest;
+import com.example.starter.baggage.BaggageDtos.CancelResponse;
+import com.example.starter.baggage.BaggageDtos.DequeueRequest;
+import com.example.starter.baggage.BaggageDtos.DequeueResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
+import com.example.starter.baggage.BaggageDtos.EnqueueRequest;
+import com.example.starter.baggage.BaggageDtos.EnqueueResponse;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.QueueResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -107,5 +114,32 @@ public class BaggageController {
     @GetMapping("/bags/short-unloaded")
     public ShortListResponse listShortUnloaded() {
         return baggageService.listShortUnloaded();
+    }
+
+    /** 入队：绑定 1~5 件当前可装行李，按请求顺序分配递增队列序号。 */
+    @PostMapping("/legs/{legId}/queue/enqueue")
+    public EnqueueResponse enqueue(@PathVariable String legId,
+                                   @Valid @RequestBody EnqueueRequest request) {
+        return baggageService.enqueue(legId, request);
+    }
+
+    /** 出队：取最前面至多 count 个有效成员，整批执行原装载规则。 */
+    @PostMapping("/legs/{legId}/queue/dequeue")
+    public DequeueResponse dequeue(@PathVariable String legId,
+                                   @Valid @RequestBody DequeueRequest request) {
+        return baggageService.dequeue(legId, request);
+    }
+
+    /** 撤队：撤销有效队列位置，序号保留历史不重排不重用。 */
+    @PostMapping("/legs/{legId}/queue/cancel")
+    public CancelResponse cancelQueueMember(@PathVariable String legId,
+                                            @Valid @RequestBody CancelRequest request) {
+        return baggageService.cancelQueueMember(legId, request);
+    }
+
+    /** 队列查询：返回队列版本与全部成员（含历史），按序号升序。 */
+    @GetMapping("/legs/{legId}/queue")
+    public QueueResponse getQueue(@PathVariable String legId) {
+        return baggageService.getQueue(legId);
     }
 }

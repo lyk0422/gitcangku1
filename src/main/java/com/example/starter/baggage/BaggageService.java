@@ -17,14 +17,23 @@ import org.springframework.stereotype.Service;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.CancelRequest;
+import com.example.starter.baggage.BaggageDtos.CancelResponse;
+import com.example.starter.baggage.BaggageDtos.DequeueRequest;
+import com.example.starter.baggage.BaggageDtos.DequeueResponse;
+import com.example.starter.baggage.BaggageDtos.DequeuedItem;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
+import com.example.starter.baggage.BaggageDtos.EnqueueRequest;
+import com.example.starter.baggage.BaggageDtos.EnqueueResponse;
 import com.example.starter.baggage.BaggageDtos.ItineraryItem;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.QueueMemberItem;
+import com.example.starter.baggage.BaggageDtos.QueueResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -42,6 +51,10 @@ import com.example.starter.baggage.BaggageDtos.TraceEvent;
  * load_record 以 bag_tag 为主键保证同件行李不会进入两个清单。
  * 差异到达仅允许 SEALED 航段提交封舱清单子集；缺失行李转 SHORT_UNLOADED 并冻结待乘索引，
  * 补到前无法装载任何后续航段，补到提交后才恢复参与装载。
+ * 航段可启用有序待装队列（首次入队时创建）：入队按请求顺序分配递增序号，
+ * 出队只取最前面有效成员并整批执行原装载规则，撤队保留序号历史不重排不重用；
+ * 队列版本初始 1，入队/撤队/出队成功各加一；启用队列的航段禁止普通直接装载（409），
+ * 存在有效未出队成员时禁止封舱（422）。出队、补到、撤队、封舱与入队经航段行级锁共享一致视图。
  */
 @Service
 public class BaggageService {
@@ -62,6 +75,12 @@ public class BaggageService {
     private static final String EVT_SHORT = "SHORT_UNLOADED";
     private static final String EVT_RECOVERED = "RECOVERED";
     private static final String EVT_DELIVERED = "DELIVERED";
+
+    private static final String QUEUE_WAITING = "WAITING";
+    private static final String QUEUE_DEQUEUED = "DEQUEUED";
+    private static final String QUEUE_CANCELLED = "CANCELLED";
+    /** 每航段队列最多容纳的有效（WAITING）成员数。 */
+    private static final int QUEUE_MAX_ACTIVE = 20;
 
     private static final RowMapper<LegRow> LEG_MAPPER = (rs, rowNum) -> new LegRow(
             rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"),
@@ -85,6 +104,12 @@ public class BaggageService {
             rs.getString("bag_tag"), rs.getString("short_leg_id"), rs.getString("short_destination"),
             getInstant(rs, "short_registered_at").toString(),
             rs.getInt("next_leg_index"), rs.getString("current_location"));
+
+    private static final RowMapper<QueueRow> QUEUE_MAPPER = (rs, rowNum) -> new QueueRow(
+            rs.getInt("version"), rs.getInt("next_seq"));
+
+    private static final RowMapper<QueueMemberRow> QUEUE_MEMBER_MAPPER = (rs, rowNum) -> new QueueMemberRow(
+            rs.getInt("seq"), rs.getString("bag_tag"), rs.getString("status"));
 
     private final JdbcTemplate jdbcTemplate;
     private final IdempotencyService idempotencyService;
@@ -158,6 +183,56 @@ public class BaggageService {
     public RecoverResponse recover(RecoverRequest request) {
         return idempotencyService.execute(request.requestId(), "RECOVER", 200,
                 request, RecoverResponse.class, () -> doRecover(request));
+    }
+
+    /**
+     * 入队：为航段启用（或追加）待装队列，绑定 1~5 件当前可装行李，
+     * 按请求给定顺序分配递增序号；每航段最多 20 个有效成员，
+     * 每件行李同航段至多一个有效位置；成功后队列版本加一。
+     */
+    public EnqueueResponse enqueue(String legId, EnqueueRequest request) {
+        EnqueuePayload payload = new EnqueuePayload(legId, request.operator(), request.bagTags());
+        return idempotencyService.execute(request.requestId(), "QUEUE_ENQUEUE", 200,
+                payload, EnqueueResponse.class, () -> doEnqueue(legId, request));
+    }
+
+    /**
+     * 出队：校验队列版本后取最前面至多 count 个有效成员，整批执行原装载规则；
+     * 首件（或任一成员）状态不合规则 422，不跳过也不装后件；
+     * 成功后冻结出队序号与完整装载响应，队列版本与航段版本各加一。
+     */
+    public DequeueResponse dequeue(String legId, DequeueRequest request) {
+        DequeuePayload payload = new DequeuePayload(
+                legId, request.operator(), request.expectedQueueVersion(), request.count());
+        return idempotencyService.execute(request.requestId(), "QUEUE_DEQUEUE", 200,
+                payload, DequeueResponse.class, () -> doDequeue(legId, request));
+    }
+
+    /**
+     * 撤队：撤销该行李在航段队列中的有效位置，序号保留历史不重排不重用；
+     * 已出队成员不可撤（409）；成功后队列版本加一。
+     */
+    public CancelResponse cancelQueueMember(String legId, CancelRequest request) {
+        CancelPayload payload = new CancelPayload(legId, request.operator(), request.bagTag());
+        return idempotencyService.execute(request.requestId(), "QUEUE_CANCEL", 200,
+                payload, CancelResponse.class, () -> doCancel(legId, request));
+    }
+
+    /** 队列查询：返回队列版本与全部成员（含已出队/已撤队历史），按序号升序。 */
+    public QueueResponse getQueue(String legId) {
+        if (findLeg(legId) == null) {
+            throw ApiException.notFound("航段不存在: " + legId);
+        }
+        QueueRow queue = findQueue(legId);
+        if (queue == null) {
+            return new QueueResponse(legId, 0, List.of());
+        }
+        List<QueueMemberItem> members = jdbcTemplate.query(
+                "SELECT seq, bag_tag, status FROM queue_member WHERE leg_id = ? ORDER BY seq",
+                (rs, rowNum) -> new QueueMemberItem(
+                        rs.getInt("seq"), rs.getString("bag_tag"), rs.getString("status")),
+                legId);
+        return new QueueResponse(legId, queue.version(), members);
     }
 
     /** 行李完整轨迹查询。 */
@@ -253,6 +328,9 @@ public class BaggageService {
 
     private LoadResponse doLoad(String legId, LoadRequest request) {
         LegRow leg = lockLeg(legId);
+        if (findQueue(legId) != null) {
+            throw ApiException.conflict("航段 " + legId + " 已启用待装队列，禁止绕过顺序直接装载");
+        }
         checkVersion(leg, request.expectedVersion());
         if (!LEG_OPEN.equals(leg.status())) {
             throw ApiException.unprocessable("航段状态为 " + leg.status() + "，禁止装载");
@@ -286,6 +364,12 @@ public class BaggageService {
         checkVersion(leg, request.expectedVersion());
         if (!LEG_OPEN.equals(leg.status())) {
             throw ApiException.unprocessable("航段状态为 " + leg.status() + "，禁止封舱");
+        }
+        Integer waitingMembers = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM queue_member WHERE leg_id = ? AND status = ?",
+                Integer.class, legId, QUEUE_WAITING);
+        if (waitingMembers != null && waitingMembers > 0) {
+            throw ApiException.unprocessable("存在有效未出队队列成员，禁止封舱");
         }
         List<String> manifest = jdbcTemplate.queryForList(
                 "SELECT bag_tag FROM load_record WHERE leg_id = ? ORDER BY bag_tag", String.class, legId);
@@ -398,6 +482,164 @@ public class BaggageService {
         }
         return new RecoverResponse(bag.bagTag(), newStatus, request.actualStation(),
                 nextIndex, request.missingLegId());
+    }
+
+    private EnqueueResponse doEnqueue(String legId, EnqueueRequest request) {
+        LegRow leg = lockLeg(legId);
+        if (!LEG_OPEN.equals(leg.status())) {
+            throw ApiException.unprocessable("航段状态为 " + leg.status() + "，禁止入队");
+        }
+        List<String> bagTags = request.bagTags();
+        if (new HashSet<>(bagTags).size() != bagTags.size()) {
+            throw ApiException.unprocessable("入队的 bagTag 不得重复");
+        }
+        QueueRow queue = lockOrCreateQueue(legId);
+        int activeCount = countWaitingMembers(legId);
+        if (activeCount + bagTags.size() > QUEUE_MAX_ACTIVE) {
+            throw ApiException.unprocessable(
+                    "队列有效成员将达到 " + (activeCount + bagTags.size()) + " 件，超过 "
+                            + QUEUE_MAX_ACTIVE + " 件上限");
+        }
+        for (String bagTag : bagTags) {
+            BagRow bag = lockBag(bagTag);
+            if (bag == null) {
+                throw ApiException.unprocessable("行李不存在: " + bagTag);
+            }
+            validateLoadable(bag, leg);
+            Integer existing = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM queue_member WHERE leg_id = ? AND bag_tag = ? AND status = ?",
+                    Integer.class, legId, bagTag, QUEUE_WAITING);
+            if (existing != null && existing > 0) {
+                throw ApiException.unprocessable(
+                        "行李 " + bagTag + " 已在航段 " + legId + " 的待装队列中");
+            }
+        }
+        int seq = queue.nextSeq();
+        List<QueueMemberItem> enqueued = new ArrayList<>();
+        for (String bagTag : bagTags) {
+            jdbcTemplate.update(
+                    "INSERT INTO queue_member (leg_id, seq, bag_tag, status, enqueued_by)"
+                            + " VALUES (?, ?, ?, ?, ?)",
+                    legId, seq, bagTag, QUEUE_WAITING, request.operator());
+            enqueued.add(new QueueMemberItem(seq, bagTag, QUEUE_WAITING));
+            seq++;
+        }
+        int newVersion = queue.version() + 1;
+        jdbcTemplate.update("UPDATE leg_queue SET version = ?, next_seq = ? WHERE leg_id = ?",
+                newVersion, seq, legId);
+        return new EnqueueResponse(legId, newVersion, enqueued);
+    }
+
+    private DequeueResponse doDequeue(String legId, DequeueRequest request) {
+        LegRow leg = lockLeg(legId);
+        if (!LEG_OPEN.equals(leg.status())) {
+            throw ApiException.unprocessable("航段状态为 " + leg.status() + "，禁止出队装载");
+        }
+        QueueRow queue = lockQueue(legId);
+        if (queue == null) {
+            throw ApiException.unprocessable("航段 " + legId + " 未启用待装队列");
+        }
+        if (queue.version() != request.expectedQueueVersion()) {
+            throw ApiException.conflict("队列版本冲突: 期望 "
+                    + request.expectedQueueVersion() + "，当前 " + queue.version());
+        }
+        List<QueueMemberRow> members = jdbcTemplate.query(
+                "SELECT seq, bag_tag, status FROM queue_member WHERE leg_id = ? AND status = ?"
+                        + " ORDER BY seq LIMIT ?",
+                QUEUE_MEMBER_MAPPER, legId, QUEUE_WAITING, request.count());
+        if (members.isEmpty()) {
+            throw ApiException.unprocessable("队列无有效待装成员");
+        }
+        // 只取最前面的有效成员，整批执行原装载规则：首件不合规则即整批 422，不跳过也不装后件
+        List<BagRow> bags = new ArrayList<>();
+        for (QueueMemberRow member : members) {
+            BagRow bag = lockBag(member.bagTag());
+            if (bag == null) {
+                throw ApiException.unprocessable("行李不存在: " + member.bagTag());
+            }
+            validateLoadable(bag, leg);
+            bags.add(bag);
+        }
+        List<DequeuedItem> dequeued = new ArrayList<>();
+        List<String> loaded = new ArrayList<>();
+        for (QueueMemberRow member : members) {
+            jdbcTemplate.update("INSERT INTO load_record (bag_tag, leg_id) VALUES (?, ?)",
+                    member.bagTag(), legId);
+            jdbcTemplate.update("UPDATE bag SET loaded_leg_id = ? WHERE bag_tag = ?",
+                    legId, member.bagTag());
+            insertEvent(member.bagTag(), EVT_LOADED, legId, leg.origin());
+            jdbcTemplate.update("UPDATE queue_member SET status = ? WHERE leg_id = ? AND seq = ?",
+                    QUEUE_DEQUEUED, legId, member.seq());
+            dequeued.add(new DequeuedItem(member.seq(), member.bagTag()));
+            loaded.add(member.bagTag());
+        }
+        int newQueueVersion = queue.version() + 1;
+        jdbcTemplate.update("UPDATE leg_queue SET version = ? WHERE leg_id = ?",
+                newQueueVersion, legId);
+        int newLegVersion = leg.version() + 1;
+        jdbcTemplate.update("UPDATE leg SET version = ? WHERE leg_id = ?", newLegVersion, legId);
+        return new DequeueResponse(legId, newQueueVersion, dequeued,
+                new LoadResponse(legId, LEG_OPEN, newLegVersion, loaded));
+    }
+
+    private CancelResponse doCancel(String legId, CancelRequest request) {
+        lockLeg(legId);
+        QueueRow queue = lockQueue(legId);
+        List<QueueMemberRow> members = queue == null ? List.of()
+                : jdbcTemplate.query(
+                        "SELECT seq, bag_tag, status FROM queue_member"
+                                + " WHERE leg_id = ? AND bag_tag = ? ORDER BY seq",
+                        QUEUE_MEMBER_MAPPER, legId, request.bagTag());
+        QueueMemberRow waiting = members.stream()
+                .filter(member -> QUEUE_WAITING.equals(member.status()))
+                .findFirst()
+                .orElse(null);
+        if (waiting == null) {
+            if (members.stream().anyMatch(member -> QUEUE_DEQUEUED.equals(member.status()))) {
+                throw ApiException.conflict("行李 " + request.bagTag() + " 已出队，不可撤队");
+            }
+            if (!members.isEmpty()) {
+                throw ApiException.unprocessable("行李 " + request.bagTag() + " 的队列位置已撤销");
+            }
+            throw ApiException.notFound(
+                    "航段 " + legId + " 的队列成员不存在: " + request.bagTag());
+        }
+        jdbcTemplate.update("UPDATE queue_member SET status = ? WHERE leg_id = ? AND seq = ?",
+                QUEUE_CANCELLED, legId, waiting.seq());
+        int newVersion = queue.version() + 1;
+        jdbcTemplate.update("UPDATE leg_queue SET version = ? WHERE leg_id = ?", newVersion, legId);
+        return new CancelResponse(legId, newVersion, waiting.seq(), request.bagTag(), QUEUE_CANCELLED);
+    }
+
+    private int countWaitingMembers(String legId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM queue_member WHERE leg_id = ? AND status = ?",
+                Integer.class, legId, QUEUE_WAITING);
+        return count == null ? 0 : count;
+    }
+
+    private QueueRow findQueue(String legId) {
+        List<QueueRow> rows = jdbcTemplate.query(
+                "SELECT version, next_seq FROM leg_queue WHERE leg_id = ?", QUEUE_MAPPER, legId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    private QueueRow lockQueue(String legId) {
+        List<QueueRow> rows = jdbcTemplate.query(
+                "SELECT version, next_seq FROM leg_queue WHERE leg_id = ? FOR UPDATE",
+                QUEUE_MAPPER, legId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** 在持有航段行锁后取队列行锁；队列不存在则创建（版本 1、序号从 1 开始）。 */
+    private QueueRow lockOrCreateQueue(String legId) {
+        QueueRow queue = lockQueue(legId);
+        if (queue != null) {
+            return queue;
+        }
+        jdbcTemplate.update("INSERT INTO leg_queue (leg_id, version, next_seq) VALUES (?, 1, 1)",
+                legId);
+        return lockQueue(legId);
     }
 
     /** 实际到达行李的统一推进：移动到到达站、推进待乘索引，完成行程者交付。 */
@@ -574,5 +816,25 @@ public class BaggageService {
 
     /** 差异到达幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
     private record DifferenceArrivePayload(String legId, int expectedVersion, List<String> bagTags) {
+    }
+
+    /** 队列行：版本与下一个待分配序号。 */
+    private record QueueRow(int version, int nextSeq) {
+    }
+
+    /** 队列成员行。 */
+    private record QueueMemberRow(int seq, String bagTag, String status) {
+    }
+
+    /** 入队幂等摘要参数：bagTags 保持请求顺序，顺序属于参数。 */
+    private record EnqueuePayload(String legId, String operator, List<String> bagTags) {
+    }
+
+    /** 出队幂等摘要参数：含期望队列版本与数量。 */
+    private record DequeuePayload(String legId, String operator, int expectedQueueVersion, int count) {
+    }
+
+    /** 撤队幂等摘要参数。 */
+    private record CancelPayload(String legId, String operator, String bagTag) {
     }
 }

@@ -2,6 +2,8 @@ package com.example.starter.baggage;
 
 import java.util.List;
 
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
@@ -124,5 +126,56 @@ public final class BaggageDtos {
 
     /** 未补到清单响应。 */
     public record ShortListResponse(List<ShortItem> shortUnloaded) {
+    }
+
+    /** 入队请求：bagTags 为 1~5 件当前可装行李，按给定顺序分配递增队列序号。 */
+    public record EnqueueRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operator 不能为空") String operator,
+            @NotNull(message = "bagTags 不能为空")
+            @Size(min = 1, max = 5, message = "单次入队数量必须为 1~5") List<@NotBlank(message = "bagTag 不能为空") String> bagTags) {
+    }
+
+    /** 出队请求：expectedQueueVersion 做队列版本校验，count 为 1~5 的正整数。 */
+    public record DequeueRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operator 不能为空") String operator,
+            @NotNull(message = "expectedQueueVersion 不能为空") Integer expectedQueueVersion,
+            @NotNull(message = "count 不能为空")
+            @Min(value = 1, message = "出队数量必须为正整数")
+            @Max(value = 5, message = "单次出队数量最多 5") Integer count) {
+    }
+
+    /** 撤队请求：按 bagTag 撤销该行李在航段队列中的有效位置。 */
+    public record CancelRequest(
+            @NotBlank(message = "requestId 不能为空") String requestId,
+            @NotBlank(message = "operator 不能为空") String operator,
+            @NotBlank(message = "bagTag 不能为空") String bagTag) {
+    }
+
+    /** 队列成员明细：含已出队/已撤队历史，序号保留不重排。 */
+    public record QueueMemberItem(int seq, String bagTag, String status) {
+    }
+
+    /** 入队响应：enqueued 按分配序号升序。 */
+    public record EnqueueResponse(String legId, int queueVersion, List<QueueMemberItem> enqueued) {
+    }
+
+    /** 出队冻结项：出队时的队列序号与袋号，后续撤队不改变该历史。 */
+    public record DequeuedItem(int seq, String bagTag) {
+    }
+
+    /** 出队响应：冻结出队序号与完整装载响应。 */
+    public record DequeueResponse(String legId, int queueVersion,
+                                  List<DequeuedItem> dequeued, LoadResponse load) {
+    }
+
+    /** 撤队响应：保留被撤销成员的序号。 */
+    public record CancelResponse(String legId, int queueVersion, int seq,
+                                 String bagTag, String status) {
+    }
+
+    /** 队列查询响应：members 含全部历史成员，按序号升序；队列未启用时 queueVersion 为 0。 */
+    public record QueueResponse(String legId, int queueVersion, List<QueueMemberItem> members) {
     }
 }

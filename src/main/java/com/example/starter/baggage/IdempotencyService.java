@@ -17,6 +17,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * 幂等去重服务：所有写操作携带全局唯一 requestId。
+ * 摘要以操作类型 + 结构化参数（资源、全参数及期望版本）计算，十进制按值、文本原样；
  * 同键同参重放原成功结果，同键异参返回 409；失败请求不占键，
  * 业务变更与去重记录在同一事务中原子提交。
  */
@@ -50,7 +51,7 @@ public class IdempotencyService {
      */
     public <T> T execute(String requestId, String operation, int successStatus,
                          Object payload, Class<T> resultType, Supplier<T> action) {
-        String hash = sha256(writeJson(payload));
+        String hash = sha256(operation + "\n" + writeJson(payload));
         Object lock = locks.computeIfAbsent(requestId, key -> new Object());
         synchronized (lock) {
             try {
