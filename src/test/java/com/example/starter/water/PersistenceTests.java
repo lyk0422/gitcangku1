@@ -2,6 +2,8 @@ package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.GraphEdgeRow;
+import com.example.starter.water.WaterRepository.SegmentRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import org.junit.jupiter.api.Test;
@@ -12,6 +14,7 @@ import org.springframework.jdbc.datasource.init.ScriptUtils;
 
 import java.math.BigDecimal;
 import java.sql.Connection;
+import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -37,9 +40,9 @@ class PersistenceTests {
         }
         WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
         long windowId = repo1.insertWindow("wk-persist", "ch-persist", 1_000L, 2_000L,
-                new BigDecimal("10.000"), 1L);
-        repo1.insertAllocation("ak-source", windowId, "user-1", new BigDecimal("6.000"), "alice", 2L);
-        repo1.insertAllocation("ak-target", windowId, "user-2", new BigDecimal("2.500"), "bob", 3L);
+                new BigDecimal("10.000"), null, 1L);
+        repo1.insertAllocation("ak-source", windowId, "user-1", new BigDecimal("6.000"), null, "alice", 2L);
+        repo1.insertAllocation("ak-target", windowId, "user-2", new BigDecimal("2.500"), null, "bob", 3L);
         AllocationRow source = repo1.findAllocationByKey("ak-source");
         AllocationRow target = repo1.findAllocationByKey("ak-target");
         // 普通批准：源持有额度等于原申请水量
@@ -102,8 +105,8 @@ class PersistenceTests {
             ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
         }
         WaterRepository repo = new WaterRepository(new JdbcTemplate(dataSource));
-        long windowId = repo.insertWindow("wk-cancel", "ch-cancel", 1L, 2L, new BigDecimal("5"), 1L);
-        repo.insertAllocation("ak-cancel", windowId, "user-1", new BigDecimal("3.000"), "alice", 2L);
+        long windowId = repo.insertWindow("wk-cancel", "ch-cancel", 1L, 2L, new BigDecimal("5"), null, 1L);
+        repo.insertAllocation("ak-cancel", windowId, "user-1", new BigDecimal("3.000"), null, "alice", 2L);
         AllocationRow allocation = repo.findAllocationByKey("ak-cancel");
         repo.updateAllocationStatus(allocation.id(), "APPROVED", 3L);
         assertEquals(new BigDecimal("3.000"), repo.sumApprovedAmount(windowId));
@@ -115,5 +118,61 @@ class PersistenceTests {
         assertEquals(new BigDecimal("3.000"), cancelled.amount());
         assertEquals(0, cancelled.heldAmount().compareTo(BigDecimal.ZERO));
         assertEquals(0, repo.sumApprovedAmount(windowId).compareTo(BigDecimal.ZERO));
+    }
+
+    @Test
+    void graphEdgesAndPathSegmentsSurviveNewConnectionAndCancel() throws Exception {
+        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
+        SimpleDriverDataSource first = new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "");
+        try (Connection connection = first.getConnection()) {
+            ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
+        }
+        WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
+        // 渠网窗口：版本 1，节点 A/B/C，渠段 A->B(5)、B->C(5)、C->A(5)
+        long windowId = repo1.insertWindow("wk-graph", "ch-graph", 1L, 2L, new BigDecimal("100"), 1, 1L);
+        repo1.insertGraphRevision(windowId, 1, "[\"A\",\"B\",\"C\"]", null, 1L);
+        repo1.insertGraphEdge(windowId, "A", "B", 5L, 1);
+        repo1.insertGraphEdge(windowId, "B", "C", 5L, 1);
+        repo1.insertGraphEdge(windowId, "C", "A", 5L, 1);
+        // 带路径申请：A->B->C，流量 2，批准后取消
+        long allocationId = repo1.insertAllocation("ak-path", windowId, "user-1",
+                new BigDecimal("10.000"), 2L, "alice", 2L);
+        repo1.insertSegment(allocationId, 0, "A", "B");
+        repo1.insertSegment(allocationId, 1, "B", "C");
+        repo1.updateAllocationStatus(allocationId, "APPROVED", 3L);
+        assertEquals(2, repo1.listContributions(windowId).size());
+        repo1.updateAllocationStatus(allocationId, "CANCELLED", 4L);
+        // 图修订：移除无贡献的 C->A，版本升到 2
+        GraphEdgeRow caEdge = repo1.listCurrentEdges(windowId).stream()
+                .filter(e -> e.fromNode().equals("C")).findFirst().orElseThrow();
+        repo1.removeGraphEdge(caEdge.id(), 2);
+        repo1.insertGraphRevision(windowId, 2, "[\"A\",\"B\",\"C\"]", "admin", 5L);
+        repo1.updateWindowGraphVersion(windowId, 2);
+
+        // 全新连接与仓储实例读取：冻结的边全集、有序路径与贡献口径保持一致
+        WaterRepository repo2 = new WaterRepository(
+                new JdbcTemplate(new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "")));
+        WindowRow window = repo2.findWindowById(windowId);
+        assertEquals(2, window.graphVersion());
+        assertEquals(2, repo2.listCurrentEdges(windowId).size());
+        assertEquals(3, repo2.listAllEdges(windowId).size());
+        GraphEdgeRow removed = repo2.listAllEdges(windowId).stream()
+                .filter(e -> e.fromNode().equals("C")).findFirst().orElseThrow();
+        assertEquals(1, removed.addedVersion());
+        assertEquals(2, removed.removedVersion());
+        assertNotNull(repo2.findGraphRevision(windowId, 1));
+        assertEquals("admin", repo2.findGraphRevision(windowId, 2).actor());
+
+        // 取消后路径段仍冻结保留且保序，流量贡献归零
+        List<SegmentRow> segments = repo2.listSegments(allocationId);
+        assertEquals(2, segments.size());
+        assertEquals("A", segments.get(0).fromNode());
+        assertEquals("B", segments.get(0).toNode());
+        assertEquals("B", segments.get(1).fromNode());
+        assertEquals("C", segments.get(1).toNode());
+        AllocationRow cancelled = repo2.findAllocationByKey("ak-path");
+        assertEquals("CANCELLED", cancelled.status());
+        assertEquals(2L, cancelled.flowRate());
+        assertEquals(0, repo2.listContributions(windowId).size());
     }
 }

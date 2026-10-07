@@ -40,4 +40,9 @@ public class ApiException extends RuntimeException {
     public static ApiException quotaExceeded(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "QUOTA_EXCEEDED", message);
     }
+
+    /** 渠段容量不足：已批准流量之和加入本申请后将超过渠段容量。 */
+    public static ApiException edgeCapacityExceeded(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "EDGE_CAPACITY_EXCEEDED", message);
+    }
 }

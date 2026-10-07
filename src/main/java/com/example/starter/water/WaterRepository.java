@@ -15,20 +15,38 @@ import java.util.Objects;
 
 /**
  * 灌区配水数据访问层（JdbcTemplate，参数化 SQL）。
- * 时间一律为 UTC 纳秒时间戳；水量为 DECIMAL(19,3)。
+ * 时间一律为 UTC 纳秒时间戳；水量为 DECIMAL(19,3)；流量与渠段容量为正整数（立方米每秒）。
  */
 @Repository
 public class WaterRepository {
 
-    /** 供水窗口行。 */
+    /** 供水窗口行；graphVersion 为 null 表示普通窗口（不适用渠网门禁）。 */
     public record WindowRow(long id, String windowKey, String channelId, long startNanos, long endNanos,
-                            BigDecimal plannedVolume, long createdNanos) {
+                            BigDecimal plannedVolume, Integer graphVersion, long createdNanos) {
     }
 
-    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
+    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度，flowRate 仅渠网窗口非空。 */
     public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
-                                BigDecimal heldAmount, String requester, String status,
+                                BigDecimal heldAmount, Long flowRate, String requester, String status,
                                 long createdNanos, long updatedNanos) {
+    }
+
+    /** 申请路径段行，按 seq 保序。 */
+    public record SegmentRow(long allocationId, int seq, String fromNode, String toNode) {
+    }
+
+    /** 已批准且仍持有额度的申请对某条有向边的流量贡献行。 */
+    public record ContributionRow(long allocationId, String fromNode, String toNode, long flowRate) {
+    }
+
+    /** 渠网有向渠段行；removedVersion 为 null 表示当前有效。 */
+    public record GraphEdgeRow(long id, String fromNode, String toNode, long capacity,
+                               int addedVersion, Integer removedVersion) {
+    }
+
+    /** 图修订历史行。 */
+    public record GraphRevisionRow(long id, long windowId, int version, String nodesJson, String actor,
+                                   long createdNanos) {
     }
 
     /** 转让流水行，创建后不可变。 */
@@ -46,20 +64,43 @@ public class WaterRepository {
                              long createdNanos) {
     }
 
+    private static final String WINDOW_SELECT =
+            "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, graph_version, created_nanos";
+
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
-            rs.getBigDecimal("planned_volume"), rs.getLong("created_nanos"));
+            rs.getBigDecimal("planned_volume"),
+            rs.getObject("graph_version") == null ? null : rs.getInt("graph_version"),
+            rs.getLong("created_nanos"));
 
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
             rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"),
+            rs.getObject("flow_rate") == null ? null : rs.getLong("flow_rate"),
             rs.getString("requester"), rs.getString("status"),
             rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
 
     private static final String ALLOCATION_SELECT =
-            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status,"
+            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, flow_rate, requester, status,"
                     + " created_nanos, updated_nanos";
+
+    private static final RowMapper<SegmentRow> SEGMENT_MAPPER = (rs, n) -> new SegmentRow(
+            rs.getLong("allocation_id"), rs.getInt("seq"),
+            rs.getString("from_node"), rs.getString("to_node"));
+
+    private static final RowMapper<ContributionRow> CONTRIBUTION_MAPPER = (rs, n) -> new ContributionRow(
+            rs.getLong("allocation_id"), rs.getString("from_node"), rs.getString("to_node"),
+            rs.getLong("flow_rate"));
+
+    private static final RowMapper<GraphEdgeRow> GRAPH_EDGE_MAPPER = (rs, n) -> new GraphEdgeRow(
+            rs.getLong("id"), rs.getString("from_node"), rs.getString("to_node"), rs.getLong("capacity"),
+            rs.getInt("added_version"),
+            rs.getObject("removed_version") == null ? null : rs.getInt("removed_version"));
+
+    private static final RowMapper<GraphRevisionRow> GRAPH_REVISION_MAPPER = (rs, n) -> new GraphRevisionRow(
+            rs.getLong("id"), rs.getLong("window_id"), rs.getInt("version"), rs.getString("nodes_json"),
+            rs.getString("actor"), rs.getLong("created_nanos"));
 
     private static final RowMapper<TransferRow> TRANSFER_MAPPER = (rs, n) -> new TransferRow(
             rs.getLong("id"), rs.getString("transfer_key"), rs.getLong("window_id"),
@@ -81,20 +122,26 @@ public class WaterRepository {
         this.jdbc = jdbc;
     }
 
-    /** 插入窗口并返回自增主键。 */
+    /** 插入窗口并返回自增主键；graphVersion 为 null 表示普通窗口。 */
     public long insertWindow(String windowKey, String channelId, long startNanos, long endNanos,
-                             BigDecimal plannedVolume, long createdNanos) {
+                             BigDecimal plannedVolume, Integer graphVersion, long createdNanos) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO supply_window (window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos)"
-                            + " VALUES (?, ?, ?, ?, ?, ?)", Statement.RETURN_GENERATED_KEYS);
+                    "INSERT INTO supply_window (window_key, channel_id, start_nanos, end_nanos, planned_volume,"
+                            + " graph_version, created_nanos) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, windowKey);
             ps.setString(2, channelId);
             ps.setLong(3, startNanos);
             ps.setLong(4, endNanos);
             ps.setBigDecimal(5, plannedVolume);
-            ps.setLong(6, createdNanos);
+            if (graphVersion == null) {
+                ps.setNull(6, java.sql.Types.INTEGER);
+            } else {
+                ps.setInt(6, graphVersion);
+            }
+            ps.setLong(7, createdNanos);
             return ps;
         }, keys);
         return Objects.requireNonNull(keys.getKey()).longValue();
@@ -103,20 +150,17 @@ public class WaterRepository {
     /** 按主键查询窗口，不存在返回 null。 */
     public WindowRow findWindowById(long id) {
         try {
-            return jdbc.queryForObject(
-                    "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos"
-                            + " FROM supply_window WHERE id = ?", WINDOW_MAPPER, id);
+            return jdbc.queryForObject(WINDOW_SELECT + " FROM supply_window WHERE id = ?", WINDOW_MAPPER, id);
         } catch (EmptyResultDataAccessException e) {
             return null;
         }
     }
 
-    /** 按主键锁定窗口行（FOR UPDATE），用于串行化批准与限供。 */
+    /** 按主键锁定窗口行（FOR UPDATE），用于串行化批准、取消、转让、限供与图修订。 */
     public WindowRow lockWindowById(long id) {
         try {
-            return jdbc.queryForObject(
-                    "SELECT id, window_key, channel_id, start_nanos, end_nanos, planned_volume, created_nanos"
-                            + " FROM supply_window WHERE id = ? FOR UPDATE", WINDOW_MAPPER, id);
+            return jdbc.queryForObject(WINDOW_SELECT + " FROM supply_window WHERE id = ? FOR UPDATE",
+                    WINDOW_MAPPER, id);
         } catch (EmptyResultDataAccessException e) {
             return null;
         }
@@ -130,21 +174,32 @@ public class WaterRepository {
         return count != null && count > 0;
     }
 
-    /** 插入申请（初始 REQUESTED）并返回主键。 */
+    /** 更新窗口当前图版本（图修订提交时调用）。 */
+    public void updateWindowGraphVersion(long windowId, int graphVersion) {
+        jdbc.update("UPDATE supply_window SET graph_version = ? WHERE id = ?", graphVersion, windowId);
+    }
+
+    /** 插入申请（初始 REQUESTED）并返回主键；flowRate 仅渠网窗口非空。 */
     public long insertAllocation(String allocationKey, long windowId, String userId, BigDecimal amount,
-                                 String requester, long nowNanos) {
+                                 Long flowRate, String requester, long nowNanos) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, held_amount, requester, status, created_nanos, updated_nanos)"
-                            + " VALUES (?, ?, ?, ?, 0, ?, 'REQUESTED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
+                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, held_amount, flow_rate,"
+                            + " requester, status, created_nanos, updated_nanos)"
+                            + " VALUES (?, ?, ?, ?, 0, ?, ?, 'REQUESTED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, allocationKey);
             ps.setLong(2, windowId);
             ps.setString(3, userId);
             ps.setBigDecimal(4, amount);
-            ps.setString(5, requester);
-            ps.setLong(6, nowNanos);
+            if (flowRate == null) {
+                ps.setNull(5, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(5, flowRate);
+            }
+            ps.setString(6, requester);
             ps.setLong(7, nowNanos);
+            ps.setLong(8, nowNanos);
             return ps;
         }, keys);
         return Objects.requireNonNull(keys.getKey()).longValue();
@@ -194,6 +249,76 @@ public class WaterRepository {
                 "SELECT COALESCE(SUM(held_amount), 0) FROM allocation WHERE window_id = ? AND status = 'APPROVED'",
                 BigDecimal.class, windowId);
         return sum == null ? BigDecimal.ZERO : sum;
+    }
+
+    /** 插入申请的一条有序路径段。 */
+    public void insertSegment(long allocationId, int seq, String fromNode, String toNode) {
+        jdbc.update("INSERT INTO allocation_segment (allocation_id, seq, from_node, to_node) VALUES (?, ?, ?, ?)",
+                allocationId, seq, fromNode, toNode);
+    }
+
+    /** 申请的全部路径段，按 seq 升序（路径顺序保序）。 */
+    public List<SegmentRow> listSegments(long allocationId) {
+        return jdbc.query(
+                "SELECT allocation_id, seq, from_node, to_node FROM allocation_segment"
+                        + " WHERE allocation_id = ? ORDER BY seq", SEGMENT_MAPPER, allocationId);
+    }
+
+    /**
+     * 窗口内已批准且仍持有额度（held_amount > 0）的申请对各自路径边的流量贡献，
+     * 用于边容量求和与已批准边并集无环校验；取消（CANCELLED）与已全额转出的申请不再贡献。
+     */
+    public List<ContributionRow> listContributions(long windowId) {
+        return jdbc.query(
+                "SELECT a.id AS allocation_id, s.from_node, s.to_node, a.flow_rate"
+                        + " FROM allocation a JOIN allocation_segment s ON s.allocation_id = a.id"
+                        + " WHERE a.window_id = ? AND a.status = 'APPROVED' AND a.held_amount > 0"
+                        + " ORDER BY a.id, s.seq", CONTRIBUTION_MAPPER, windowId);
+    }
+
+    /** 插入图修订历史行（逐版冻结节点全集）。 */
+    public void insertGraphRevision(long windowId, int version, String nodesJson, String actor,
+                                    long createdNanos) {
+        jdbc.update("INSERT INTO graph_revision (window_id, version, nodes_json, actor, created_nanos)"
+                + " VALUES (?, ?, ?, ?, ?)", windowId, version, nodesJson, actor, createdNanos);
+    }
+
+    /** 查询窗口指定版本的图修订，不存在返回 null。 */
+    public GraphRevisionRow findGraphRevision(long windowId, int version) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, window_id, version, nodes_json, actor, created_nanos FROM graph_revision"
+                            + " WHERE window_id = ? AND version = ?", GRAPH_REVISION_MAPPER, windowId, version);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 插入当前有效渠段（added_version 为加入时的图版本）。 */
+    public void insertGraphEdge(long windowId, String fromNode, String toNode, long capacity, int addedVersion) {
+        jdbc.update("INSERT INTO graph_edge (window_id, from_node, to_node, capacity, added_version,"
+                + " removed_version) VALUES (?, ?, ?, ?, ?, NULL)",
+                windowId, fromNode, toNode, capacity, addedVersion);
+    }
+
+    /** 窗口当前有效渠段（removed_version 为 NULL），按主键升序。 */
+    public List<GraphEdgeRow> listCurrentEdges(long windowId) {
+        return jdbc.query(
+                "SELECT id, from_node, to_node, capacity, added_version, removed_version FROM graph_edge"
+                        + " WHERE window_id = ? AND removed_version IS NULL ORDER BY id",
+                GRAPH_EDGE_MAPPER, windowId);
+    }
+
+    /** 窗口全部渠段（含已移除，逐版冻结的历史），按主键升序。 */
+    public List<GraphEdgeRow> listAllEdges(long windowId) {
+        return jdbc.query(
+                "SELECT id, from_node, to_node, capacity, added_version, removed_version FROM graph_edge"
+                        + " WHERE window_id = ? ORDER BY id", GRAPH_EDGE_MAPPER, windowId);
+    }
+
+    /** 将当前有效渠段标记为在指定版本移除（容量变更视为移除旧边并加入新边）。 */
+    public void removeGraphEdge(long edgeId, int removedVersion) {
+        jdbc.update("UPDATE graph_edge SET removed_version = ? WHERE id = ?", removedVersion, edgeId);
     }
 
     /** 插入限供（ACTIVE）并返回主键。 */

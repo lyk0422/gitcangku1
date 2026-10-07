@@ -6,6 +6,8 @@ import com.example.starter.water.dto.Dtos.CommandRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.GraphResponse;
+import com.example.starter.water.dto.Dtos.GraphRevisionRequest;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
@@ -34,19 +36,19 @@ public class WaterController {
         this.service = service;
     }
 
-    /** 创建供水窗口。 */
+    /** 创建供水窗口（可携带渠网图登记）。 */
     @PostMapping("/windows")
     public WindowResponse createWindow(@RequestBody CreateWindowRequest request) {
         return service.createWindow(request.commandKey(), request.windowKey(), request.channelId(),
-                request.startUtc(), request.endUtc(), request.plannedVolume());
+                request.startUtc(), request.endUtc(), request.plannedVolume(), request.graph());
     }
 
-    /** 提交配水申请。 */
+    /** 提交配水申请（渠网窗口须携带有序路径与流量）。 */
     @PostMapping("/allocations")
     public AllocationResponse submitAllocation(@RequestBody SubmitAllocationRequest request,
                                                @RequestHeader("X-Actor-Id") String actor) {
         return service.submitAllocation(request.commandKey(), request.allocationKey(), request.windowId(),
-                request.userId(), request.amount(), actor);
+                request.userId(), request.amount(), request.path(), request.flow(), actor);
     }
 
     /** 批准配水申请。 */
@@ -102,5 +104,20 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 查询窗口当前渠网图（版本、节点全集、当前有效渠段全集）。 */
+    @GetMapping("/windows/{windowId}/graph")
+    public GraphResponse getGraph(@PathVariable long windowId) {
+        return service.getGraph(windowId);
+    }
+
+    /** 修订窗口渠网图（容量或边全集），携带 expectedGraphVersion，操作人由 X-Actor-Id 提供。 */
+    @PostMapping("/windows/{windowId}/graph")
+    public GraphResponse reviseGraph(@PathVariable long windowId,
+                                     @RequestBody GraphRevisionRequest request,
+                                     @RequestHeader("X-Actor-Id") String actor) {
+        return service.reviseGraph(request.requestId(), windowId, request.expectedGraphVersion(),
+                request.graph(), actor);
     }
 }
