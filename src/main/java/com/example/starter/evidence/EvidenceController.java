@@ -2,6 +2,7 @@ package com.example.starter.evidence;
 
 import com.example.starter.evidence.dto.CommandRequest;
 import com.example.starter.evidence.dto.CustodyChainView;
+import com.example.starter.evidence.dto.EvidenceBytesView;
 import com.example.starter.evidence.dto.EvidenceView;
 import com.example.starter.evidence.dto.IntakeRequest;
 import com.example.starter.evidence.dto.LoanCreateRequest;
@@ -37,10 +38,13 @@ public class EvidenceController {
     static final String ACTOR_HEADER = "X-Actor-Id";
 
     private final EvidenceService evidenceService;
+    private final ChunkIntakeService chunkIntakeService;
     private final IdempotencyAdvisor idempotencyAdvisor;
 
-    public EvidenceController(EvidenceService evidenceService, IdempotencyAdvisor idempotencyAdvisor) {
+    public EvidenceController(EvidenceService evidenceService, ChunkIntakeService chunkIntakeService,
+                              IdempotencyAdvisor idempotencyAdvisor) {
         this.evidenceService = evidenceService;
+        this.chunkIntakeService = chunkIntakeService;
         this.idempotencyAdvisor = idempotencyAdvisor;
     }
 
@@ -163,6 +167,15 @@ public class EvidenceController {
     @GetMapping("/{evidenceKey}/custody-chain")
     public CustodyChainView custodyChain(@PathVariable String evidenceKey) {
         return evidenceService.custodyChain(evidenceKey);
+    }
+
+    /**
+     * 读取完整字节：仅当前保管人；借出及待交接期间保管人不变，按原归属限制。
+     */
+    @GetMapping("/{evidenceKey}/bytes")
+    public EvidenceBytesView readBytes(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                       @PathVariable String evidenceKey) {
+        return chunkIntakeService.readBytes(actorId, evidenceKey);
     }
 
     private ResponseEntity<String> toEntity(StoredResponse response) {

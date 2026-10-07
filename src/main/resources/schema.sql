@@ -60,12 +60,44 @@ CREATE TABLE IF NOT EXISTS loan_record (
     KEY idx_loan_borrower_status (borrower_id, status)
 );
 
+-- 分块入库会话：数字证物先接齐字节再进入封存链。创建时固定总字节数（1至65536）与完整 SHA-256；
+-- 仅入库人可补块、完成或放弃；完成时创建 SEALED 证物，放弃后证物键可由新记录复用。
+CREATE TABLE IF NOT EXISTS chunk_intake (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    intake_key VARCHAR(64) NOT NULL COMMENT '分块入库业务键，全局唯一',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '完成接收后写入的证物业务键；放弃后可由新记录复用',
+    case_key VARCHAR(64) NOT NULL COMMENT '所属案件键，完成后写入证物',
+    category VARCHAR(64) NOT NULL COMMENT '证物类别，完成后写入证物',
+    seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，完成后写入证物',
+    total_bytes INT NOT NULL COMMENT '声明的总字节数，1至65536，创建后不可变',
+    sha256 VARCHAR(64) NOT NULL COMMENT '完整内容的 SHA-256 摘要（64位十六进制，存储小写）',
+    creator_id VARCHAR(64) NOT NULL COMMENT '创建待接收记录的入库人，仅其可补块、完成或放弃',
+    status VARCHAR(20) NOT NULL COMMENT '接收状态：RECEIVING 接收中 / COMPLETED 已完成 / ABANDONED 已放弃',
+    version INT NOT NULL COMMENT '记录版本，从 0 开始，每次补块、完成或放弃加 1，用于期望版本校验',
+    created_at DATETIME(6) NOT NULL COMMENT '创建时间，Asia/Shanghai',
+    decided_at DATETIME(6) NULL COMMENT '完成或放弃时间，Asia/Shanghai；NULL 表示仍在接收中',
+    CONSTRAINT uk_chunk_intake_key UNIQUE (intake_key),
+    KEY idx_chunk_intake_evidence (evidence_key)
+);
+
+-- 已接收块：写入后不可改；范围不得越过总长度且不得相互重叠，
+-- 完全相同范围且解码字节相同的重复提交返回已有块，其余重叠一律拒绝。
+CREATE TABLE IF NOT EXISTS intake_chunk (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    intake_key VARCHAR(64) NOT NULL COMMENT '关联分块入库业务键',
+    offset_bytes INT NOT NULL COMMENT '块起始偏移（字节），非负，偏移+长度不得越过总长度',
+    length_bytes INT NOT NULL COMMENT '解码后字节长度，1至4096',
+    data BLOB NOT NULL COMMENT '解码后的原始字节（合成数据），写入后不可改，不写入日志',
+    created_at DATETIME(6) NOT NULL COMMENT '块接收时间，Asia/Shanghai',
+    KEY idx_chunk_intake (intake_key)
+);
+
 -- 幂等命令日志：command_key 全局唯一；同键同参重放返回首次结果，同键改参返回 409。
 CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/CHUNK_INTAKE_CREATE/CHUNK_APPEND/CHUNK_COMPLETE/CHUNK_ABANDON',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
