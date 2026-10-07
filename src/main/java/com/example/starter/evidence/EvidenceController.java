@@ -37,10 +37,14 @@ public class EvidenceController {
     static final String ACTOR_HEADER = "X-Actor-Id";
 
     private final EvidenceService evidenceService;
+    private final ChunkIntakeService chunkIntakeService;
     private final IdempotencyAdvisor idempotencyAdvisor;
 
-    public EvidenceController(EvidenceService evidenceService, IdempotencyAdvisor idempotencyAdvisor) {
+    public EvidenceController(EvidenceService evidenceService,
+                              ChunkIntakeService chunkIntakeService,
+                              IdempotencyAdvisor idempotencyAdvisor) {
         this.evidenceService = evidenceService;
+        this.chunkIntakeService = chunkIntakeService;
         this.idempotencyAdvisor = idempotencyAdvisor;
     }
 
@@ -158,11 +162,24 @@ public class EvidenceController {
     }
 
     /**
-     * 查询完整保管链：当前状态 + 全部交接与核验记录。
+     * 查询完整保管链：当前状态 + 全部交接等记录。
      */
     @GetMapping("/{evidenceKey}/custody-chain")
     public CustodyChainView custodyChain(@PathVariable String evidenceKey) {
         return evidenceService.custodyChain(evidenceKey);
+    }
+
+    /**
+     * 读取完整字节：仅完成分块接收创建的证物、且请求人为当前保管人；返回原始合成字节（application/octet-stream）。
+     * 非保管人 409；借出中/待交接按原归属限制；普通入库证物无分块字节记录返回 404。
+     */
+    @GetMapping("/{evidenceKey}/bytes")
+    @SuppressWarnings("java:S6833")
+    public ResponseEntity<byte[]> bytes(@RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+                                        @PathVariable String evidenceKey) {
+        return ResponseEntity.ok()
+                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                .body(chunkIntakeService.readBytes(actorId, evidenceKey));
     }
 
     private ResponseEntity<String> toEntity(StoredResponse response) {

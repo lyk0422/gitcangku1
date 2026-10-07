@@ -46,6 +46,7 @@ public class EvidenceService {
     private final SealInspectionRepository inspectionRepository;
     private final LoanRecordRepository loanRepository;
     private final CommandLogRepository commandLogRepository;
+    private final ChunkIntakeRepository chunkIntakeRepository;
     private final ObjectMapper objectMapper;
     private final EvidenceClock clock;
 
@@ -54,6 +55,7 @@ public class EvidenceService {
                            SealInspectionRepository inspectionRepository,
                            LoanRecordRepository loanRepository,
                            CommandLogRepository commandLogRepository,
+                           ChunkIntakeRepository chunkIntakeRepository,
                            ObjectMapper objectMapper,
                            EvidenceClock clock) {
         this.evidenceRepository = evidenceRepository;
@@ -61,6 +63,7 @@ public class EvidenceService {
         this.inspectionRepository = inspectionRepository;
         this.loanRepository = loanRepository;
         this.commandLogRepository = commandLogRepository;
+        this.chunkIntakeRepository = chunkIntakeRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -77,6 +80,10 @@ public class EvidenceService {
         if (evidenceRepository.findByKey(request.evidenceKey()).isPresent()) {
             throw ApiException.conflict("证物已存在: " + request.evidenceKey());
         }
+        // 分块接收（含待接收/已放弃）占用同键时，原入库入口不得再创建同键证物。
+        if (chunkIntakeRepository.findByKey(request.evidenceKey()).isPresent()) {
+            throw ApiException.conflict("该键存在分块接收记录: " + request.evidenceKey());
+        }
         LocalDateTime now = LocalDateTime.now();
         evidenceRepository.insert(request.evidenceKey(), request.caseKey(), request.category(),
                 request.sealNo(), actorId, now);
@@ -90,6 +97,7 @@ public class EvidenceService {
     @Transactional
     public StoredResponse initiateTransfer(String actorId, String evidenceKey,
                                            TransferInitiateRequest request, String requestHash) {
+        requireNoPendingChunkIntake(evidenceKey);
         Optional<StoredResponse> replay = checkReplay(request.commandKey(), requestHash);
         if (replay.isPresent()) {
             return replay.get();
@@ -125,6 +133,7 @@ public class EvidenceService {
     @Transactional
     public StoredResponse acceptTransfer(String actorId, String evidenceKey,
                                          CommandRequest request, String requestHash) {
+        requireNoPendingChunkIntake(evidenceKey);
         Optional<StoredResponse> replay = checkReplay(request.commandKey(), requestHash);
         if (replay.isPresent()) {
             return replay.get();
@@ -156,6 +165,7 @@ public class EvidenceService {
     @Transactional
     public StoredResponse cancelTransfer(String actorId, String evidenceKey,
                                          CommandRequest request, String requestHash) {
+        requireNoPendingChunkIntake(evidenceKey);
         Optional<StoredResponse> replay = checkReplay(request.commandKey(), requestHash);
         if (replay.isPresent()) {
             return replay.get();
@@ -188,6 +198,7 @@ public class EvidenceService {
     @Transactional
     public StoredResponse inspectSeal(String actorId, String evidenceKey,
                                       SealInspectionRequest request, String requestHash) {
+        requireNoPendingChunkIntake(evidenceKey);
         Optional<StoredResponse> replay = checkReplay(request.commandKey(), requestHash);
         if (replay.isPresent()) {
             return replay.get();
@@ -224,6 +235,7 @@ public class EvidenceService {
     @Transactional
     public StoredResponse borrow(String actorId, String evidenceKey,
                                  LoanCreateRequest request, String requestHash) {
+        requireNoPendingChunkIntake(evidenceKey);
         Optional<StoredResponse> replay = checkReplay(request.commandKey(), requestHash);
         if (replay.isPresent()) {
             return replay.get();
@@ -273,6 +285,7 @@ public class EvidenceService {
     @Transactional
     public StoredResponse returnLoan(String actorId, String evidenceKey,
                                      LoanReturnRequest request, String requestHash) {
+        requireNoPendingChunkIntake(evidenceKey);
         Optional<StoredResponse> replay = checkReplay(request.commandKey(), requestHash);
         if (replay.isPresent()) {
             return replay.get();
@@ -354,6 +367,18 @@ public class EvidenceService {
     private Evidence lockEvidence(String evidenceKey) {
         return evidenceRepository.findByKeyForUpdate(evidenceKey)
                 .orElseThrow(() -> ApiException.notFound("证物不存在: " + evidenceKey));
+    }
+
+    /**
+     * 原借出、交接及封条核验入口守卫：同键存在未完成封存的分块接收（待接收/已放弃）时一律 409。
+     * 完成封存后的证物（接收状态 SEALED）按原规则流转，不在此拦截。
+     */
+    private void requireNoPendingChunkIntake(String evidenceKey) {
+        chunkIntakeRepository.findByKey(evidenceKey).ifPresent(intake -> {
+            if (intake.status() != ChunkIntakeStatus.SEALED) {
+                throw ApiException.conflict("证物仍处于分块接收流程，原入口暂不可用: " + evidenceKey);
+            }
+        });
     }
 
     private void requireSealIntact(Evidence evidence) {

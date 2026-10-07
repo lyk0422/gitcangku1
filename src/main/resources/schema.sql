@@ -63,12 +63,42 @@ CREATE TABLE IF NOT EXISTS loan_record (
 -- 幂等命令日志：command_key 全局唯一；同键同参重放返回首次结果，同键改参返回 409。
 CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
+    command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键（分块接口为全局 requestId），全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/CHUNK_INTAKE_CREATE/CHUNK_UPLOAD/CHUNK_COMPLETE/CHUNK_ABANDON',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
     created_at DATETIME(6) NOT NULL COMMENT '首次执行时间，Asia/Shanghai',
     CONSTRAINT uk_command_key UNIQUE (command_key)
+);
+
+-- 数字证物分块接收：创建后为 RECEIVING，仅入库人可乱序补块；显式完成覆盖 [0,total_length) 且 SHA-256 相符才创建 SEALED 证物。
+CREATE TABLE IF NOT EXISTS chunk_intake (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    intake_key VARCHAR(64) NOT NULL COMMENT '分块接收业务键，即完成后的证物业务键，全局唯一；放弃后只能另换新键新建接收',
+    case_key VARCHAR(64) NOT NULL COMMENT '所属案件键，完成封存时原样写入证物，接收期间不可修改',
+    category VARCHAR(64) NOT NULL COMMENT '证物类别，完成封存时原样写入证物，接收期间不可修改',
+    seal_no VARCHAR(64) NOT NULL COMMENT '封条编号，完成封存时原样写入证物，接收期间不可修改',
+    custodian_id VARCHAR(64) NOT NULL COMMENT '创建待接收记录的入库人；完成前唯一可补块/完成/放弃者，完成后成为证物当前保管人',
+    total_length INT NOT NULL COMMENT '固定总字节数，取值 1..65536，创建后不可修改',
+    sha256 CHAR(64) NOT NULL COMMENT '完整字节流的 SHA-256 十六进制摘要（服务端统一小写存储），完成时按解码拼接字节整体校验',
+    status VARCHAR(20) NOT NULL COMMENT '接收状态：RECEIVING 待接收（可乱序补块、可放弃）/ SEALED 已完成并创建证物 / ABANDONED 已放弃（终态）',
+    version INT NOT NULL COMMENT '乐观版本号：当前已接收块数，每成功写入一个新块递增 1；写请求可携带期望版本比对',
+    created_at DATETIME(6) NOT NULL COMMENT '待接收记录创建时间，Asia/Shanghai',
+    updated_at DATETIME(6) NOT NULL COMMENT '最近一次补块或状态变更时间，Asia/Shanghai',
+    CONSTRAINT uk_chunk_intake_key UNIQUE (intake_key)
+);
+
+-- 分块载荷：块写入后不可修改；同一接收内 (offset,length) 唯一，任意重叠由服务端在接收行锁内拒绝。
+-- 载荷为 Base64 解码后的原始合成字节，只允许当前保管人通过取字节入口读取，禁止写入应用日志。
+CREATE TABLE IF NOT EXISTS evidence_chunk (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    intake_key VARCHAR(64) NOT NULL COMMENT '所属分块接收业务键',
+    chunk_offset INT NOT NULL COMMENT '块起始偏移（字节），非负，相对完整字节流',
+    chunk_length INT NOT NULL COMMENT 'Base64 解码后的字节长度，取值 1..4096，offset+length 不得越过总长度',
+    payload VARBINARY(4096) NOT NULL COMMENT '块原始字节（Base64 解码后存储，身份比较按解码字节；等价 Base64 编码不形成不同内容），禁止写日志',
+    created_at DATETIME(6) NOT NULL COMMENT '块首次接收时间，Asia/Shanghai；块写入后不可修改',
+    CONSTRAINT uk_chunk_range UNIQUE (intake_key, chunk_offset, chunk_length),
+    KEY idx_chunk_intake_offset (intake_key, chunk_offset)
 );
