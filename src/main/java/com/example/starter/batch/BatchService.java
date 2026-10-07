@@ -6,22 +6,22 @@ import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.MeasurementEntryResponse;
+import com.example.starter.batch.dto.MeasurementResponse;
+import com.example.starter.batch.dto.RebindResponse;
+import com.example.starter.batch.dto.RebindSpecRequest;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.RecallResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
+import com.example.starter.batch.dto.SubmitMeasurementRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import com.example.starter.batch.dto.TestResultResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.support.TransactionTemplate;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -29,10 +29,12 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.Supplier;
 
 /**
@@ -51,47 +53,56 @@ public class BatchService {
     private static final String CMD_RECALL = "RECALL";
     private static final String CMD_SPLIT = "SPLIT";
 
-    /**
-     * 指纹拼接分隔符（NUL）：业务参数不可能包含该字符，避免拼接碰撞。
-     */
-    private static final String SEP = "\u0000";
-
-    private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
-
     private final BatchRepository repo;
-    private final TransactionTemplate tx;
+    private final SpecRepository specRepo;
+    private final IdempotentExecutor idem;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
-                        PlatformTransactionManager transactionManager,
+                        SpecRepository specRepo,
+                        IdempotentExecutor idem,
                         ObjectMapper objectMapper) {
         this.repo = repo;
-        this.tx = new TransactionTemplate(transactionManager);
+        this.specRepo = specRepo;
+        this.idem = idem;
         this.objectMapper = objectMapper;
     }
 
     /**
      * 创建批次：初始状态 QUARANTINED；batchKey 全局唯一，重复返回 409。
+     * specKey/specVersion 同时提供时绑定一版已存在的耦合公差规范（不存在返回 404），
+     * 同时缺省则不绑定；绑定批次放行前还需当前版本测量向量 PASS。
      */
     public StoredResponse createBatch(CreateBatchRequest req) {
         List<String> items = req.requiredTests().stream().map(String::trim).toList();
         if (new HashSet<>(items).size() != items.size()) {
             throw ApiException.badRequest("requiredTests 存在重复检验项");
         }
+        if ((req.specKey() == null) != (req.specVersion() == null)) {
+            throw ApiException.badRequest("specKey 与 specVersion 必须同时提供或同时缺省");
+        }
         String fingerprint = fingerprint("create", req.batchKey(), req.productCode(), req.batchNo(),
-                req.producedAt().toString(), String.join(SEP, items));
+                req.producedAt().toString(), String.join("\u0000", items),
+                String.valueOf(req.specKey()), String.valueOf(req.specVersion()));
         return executeIdempotent(CMD_CREATE, req.commandKey(), fingerprint, () -> {
             repo.findBatch(req.batchKey()).ifPresent(b -> {
                 throw ApiException.conflict("batchKey 已存在: " + req.batchKey());
             });
+            if (req.specKey() != null) {
+                specRepo.findSpec(req.specKey(), req.specVersion())
+                        .orElseThrow(() -> ApiException.notFound("规范版本不存在: "
+                                + req.specKey() + "@" + req.specVersion()));
+            }
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(),
+                    req.specKey(), req.specVersion(), now));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
             BatchResponse body = new BatchResponse(req.batchKey(), req.productCode(), req.batchNo(),
-                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now));
+                    req.producedAt(), BatchStatus.QUARANTINED, items, req.specKey(),
+                    req.specVersion(), Instant.parse(now));
             return new StoredResponse(201, toJson(body));
         });
     }
@@ -143,7 +154,8 @@ public class BatchService {
             BatchStatus newStatus = status;
             if (req.result() == TestOutcome.FAIL) {
                 newStatus = BatchStatus.REJECTED;
-            } else if (status == BatchStatus.QUARANTINED && allRequiredPassed(batchKey, required)) {
+            } else if (status == BatchStatus.QUARANTINED && allRequiredPassed(batchKey, required)
+                    && measurementSatisfied(batch)) {
                 newStatus = BatchStatus.PENDING_RELEASE;
             }
             if (newStatus != status) {
@@ -156,7 +168,151 @@ public class BatchService {
     }
 
     /**
+     * 提交测量向量：仅绑定规范的批次可用。向量必须恰好覆盖当前绑定版本的全部特性，
+     * 每值最多 6 位小数；缺特性、多特性或超精度返回 400 且不留检验记录。
+     * 合法向量按 BigDecimal 精确评估全部线性约束（等号合格）：全部满足记录 PASS，
+     * 任一越界记录 FAIL 并使批次进入 REJECTED。expectedVersion 必须等于当前绑定版本。
+     */
+    public StoredResponse submitMeasurement(String batchKey, SubmitMeasurementRequest req) {
+        Map<String, BigDecimal> values = req.values();
+        List<String> fingerprintParts = new ArrayList<>();
+        fingerprintParts.add("measure");
+        fingerprintParts.add(batchKey);
+        fingerprintParts.add(String.valueOf(req.expectedVersion()));
+        fingerprintParts.add(req.operator().trim());
+        for (Map.Entry<String, BigDecimal> entry : new TreeMap<>(values).entrySet()) {
+            fingerprintParts.add(entry.getKey());
+            fingerprintParts.add(entry.getValue() == null ? "null"
+                    : SpecDefinition.canonicalDecimal(entry.getValue()));
+        }
+        String fingerprint = fingerprint(fingerprintParts.toArray(new String[0]));
+        return executeIdempotent(SpecService.CMD_GLOBAL, req.requestId(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            if (batch.specKey() == null) {
+                throw ApiException.unprocessable("批次未绑定规范，不能提交测量向量: " + batchKey);
+            }
+            if (!batch.specVersion().equals(req.expectedVersion())) {
+                throw ApiException.conflict("期望版本 " + req.expectedVersion()
+                        + " 与当前绑定版本 " + batch.specVersion() + " 不一致");
+            }
+            assertNoRecalledAncestor(batchKey);
+            BatchStatus status = BatchStatus.valueOf(batch.status());
+            if (status != BatchStatus.QUARANTINED && status != BatchStatus.PENDING_RELEASE) {
+                throw ApiException.conflict("批次状态 " + status + " 不允许提交测量向量");
+            }
+            SpecRepository.SpecRow specRow = specRepo.findSpec(batch.specKey(), batch.specVersion())
+                    .orElseThrow(() -> new IllegalStateException("绑定规范版本缺失: "
+                            + batch.specKey() + "@" + batch.specVersion()));
+            SpecDefinition def = SpecDefinition.fromJson(specRow.featuresJson(),
+                    specRow.constraintsJson(), objectMapper);
+            validateVector(def, values);
+
+            List<Integer> violated = def.evaluate(values);
+            TestOutcome outcome = violated.isEmpty() ? TestOutcome.PASS : TestOutcome.FAIL;
+            String now = now();
+            Map<String, BigDecimal> ordered = new LinkedHashMap<>();
+            for (String feature : def.features()) {
+                ordered.put(feature, values.get(feature));
+            }
+            specRepo.insertMeasurement(new SpecRepository.MeasurementRow(0L, batchKey,
+                    batch.specVersion(), toJson(ordered), outcome.name(),
+                    req.operator().trim(), req.requestId(), now));
+
+            BatchStatus newStatus = status;
+            if (outcome == TestOutcome.FAIL) {
+                newStatus = BatchStatus.REJECTED;
+            } else if (status == BatchStatus.QUARANTINED
+                    && allRequiredPassed(batchKey, repo.findRequiredTests(batchKey))) {
+                newStatus = BatchStatus.PENDING_RELEASE;
+            }
+            if (newStatus != status) {
+                repo.updateStatus(batchKey, newStatus.name());
+            }
+            MeasurementResponse body = new MeasurementResponse(batchKey, batch.specVersion(),
+                    ordered, outcome, violated, newStatus, Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 向量格式校验：特性集合必须恰好等于规范特性；每值最多 6 位小数。违反抛 400 且不留检验。
+     */
+    private void validateVector(SpecDefinition def, Map<String, BigDecimal> values) {
+        Set<String> expected = new HashSet<>(def.features());
+        if (!values.keySet().equals(expected)) {
+            throw ApiException.badRequest("测量向量必须恰好覆盖规范特性: " + def.features());
+        }
+        for (Map.Entry<String, BigDecimal> entry : values.entrySet()) {
+            if (entry.getValue() == null) {
+                throw ApiException.badRequest("测量值不能为空: " + entry.getKey());
+            }
+            if (entry.getValue().scale() > 6) {
+                throw ApiException.badRequest("测量值最多 6 位小数: " + entry.getKey()
+                        + "=" + entry.getValue().toPlainString());
+            }
+        }
+    }
+
+    /**
+     * 显式换版：仅未放行（QUARANTINED/PENDING_RELEASE）且尚无任何批准的批次可换版；
+     * expectedVersion 必须等于当前绑定版本。换版后旧向量与结论保留但不再作为放行依据，
+     * 原 PENDING_RELEASE 回退为 QUARANTINED，需按新版本重新提交测量向量。
+     */
+    public StoredResponse rebindSpec(String batchKey, RebindSpecRequest req) {
+        String fingerprint = fingerprint("respec", batchKey, req.operator().trim(),
+                String.valueOf(req.expectedVersion()), String.valueOf(req.newVersion()));
+        return executeIdempotent(SpecService.CMD_GLOBAL, req.requestId(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            if (batch.specKey() == null) {
+                throw ApiException.unprocessable("批次未绑定规范，不能换版: " + batchKey);
+            }
+            if (!batch.specVersion().equals(req.expectedVersion())) {
+                throw ApiException.conflict("期望版本 " + req.expectedVersion()
+                        + " 与当前绑定版本 " + batch.specVersion() + " 不一致");
+            }
+            BatchStatus status = BatchStatus.valueOf(batch.status());
+            if (status != BatchStatus.QUARANTINED && status != BatchStatus.PENDING_RELEASE) {
+                throw ApiException.conflict("批次状态 " + status + " 不允许换版，"
+                        + "仅未放行且无任何批准的批次可换版");
+            }
+            if (!repo.findApprovals(batchKey).isEmpty()) {
+                throw ApiException.conflict("批次已存在批准记录，不允许换版");
+            }
+            if (req.newVersion().equals(req.expectedVersion())) {
+                throw ApiException.conflict("新版本与当前绑定版本相同: " + req.newVersion());
+            }
+            specRepo.findSpec(batch.specKey(), req.newVersion())
+                    .orElseThrow(() -> ApiException.notFound("规范版本不存在: "
+                            + batch.specKey() + "@" + req.newVersion()));
+            String now = now();
+            repo.updateSpecVersion(batchKey, req.newVersion());
+            BatchStatus newStatus = status == BatchStatus.PENDING_RELEASE
+                    ? BatchStatus.QUARANTINED
+                    : status;
+            if (newStatus != status) {
+                repo.updateStatus(batchKey, newStatus.name());
+            }
+            RebindResponse body = new RebindResponse(batchKey, batch.specKey(),
+                    req.expectedVersion(), req.newVersion(), newStatus, Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 放行门禁的向量条件：未绑定规范恒真；绑定批次要求当前绑定版本下存在 PASS 测量向量。
+     */
+    private boolean measurementSatisfied(BatchRepository.BatchRow batch) {
+        return batch.specKey() == null
+                || specRepo.findLatestPassMeasurement(batch.batchKey(), batch.specVersion())
+                        .isPresent();
+    }
+
+    /**
      * 批准：两步放行。首个有效批准进入 RELEASE_REVIEW，第二个不同角色、不同批准人批准后 RELEASED。
+     * 绑定规范的批次必须携带等于当前绑定版本的 expectedVersion；最终批准（进入 RELEASED）时
+     * 冻结完整系数、上界与放行依据向量到 release_freeze，此后规范换版不影响该快照。
      */
     public StoredResponse approve(String batchKey, String actorId, String roleHeader, ApproveRequest req) {
         if (actorId == null || actorId.isBlank()) {
@@ -164,7 +320,8 @@ public class BatchService {
         }
         ApprovalRole role = parseRole(roleHeader);
         String actor = actorId.trim();
-        String fingerprint = fingerprint("approve", batchKey, actor, role.name());
+        String fingerprint = fingerprint("approve", batchKey, actor, role.name(),
+                String.valueOf(req.expectedVersion()));
         return executeIdempotent(CMD_APPROVE, req.commandKey(), fingerprint, () -> {
             BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
                     .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
@@ -176,6 +333,7 @@ public class BatchService {
             if (status != BatchStatus.PENDING_RELEASE && status != BatchStatus.RELEASE_REVIEW) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许批准");
             }
+            assertApprovalVersion(batch, req.expectedVersion());
             boolean actorInspected = repo.findTests(batchKey).stream()
                     .anyMatch(t -> t.inspector().equals(actor));
             if (actorInspected) {
@@ -203,10 +361,51 @@ public class BatchService {
             repo.insertApproval(new BatchRepository.ApprovalRow(0L, batchKey, req.commandKey(),
                     actor, role.name(), seq, now));
             repo.updateStatus(batchKey, newStatus.name());
+            if (newStatus == BatchStatus.RELEASED && batch.specKey() != null) {
+                freezeRelease(batch, now);
+            }
             ApprovalResponse body = new ApprovalResponse(batchKey, actor, role, seq, newStatus,
                     Instant.parse(now));
             return new StoredResponse(201, toJson(body));
         });
+    }
+
+    /**
+     * 批准版本门禁：绑定规范的批次必须提供等于当前绑定版本的 expectedVersion，
+     * 且当前版本下存在 PASS 测量向量；未绑定批次不得提供 expectedVersion。
+     */
+    private void assertApprovalVersion(BatchRepository.BatchRow batch, Integer expectedVersion) {
+        if (batch.specKey() == null) {
+            if (expectedVersion != null) {
+                throw ApiException.badRequest("未绑定规范的批次不应提供 expectedVersion");
+            }
+            return;
+        }
+        if (expectedVersion == null) {
+            throw ApiException.badRequest("绑定规范的批次批准必须提供 expectedVersion");
+        }
+        if (!batch.specVersion().equals(expectedVersion)) {
+            throw ApiException.conflict("批准期望版本 " + expectedVersion
+                    + " 与当前绑定版本 " + batch.specVersion() + " 不一致");
+        }
+        if (specRepo.findLatestPassMeasurement(batch.batchKey(), batch.specVersion()).isEmpty()) {
+            throw ApiException.unprocessable("当前绑定版本缺少 PASS 测量向量，不能批准");
+        }
+    }
+
+    /**
+     * 放行冻结：快照当前绑定版本的完整特性、系数、上界与最近一次 PASS 向量。
+     */
+    private void freezeRelease(BatchRepository.BatchRow batch, String now) {
+        SpecRepository.SpecRow spec = specRepo.findSpec(batch.specKey(), batch.specVersion())
+                .orElseThrow(() -> new IllegalStateException("绑定规范版本缺失: "
+                        + batch.specKey() + "@" + batch.specVersion()));
+        SpecRepository.MeasurementRow pass = specRepo
+                .findLatestPassMeasurement(batch.batchKey(), batch.specVersion())
+                .orElseThrow(() -> new IllegalStateException("当前版本缺少 PASS 测量向量"));
+        specRepo.insertFreeze(new SpecRepository.FreezeRow(0L, batch.batchKey(), batch.specKey(),
+                batch.specVersion(), spec.featuresJson(), spec.constraintsJson(),
+                pass.vectorJson(), now));
     }
 
     /**
@@ -286,32 +485,34 @@ public class BatchService {
                 .map(r -> new RecallResponse(r.batchKey(), r.actorId(), r.reason(),
                         BatchStatus.RECALLED, Instant.parse(r.createdAt())))
                 .orElse(null);
-        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall);
+        List<MeasurementEntryResponse> measurements = specRepo.findMeasurements(batchKey).stream()
+                .map(m -> new MeasurementEntryResponse(m.specVersion(), readVector(m.vectorJson()),
+                        TestOutcome.valueOf(m.outcome()), m.operator(),
+                        Instant.parse(m.createdAt())))
+                .toList();
+        return new BatchHistoryResponse(toBatchResponse(batch), tests, measurements, approvals,
+                recall);
     }
 
     /**
-     * 幂等执行：同事务内先查 command_log，命中则按指纹返回快照或 409；
-     * 未命中执行业务动作并写入快照。并发同键插入冲突时重试，读取已提交结果。
+     * 解析存储的测量向量 JSON（特性名→十进制值），保持提交时的特性顺序。
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, BigDecimal> readVector(String vectorJson) {
+        try {
+            return objectMapper.readValue(vectorJson, objectMapper.getTypeFactory()
+                    .constructMapType(LinkedHashMap.class, String.class, BigDecimal.class));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("测量向量反序列化失败", e);
+        }
+    }
+
+    /**
+     * 幂等执行：委托给共享执行器（同事务查快照、同键同参重放、同键改参 409、并发冲突重试）。
      */
     private StoredResponse executeIdempotent(String type, String commandKey, String fingerprint,
                                              Supplier<StoredResponse> action) {
-        for (int attempt = 0; attempt < IDEMPOTENCY_MAX_ATTEMPTS; attempt++) {
-            try {
-                return tx.execute(status -> {
-                    var logged = loggedResponse(type, commandKey, fingerprint);
-                    if (logged.isPresent()) {
-                        return logged.get();
-                    }
-                    StoredResponse response = action.get();
-                    repo.insertCommand(new BatchRepository.CommandRow(type, commandKey, fingerprint,
-                            response.status(), response.body()), now());
-                    return response;
-                });
-            } catch (DuplicateKeyException e) {
-                // 并发同事务键冲突：回滚后重试，读取对方已提交的命令快照或业务结果
-            }
-        }
-        throw ApiException.conflict("命令并发冲突，请重试: " + commandKey);
+        return idem.execute(type, commandKey, fingerprint, action);
     }
 
     /**
@@ -319,15 +520,7 @@ public class BatchService {
      */
     private Optional<StoredResponse> loggedResponse(String type, String commandKey,
                                                     String fingerprint) {
-        var existing = repo.findCommand(type, commandKey);
-        if (existing.isEmpty()) {
-            return Optional.empty();
-        }
-        BatchRepository.CommandRow row = existing.get();
-        if (!row.fingerprint().equals(fingerprint)) {
-            throw ApiException.conflict("commandKey 已以不同参数使用: " + commandKey);
-        }
-        return Optional.of(new StoredResponse(row.responseStatus(), row.responseBody()));
+        return idem.logged(type, commandKey, fingerprint);
     }
 
     private boolean allRequiredPassed(String batchKey, List<String> required) {
@@ -343,7 +536,8 @@ public class BatchService {
     private BatchResponse toBatchResponse(BatchRepository.BatchRow row) {
         return new BatchResponse(row.batchKey(), row.productCode(), row.batchNo(),
                 Instant.parse(row.producedAt()), BatchStatus.valueOf(row.status()),
-                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()));
+                repo.findRequiredTests(row.batchKey()), row.specKey(), row.specVersion(),
+                Instant.parse(row.createdAt()));
     }
 
     private TestResultResponse toTestResponse(BatchRepository.TestRow row, String batchStatus) {
@@ -399,25 +593,14 @@ public class BatchService {
         return Instant.now().toString();
     }
 
-    private String fingerprint(String... parts) {        String canonical = String.join(SEP, parts);
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(canonical.getBytes(StandardCharsets.UTF_8));
-            StringBuilder hex = new StringBuilder(hash.length * 2);
-            for (byte b : hash) {
-                hex.append(Character.forDigit((b >> 4) & 0xF, 16));
-                hex.append(Character.forDigit(b & 0xF, 16));
-            }
-            return hex.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 不可用", e);
-        }
+    private String fingerprint(String... parts) {
+        return IdempotentExecutor.fingerprint(parts);
     }
 
     /**
      * 拆分：仅当前可用的 RELEASED 批次可一次拆成 2～5 个全新子批。
-     * 子批继承产品编码、生产 UTC 时间与必做检验项，初始 QUARANTINED，
-     * 不继承检验或批准记录；父批置为 SPLIT 不再可用。
+     * 子批继承产品编码、生产 UTC 时间、必做检验项与绑定的规范版本，初始 QUARANTINED，
+     * 不继承检验、测量向量或批准记录；父批置为 SPLIT 不再可用。
      * 创建全部子批、血缘关系与父批状态在同一事务提交；任一子批键已存在或重复，整次 409 且父批不变。
      */
     public StoredResponse split(String parentKey, SplitRequest req) {
@@ -459,7 +642,8 @@ public class BatchService {
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(),
+                        parent.specKey(), parent.specVersion(), now));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }

@@ -5,8 +5,10 @@ import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.RebindSpecRequest;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
+import com.example.starter.batch.dto.SubmitMeasurementRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
@@ -50,6 +52,25 @@ public class BatchController {
     public ResponseEntity<String> submitTest(@PathVariable String batchKey,
                                              @Valid @RequestBody SubmitTestRequest request) {
         return stored(service.submitTest(batchKey, request));
+    }
+
+    /**
+     * 提交测量向量：绑定规范的批次按当前绑定版本做整体线性约束判定，
+     * 全部满足（含等号）记录 PASS，任一越界记录 FAIL 并进入 REJECTED。
+     */
+    @PostMapping("/{batchKey}/measurements")
+    public ResponseEntity<String> submitMeasurement(@PathVariable String batchKey,
+                                                    @Valid @RequestBody SubmitMeasurementRequest request) {
+        return stored(service.submitMeasurement(batchKey, request));
+    }
+
+    /**
+     * 显式换版：仅未放行且尚无任何批准的批次可换绑规范版本，带 expectedVersion 乐观校验。
+     */
+    @PostMapping("/{batchKey}/spec-version")
+    public ResponseEntity<String> rebindSpec(@PathVariable String batchKey,
+                                             @Valid @RequestBody RebindSpecRequest request) {
+        return stored(service.rebindSpec(batchKey, request));
     }
 
     /**

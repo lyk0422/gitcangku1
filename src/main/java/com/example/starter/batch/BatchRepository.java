@@ -15,9 +15,11 @@ public class BatchRepository {
 
     /**
      * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
+     * specKey/specVersion 为绑定的耦合公差规范；均为 null 表示未绑定规范。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, String status, String specKey, Integer specVersion,
+                           String createdAt) {
     }
 
     /**
@@ -57,7 +59,8 @@ public class BatchRepository {
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
-            rs.getString("status"), rs.getString("created_at"));
+            rs.getString("status"), rs.getString("spec_key"),
+            (Integer) rs.getObject("spec_version"), rs.getString("created_at"));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("test_key"),
@@ -101,10 +104,17 @@ public class BatchRepository {
     }
 
     public void insertBatch(BatchRow row) {
-        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status,"
+                        + " spec_key, spec_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(),
-                row.status(), row.createdAt());
+                row.status(), row.specKey(), row.specVersion(), row.createdAt());
+    }
+
+    /**
+     * 显式换版：仅更新绑定版本号；旧测量向量保留在 measurement 表中但不再作为放行依据。
+     */
+    public void updateSpecVersion(String batchKey, int specVersion) {
+        jdbc.update("UPDATE batch SET spec_version = ? WHERE batch_key = ?", specVersion, batchKey);
     }
 
     public void insertRequiredTest(String batchKey, String testItem, int seq) {

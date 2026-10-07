@@ -15,6 +15,8 @@ public record BatchResponse(
         Instant producedAt,
         BatchStatus status,
         List<String> requiredTests,
+        String specKey,
+        Integer specVersion,
         Instant createdAt
 ) {
 }
