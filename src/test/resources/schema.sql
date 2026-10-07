@@ -29,3 +29,21 @@ CREATE TABLE IF NOT EXISTS idempotency_request (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (request_id)
 );
+
+CREATE TABLE IF NOT EXISTS joint_record (
+    record_key VARCHAR(128) NOT NULL,
+    subject_a VARCHAR(128) NOT NULL,
+    subject_b VARCHAR(128) NOT NULL,
+    epoch_a INT NOT NULL,
+    epoch_b INT NOT NULL,
+    version INT NOT NULL,
+    revision_count INT NOT NULL,
+    payload TEXT NOT NULL,
+    confirm_a BOOLEAN NOT NULL DEFAULT FALSE,
+    confirm_b BOOLEAN NOT NULL DEFAULT FALSE,
+    status VARCHAR(16) NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (record_key)
+);

@@ -4,8 +4,8 @@ spring:
   config:
     import: "optional:configtree:/run/secrets/"
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
+    url: ${DB_URL:jdbc:h2:mem:consent-joint;MODE=MySQL;DB_CLOSE_DELAY=-1}
+    username: ${DB_USER:sa}
   sql:
     init:
       mode: always
@@ -34,3 +34,8 @@ management:
   endpoint:
     health:
       show-details: never
+
+app:
+  synthetic-seed:
+    # 本地入口启动时初始化本题合成数据（合成主体 A/B 的研究授权代次 1），仅同 JVM 内存库留存
+    enabled: true

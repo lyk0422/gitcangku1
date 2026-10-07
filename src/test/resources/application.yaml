@@ -14,3 +14,8 @@ server:
   error:
     include-message: never
     include-stacktrace: never
+
+app:
+  synthetic-seed:
+    # 测试场景数据由各用例自行建立并清理，关闭启动期合成数据初始化
+    enabled: false
