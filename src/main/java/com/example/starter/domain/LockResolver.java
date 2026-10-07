@@ -7,9 +7,18 @@ import java.util.TreeMap;
 /**
  * 依赖锁定解析器：在一致性仓库快照上带回溯地求解精确版本组合。
  *
- * <p>规则：根版本固定；其余名称按字典序选择下一个尚未解析的依赖，
+ * <p>规则：根版本固定；其余名称按字典序选择下一个尚未解析的普通依赖，
  * 候选版本从高到低尝试，遇冲突回退，取首个完整可行结果。
- * 已选制品之间必须互相满足区间约束，因此依赖图存在环时也会被正确校验。
+ * 已选制品之间必须互相满足普通依赖区间，因此依赖图存在环时也会被正确校验。
+ *
+ * <p>peer 依赖与普通依赖共同求解但语义不同：
+ * <ul>
+ *   <li>peer 不建立可达边，不会把宿主名称拉入求解集合；</li>
+ *   <li>peer 只约束普通依赖图已经可达（即已在候选解中）的同名制品：
+ *       宿主缺失或宿主精确版本落在闭区间外时，整个候选组合不可行，
+ *       触发对其他候选版本的回退；全部候选不可行时返回 null；</li>
+ *   <li>peer 边不构成普通依赖环，环检测只基于普通依赖。</li>
+ * </ul>
  */
 public final class LockResolver {
 
@@ -52,11 +61,12 @@ public final class LockResolver {
     }
 
     /**
-     * 递归回溯：选出字典序最小的未解析依赖名称，从高到低尝试候选版本。
+     * 递归回溯：选出字典序最小的未解析普通依赖名称，从高到低尝试候选版本。
      */
     private static boolean solve(Map<String, List<ArtifactVersion>> all,
                                  TreeMap<String, ArtifactVersion> chosen) {
-        // 汇总所有已选制品对“尚未解析名称”的区间约束，取交集。
+        // 汇总所有已选制品对“尚未解析名称”的普通依赖区间约束，取交集。
+        // peer 不参与：peer 不建立可达边，不能把宿主名称拉入求解集合。
         String next = null;
         int lo = Integer.MAX_VALUE;
         int hi = Integer.MIN_VALUE;
@@ -77,11 +87,11 @@ public final class LockResolver {
         }
 
         if (next == null) {
-            // 所有依赖均已解析为精确版本。
-            return true;
+            // 普通依赖图已全部解析为精确版本；peer 约束在此统一终局校验。
+            return peersSatisfied(chosen);
         }
         if (lo > hi) {
-            // 多个已选制品对该名称的区间交集为空。
+            // 多个已选制品对该名称的普通依赖区间交集为空。
             return false;
         }
 
@@ -91,7 +101,7 @@ public final class LockResolver {
             if (candidate.withdrawn() || candidate.version() < lo || candidate.version() > hi) {
                 continue;
             }
-            // 新候选对所有已选名称（含自身）的区间必须成立；环依赖在此被校验。
+            // 新候选对所有已选名称（含自身）的普通依赖区间必须成立；环依赖在此被校验。
             if (!satisfiesChosen(candidate, chosen)) {
                 continue;
             }
@@ -105,7 +115,7 @@ public final class LockResolver {
     }
 
     /**
-     * 校验候选制品声明的、指向已选名称的依赖区间均被已选精确版本满足。
+     * 校验候选制品声明的、指向已选名称的普通依赖区间均被已选精确版本满足。
      */
     private static boolean satisfiesChosen(ArtifactVersion candidate,
                                            Map<String, ArtifactVersion> chosen) {
@@ -116,6 +126,27 @@ public final class LockResolver {
             }
             if (selected.version() < dep.minimumVersion() || selected.version() > dep.maximumVersion()) {
                 return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 终局校验全部已选制品的 peer 声明：
+     * peer 仅约束普通依赖图已经可达的同名制品——宿主不在候选解中（缺失）
+     * 或宿主精确版本不满足闭区间时，该候选组合不可行。
+     */
+    private static boolean peersSatisfied(Map<String, ArtifactVersion> chosen) {
+        for (ArtifactVersion artifact : chosen.values()) {
+            for (DependencyRange peer : artifact.peers()) {
+                ArtifactVersion host = chosen.get(peer.name());
+                if (host == null) {
+                    // 宿主未通过普通依赖图可达：peer 不能自行引入宿主。
+                    return false;
+                }
+                if (host.version() < peer.minimumVersion() || host.version() > peer.maximumVersion()) {
+                    return false;
+                }
             }
         }
         return true;

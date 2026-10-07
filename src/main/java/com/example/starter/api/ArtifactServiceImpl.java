@@ -5,8 +5,12 @@ import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.DependencyView;
 import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
+import com.example.starter.api.dto.LockPeerMatchResponse;
 import com.example.starter.api.dto.LockRequest;
+import com.example.starter.api.dto.PeerSpec;
+import com.example.starter.api.dto.PeerView;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.api.dto.WithdrawRequest;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.LockResolver;
@@ -15,6 +19,7 @@ import com.example.starter.repo.RepositoryDao;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
 import com.example.starter.repo.RepositoryDao.LockEntryRow;
 import com.example.starter.repo.RepositoryDao.LockFileRow;
+import com.example.starter.repo.RepositoryDao.LockPeerMatchRow;
 import com.example.starter.support.ApiException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -28,6 +33,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -39,12 +45,16 @@ import java.util.function.Supplier;
  *
  * <p>所有写操作在单个事务内完成：先锁单行仓库版本表互斥并发写，
  * 再做业务变更并写入幂等成功记录，原子提交；业务失败整体回滚，不占用 requestId。
+ * 登记/撤回/锁定均要求非空操作者；撤回与锁定核对同一 expectedRepositoryVersion。
+ * 幂等指纹为结构化 JSON（操作、资源、全参数、期望版本、操作者）的 SHA-256，
+ * 字段名分层且互不碰撞；peer 声明按名称排序后参与指纹，换序同参。
  */
 @Service
 public class ArtifactServiceImpl implements ArtifactService {
 
     private static final int MAX_NAMES = 20;
     private static final int MAX_VERSIONS_PER_NAME = 5;
+    private static final int MAX_PEERS = 3;
 
     private static final String OP_REGISTER = "REGISTER_ARTIFACT";
     private static final String OP_WITHDRAW = "WITHDRAW_ARTIFACT";
@@ -68,32 +78,37 @@ public class ArtifactServiceImpl implements ArtifactService {
     @Override
     public ArtifactResponse registerArtifact(String requestId, RegisterArtifactRequest request) {
         requireRequestId(requestId);
+        requireOperator(request.operator());
         validateRegisterRequest(request);
-        String hash = sha256(OP_REGISTER + "|" + request.name().trim() + "|" + request.version() + "|"
-                + canonicalDependencies(request));
+        String hash = sha256(canonicalRegister(request));
         return executeIdempotent(requestId, OP_REGISTER, hash, 201,
                 () -> doRegister(request), ArtifactResponse.class);
     }
 
     @Override
-    public ArtifactResponse withdrawArtifact(String requestId, String name, int version) {
+    public ArtifactResponse withdrawArtifact(String requestId, String name, int version,
+                                             WithdrawRequest request) {
         requireRequestId(requestId);
+        requireOperator(request.operator());
         if (name == null || name.isBlank()) {
             throw ApiException.badRequest("name 不能为空");
         }
-        String hash = sha256(OP_WITHDRAW + "|" + name.trim() + "|" + version);
+        if (request.expectedRepositoryVersion() == null) {
+            throw ApiException.badRequest("expectedRepositoryVersion 不能为空");
+        }
+        String hash = sha256(canonicalWithdraw(name.trim(), version, request));
         return executeIdempotent(requestId, OP_WITHDRAW, hash, 200,
-                () -> doWithdraw(name.trim(), version), ArtifactResponse.class);
+                () -> doWithdraw(name.trim(), version, request), ArtifactResponse.class);
     }
 
     @Override
     public LockFileResponse createLock(String requestId, LockRequest request) {
         requireRequestId(requestId);
+        requireOperator(request.operator());
         if (request.rootName() == null || request.rootName().isBlank()) {
             throw ApiException.badRequest("rootName 不能为空");
         }
-        String hash = sha256(OP_LOCK + "|" + request.rootName().trim() + "|" + request.rootVersion()
-                + "|" + request.expectedRepositoryVersion());
+        String hash = sha256(canonicalLock(request));
         return executeIdempotent(requestId, OP_LOCK, hash, 201,
                 () -> doLock(request), LockFileResponse.class);
     }
@@ -102,7 +117,7 @@ public class ArtifactServiceImpl implements ArtifactService {
     public List<LockFileResponse> listLocks() {
         List<LockFileResponse> result = new ArrayList<>();
         for (LockFileRow row : repositoryDao.listLockFiles()) {
-            result.add(toLockResponse(row, repositoryDao.listLockEntries(row.id())));
+            result.add(toLockResponse(row));
         }
         return result;
     }
@@ -113,7 +128,7 @@ public class ArtifactServiceImpl implements ArtifactService {
         if (row == null) {
             throw ApiException.notFound("锁文件不存在: " + id);
         }
-        return toLockResponse(row, repositoryDao.listLockEntries(id));
+        return toLockResponse(row);
     }
 
     // ------------------------------------------------------------------
@@ -138,18 +153,29 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
 
         Instant now = Instant.now(clock);
-        long artifactId = repositoryDao.insertArtifact(name, version, now);
-        for (var dep : request.dependencies()) {
+        long artifactId = repositoryDao.insertArtifact(name, version, request.operator(), now);
+        for (DependencySpec dep : request.dependencies()) {
             repositoryDao.insertDependency(artifactId, dep.name().trim(),
                     dep.minimumVersion(), dep.maximumVersion());
         }
+        for (PeerSpec peer : request.peers()) {
+            repositoryDao.insertPeer(artifactId, peer.name().trim(),
+                    peer.minimumVersion(), peer.maximumVersion());
+        }
         long repositoryVersion = repositoryDao.incrementRepositoryVersion();
 
-        return new ArtifactResponse(name, version, false, repositoryVersion, now,
-                toDependencyViews(request.dependencies()));
+        return new ArtifactResponse(name, version, false, request.operator(), repositoryVersion, now,
+                toDependencyViews(request.dependencies()), toPeerViews(request.peers()));
     }
 
-    private ArtifactResponse doWithdraw(String name, int version) {
+    private ArtifactResponse doWithdraw(String name, int version, WithdrawRequest request) {
+        // 当前事务已在入口持有 repository_state 行锁；此处读取版本号并做乐观校验。
+        long currentVersion = repositoryDao.lockRepositoryState();
+        if (currentVersion != request.expectedRepositoryVersion()) {
+            throw ApiException.conflict("仓库版本不匹配：expected="
+                    + request.expectedRepositoryVersion() + ", actual=" + currentVersion);
+        }
+
         ArtifactVersion artifact = repositoryDao.loadArtifact(name, version);
         if (artifact == null) {
             throw ApiException.notFound("制品版本不存在: " + name + ":" + version);
@@ -163,8 +189,9 @@ public class ArtifactServiceImpl implements ArtifactService {
             throw ApiException.conflict("制品版本已撤回: " + name + ":" + version);
         }
         long repositoryVersion = repositoryDao.incrementRepositoryVersion();
-        return new ArtifactResponse(name, version, true, repositoryVersion,
-                Instant.now(clock), toDependencyViews(artifact.dependencies()));
+        return new ArtifactResponse(name, version, true, request.operator(), repositoryVersion,
+                Instant.now(clock), toRangeViews(artifact.dependencies()),
+                toRangePeerViews(artifact.peers()));
     }
 
     private LockFileResponse doLock(LockRequest request) {
@@ -190,17 +217,58 @@ public class ArtifactServiceImpl implements ArtifactService {
         Map<String, Integer> solution = LockResolver.resolve(snapshot, rootName, rootVersion);
         if (solution == null) {
             throw ApiException.unprocessable(
-                    "不存在满足全部依赖区间的未撤回版本组合，无法锁定");
+                    "不存在满足全部普通依赖与 peer 约束的未撤回版本组合，无法锁定");
         }
 
+        // 依据求解结果冻结全部 peer 声明及实际宿主匹配版本：解析器已保证宿主可达且版本满足。
+        List<LockPeerMatchResponse> peerMatches = collectPeerMatches(snapshot, solution);
+
         Instant now = Instant.now(clock);
-        long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, currentVersion,
-                currentRequestId.get(), now);
+        long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, request.operator(),
+                currentVersion, currentRequestId.get(), now);
         solution.forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
+        for (LockPeerMatchResponse match : peerMatches) {
+            repositoryDao.insertLockPeerMatch(lockFileId, match.declarerName(),
+                    match.declarerVersion(), match.hostName(), match.minimumVersion(),
+                    match.maximumVersion(), match.matchedVersion());
+        }
 
         List<LockEntryResponse> entries = new ArrayList<>();
         solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
-        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
+        return new LockFileResponse(lockFileId, rootName, rootVersion, request.operator(),
+                currentVersion, now, entries, peerMatches);
+    }
+
+    /**
+     * 按名称升序遍历候选解中的制品，收集其全部 peer 声明与实际宿主匹配版本。
+     */
+    private List<LockPeerMatchResponse> collectPeerMatches(
+            RepositorySnapshot snapshot, Map<String, Integer> solution) {
+        Map<String, List<ArtifactVersion>> all = snapshot.artifacts();
+        List<LockPeerMatchResponse> matches = new ArrayList<>();
+        for (String declarerName : new TreeMap<>(solution).keySet()) {
+            int declarerVersion = solution.get(declarerName);
+            ArtifactVersion artifact = all.get(declarerName).stream()
+                    .filter(a -> a.version() == declarerVersion)
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalStateException(
+                            "求解结果中的制品版本缺失: " + declarerName + ":" + declarerVersion));
+            TreeMap<String, DependencyRange> peersByName = new TreeMap<>();
+            artifact.peers().forEach(p -> peersByName.put(p.name(), p));
+            for (DependencyRange peer : peersByName.values()) {
+                Integer matchedVersion = solution.get(peer.name());
+                if (matchedVersion == null || matchedVersion < peer.minimumVersion()
+                        || matchedVersion > peer.maximumVersion()) {
+                    throw new IllegalStateException(
+                            "peer 约束未被求解结果满足: " + declarerName + ":" + declarerVersion
+                                    + " -> " + peer.name());
+                }
+                matches.add(new LockPeerMatchResponse(declarerName, declarerVersion,
+                        peer.name(), peer.minimumVersion(), peer.maximumVersion(),
+                        matchedVersion));
+            }
+        }
+        return List.copyOf(matches);
     }
 
     // ------------------------------------------------------------------
@@ -214,7 +282,7 @@ public class ArtifactServiceImpl implements ArtifactService {
 
     private <T> T executeIdempotent(String requestId, String operation, String requestHash,
                                     int httpStatus, Supplier<T> action, Class<T> responseType) {
-        // 快速路径：已提交的成功记录直接重放。
+        // 快速路径：已提交的成功记录直接重放首次完整响应。
         T replay = replayIfPresent(requestId, operation, requestHash, responseType);
         if (replay != null) {
             return replay;
@@ -242,7 +310,7 @@ public class ArtifactServiceImpl implements ArtifactService {
                 }
             });
         } catch (DuplicateKeyException e) {
-            // 同键并发：赢家已提交则重放其结果，否则报告冲突。
+            // 同键并发：赢家已提交则重放其结果，否则报告冲突；不向调用方泄漏唯一键错误。
             T replayAfterRace = replayIfPresent(requestId, operation, requestHash, responseType);
             if (replayAfterRace != null) {
                 return replayAfterRace;
@@ -268,6 +336,65 @@ public class ArtifactServiceImpl implements ArtifactService {
     }
 
     // ------------------------------------------------------------------
+    // 结构化幂等指纹（JSON 字段分层命名，无碰撞；数字按十进制值，文本原样）
+    // ------------------------------------------------------------------
+
+    private String canonicalRegister(RegisterArtifactRequest request) {
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("operation", OP_REGISTER);
+        root.put("name", request.name().trim());
+        root.put("version", request.version());
+        root.put("operator", request.operator());
+        root.put("dependencies", canonicalRanges(request.dependencies().stream()
+                .map(d -> List.<Object>of(d.name().trim(), d.minimumVersion(), d.maximumVersion())).toList()));
+        root.put("peers", canonicalRanges(request.peers().stream()
+                .map(p -> List.<Object>of(p.name().trim(), p.minimumVersion(), p.maximumVersion())).toList()));
+        return writeJson(root);
+    }
+
+    private String canonicalWithdraw(String name, int version, WithdrawRequest request) {
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("operation", OP_WITHDRAW);
+        root.put("name", name);
+        root.put("version", version);
+        root.put("operator", request.operator());
+        root.put("expectedRepositoryVersion", request.expectedRepositoryVersion());
+        return writeJson(root);
+    }
+
+    private String canonicalLock(LockRequest request) {
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("operation", OP_LOCK);
+        root.put("rootName", request.rootName().trim());
+        root.put("rootVersion", request.rootVersion());
+        root.put("operator", request.operator());
+        root.put("expectedRepositoryVersion", request.expectedRepositoryVersion());
+        return writeJson(root);
+    }
+
+    /** 区间声明按名称、上下界排序后序列化，使换序请求同参。 */
+    private List<List<Object>> canonicalRanges(List<List<Object>> ranges) {
+        return ranges.stream()
+                .map(r -> {
+                    @SuppressWarnings("unchecked")
+                    List<Object> typed = (List<Object>) r;
+                    return List.copyOf(typed);
+                })
+                .sorted((a, b) -> {
+                    int byName = ((String) a.get(0)).compareTo((String) b.get(0));
+                    if (byName != 0) {
+                        return byName;
+                    }
+                    int byMin = Integer.compare((Integer) a.get(1), (Integer) b.get(1));
+                    if (byMin != 0) {
+                        return byMin;
+                    }
+                    return Integer.compare((Integer) a.get(2), (Integer) b.get(2));
+                })
+                .toList();
+    }
+
+    // ------------------------------------------------------------------
     // 校验与转换
     // ------------------------------------------------------------------
 
@@ -279,55 +406,103 @@ public class ArtifactServiceImpl implements ArtifactService {
         if (deps.size() > 10) {
             throw ApiException.badRequest("每个制品版本最多声明 10 条依赖");
         }
+        validateRanges(deps, "依赖");
+
+        List<PeerSpec> peers = request.peers();
+        if (peers.size() > MAX_PEERS) {
+            throw ApiException.badRequest("每个制品版本最多声明 " + MAX_PEERS + " 条 peer 依赖");
+        }
+        Set<String> peerNames = new HashSet<>();
+        for (PeerSpec peer : peers) {
+            if (peer.name() == null || peer.name().isBlank()) {
+                throw ApiException.badRequest("peer 名称不能为空");
+            }
+            String peerName = peer.name().trim();
+            if (peer.minimumVersion() > peer.maximumVersion()) {
+                throw ApiException.badRequest(
+                        "peer " + peerName + " 的最低版本不能高于最高版本");
+            }
+            if (!peerNames.add(peerName)) {
+                throw ApiException.badRequest("peer 名称重复: " + peerName);
+            }
+            if (peerName.equals(request.name().trim())) {
+                throw ApiException.badRequest("peer 名称不能与制品自身同名: " + peerName);
+            }
+        }
+    }
+
+    private void validateRanges(List<DependencySpec> deps, String label) {
         Set<String> names = new HashSet<>();
         for (DependencySpec dep : deps) {
             if (dep.name() == null || dep.name().isBlank()) {
-                throw ApiException.badRequest("依赖名称不能为空");
+                throw ApiException.badRequest(label + "名称不能为空");
             }
             String depName = dep.name().trim();
             if (dep.minimumVersion() > dep.maximumVersion()) {
                 throw ApiException.badRequest(
-                        "依赖 " + depName + " 的最低版本不能高于最高版本");
+                        label + " " + depName + " 的最低版本不能高于最高版本");
             }
             if (!names.add(depName)) {
-                throw ApiException.badRequest("依赖名称重复: " + depName);
+                throw ApiException.badRequest(label + "名称重复: " + depName);
             }
         }
     }
 
-    private String canonicalDependencies(RegisterArtifactRequest request) {
-        return request.dependencies().stream()
-                .map(d -> d.name().trim() + ":" + d.minimumVersion() + ":" + d.maximumVersion())
-                .sorted()
-                .reduce((a, b) -> a + "," + b)
-                .orElse("");
-    }
-
-    private List<DependencyView> toDependencyViews(List<?> raw) {
+    private List<DependencyView> toDependencyViews(List<DependencySpec> raw) {
         TreeMap<String, DependencyView> sorted = new TreeMap<>();
-        for (Object o : raw) {
-            if (o instanceof com.example.starter.api.dto.DependencySpec spec) {
-                sorted.put(spec.name().trim(), new DependencyView(
-                        spec.name().trim(), spec.minimumVersion(), spec.maximumVersion()));
-            } else if (o instanceof DependencyRange range) {
-                sorted.put(range.name(), new DependencyView(
-                        range.name(), range.minimumVersion(), range.maximumVersion()));
-            }
+        for (DependencySpec spec : raw) {
+            sorted.put(spec.name().trim(), new DependencyView(
+                    spec.name().trim(), spec.minimumVersion(), spec.maximumVersion()));
         }
         return List.copyOf(sorted.values());
     }
 
-    private LockFileResponse toLockResponse(LockFileRow row, List<LockEntryRow> entries) {
-        List<LockEntryResponse> entryViews = entries.stream()
+    private List<PeerView> toPeerViews(List<PeerSpec> raw) {
+        TreeMap<String, PeerView> sorted = new TreeMap<>();
+        for (PeerSpec spec : raw) {
+            sorted.put(spec.name().trim(), new PeerView(
+                    spec.name().trim(), spec.minimumVersion(), spec.maximumVersion()));
+        }
+        return List.copyOf(sorted.values());
+    }
+
+    private List<DependencyView> toRangeViews(List<DependencyRange> raw) {
+        return raw.stream()
+                .map(r -> new DependencyView(r.name(), r.minimumVersion(), r.maximumVersion()))
+                .toList();
+    }
+
+    private List<PeerView> toRangePeerViews(List<DependencyRange> raw) {
+        return raw.stream()
+                .map(r -> new PeerView(r.name(), r.minimumVersion(), r.maximumVersion()))
+                .toList();
+    }
+
+    private LockFileResponse toLockResponse(LockFileRow row) {
+        List<LockEntryResponse> entryViews = repositoryDao.listLockEntries(row.id()).stream()
                 .map(e -> new LockEntryResponse(e.name(), e.version()))
                 .toList();
-        return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(),
-                row.repositoryVersion(), row.createdAt(), entryViews);
+        List<LockPeerMatchResponse> peerViews = repositoryDao.listLockPeerMatches(row.id()).stream()
+                .map(this::toPeerMatchResponse)
+                .toList();
+        return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(), row.operator(),
+                row.repositoryVersion(), row.createdAt(), entryViews, peerViews);
+    }
+
+    private LockPeerMatchResponse toPeerMatchResponse(LockPeerMatchRow row) {
+        return new LockPeerMatchResponse(row.declarerName(), row.declarerVersion(),
+                row.hostName(), row.minimumVersion(), row.maximumVersion(), row.matchedVersion());
     }
 
     private void requireRequestId(String requestId) {
         if (requestId == null || requestId.isBlank()) {
             throw ApiException.badRequest("缺少请求头 X-Request-Id");
+        }
+    }
+
+    private void requireOperator(String operator) {
+        if (operator == null || operator.isBlank()) {
+            throw ApiException.badRequest("operator 不能为空");
         }
     }
 

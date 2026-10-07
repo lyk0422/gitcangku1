@@ -22,7 +22,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * 真实 HTTP 入口测试：状态码、X-Request-Id 头、JSON 结构与幂等重放。
+ * 真实 HTTP 入口测试：状态码、X-Request-Id 头、JSON 结构、operator 透传与幂等重放。
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class ArtifactControllerHttpTest {
@@ -35,8 +35,10 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_file_peer_match");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM artifact_peer");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -52,20 +54,38 @@ class ArtifactControllerHttpTest {
         return headers;
     }
 
-    private String registerBody(String name, int version, Object... dependencies) {
+    private String registerBody(String name, int version, String operator, Object... dependencies) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("name", name);
         body.put("version", version);
+        body.put("operator", operator);
         body.put("dependencies", List.of(dependencies));
+        body.put("peers", List.of());
         return toJson(body);
     }
 
-    private Map<String, Object> dependency(String name, int min, int max) {
+    private String registerBodyWithPeers(String name, int version, String operator,
+                                         List<Object> dependencies, List<Object> peers) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("name", name);
+        body.put("version", version);
+        body.put("operator", operator);
+        body.put("dependencies", dependencies);
+        body.put("peers", peers);
+        return toJson(body);
+    }
+
+    private Map<String, Object> range(String name, int min, int max) {
         Map<String, Object> dep = new LinkedHashMap<>();
         dep.put("name", name);
         dep.put("minimumVersion", min);
         dep.put("maximumVersion", max);
         return dep;
+    }
+
+    private String withdrawBody(String operator, long expectedRepositoryVersion) {
+        return toJson(Map.of("operator", operator,
+                "expectedRepositoryVersion", expectedRepositoryVersion));
     }
 
     private String toJson(Object value) {
@@ -79,7 +99,7 @@ class ArtifactControllerHttpTest {
     @Test
     void registerViaHttpReturns201AndReplaysWithSameRequestId() {
         String rid = UUID.randomUUID().toString();
-        String body = registerBody("app", 1, dependency("lib", 1, 2));
+        String body = registerBody("app", 1, "alice", range("lib", 1, 2));
         HttpEntity<String> request = new HttpEntity<>(body, jsonHeaders(rid));
 
         ResponseEntity<JsonNode> first = restTemplate.postForEntity(
@@ -87,6 +107,7 @@ class ArtifactControllerHttpTest {
         assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         assertThat(first.getBody().path("name").asText()).isEqualTo("app");
         assertThat(first.getBody().path("version").asInt()).isEqualTo(1);
+        assertThat(first.getBody().path("operator").asText()).isEqualTo("alice");
         assertThat(first.getBody().path("repositoryVersion").asLong()).isEqualTo(1L);
 
         ResponseEntity<JsonNode> replay = restTemplate.postForEntity(
@@ -101,10 +122,10 @@ class ArtifactControllerHttpTest {
     void sameRequestIdDifferentPayloadReturns409() {
         String rid = UUID.randomUUID().toString();
         restTemplate.postForEntity("/api/artifacts",
-                new HttpEntity<>(registerBody("app", 1), jsonHeaders(rid)), JsonNode.class);
+                new HttpEntity<>(registerBody("app", 1, "alice"), jsonHeaders(rid)), JsonNode.class);
 
         ResponseEntity<JsonNode> conflict = restTemplate.postForEntity("/api/artifacts",
-                new HttpEntity<>(registerBody("app", 2), jsonHeaders(rid)), JsonNode.class);
+                new HttpEntity<>(registerBody("app", 2, "alice"), jsonHeaders(rid)), JsonNode.class);
         assertThat(conflict.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
         assertThat(conflict.getBody().path("error").asText()).isEqualTo("CONFLICT");
     }
@@ -112,14 +133,24 @@ class ArtifactControllerHttpTest {
     @Test
     void missingRequestIdHeaderReturns400() {
         ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts",
-                new HttpEntity<>(registerBody("app", 1), jsonHeaders(null)), JsonNode.class);
+                new HttpEntity<>(registerBody("app", 1, "alice"), jsonHeaders(null)), JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void blankOperatorReturns400() {
+        Map<String, Object> body = Map.of("name", "app", "version", 1, "operator", " ",
+                "dependencies", List.of(), "peers", List.of());
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(toJson(body), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
     void invalidBeanReturns400() {
-        // version 必须为正整数。
-        Map<String, Object> body = Map.of("name", "app", "version", 0, "dependencies", List.of());
+        Map<String, Object> body = Map.of("name", "app", "version", 0, "operator", "alice",
+                "dependencies", List.of(), "peers", List.of());
         ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts",
                 new HttpEntity<>(toJson(body), jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
@@ -128,23 +159,24 @@ class ArtifactControllerHttpTest {
 
     @Test
     void fullLockWorkflowAndHistoryQueries() {
-        // app:1 -> lib[1,2]；lib2/lib1；锁定取 lib2。
         restTemplate.postForEntity("/api/artifacts",
-                new HttpEntity<>(registerBody("app", 1, dependency("lib", 1, 2)),
+                new HttpEntity<>(registerBody("app", 1, "alice", range("lib", 1, 2)),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
         restTemplate.postForEntity("/api/artifacts",
-                new HttpEntity<>(registerBody("lib", 1),
+                new HttpEntity<>(registerBody("lib", 1, "alice"),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
         restTemplate.postForEntity("/api/artifacts",
-                new HttpEntity<>(registerBody("lib", 2),
+                new HttpEntity<>(registerBody("lib", 2, "alice"),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
 
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":3}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"operator\":\"dave\","
+                + "\"expectedRepositoryVersion\":3}";
         ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
         assertThat(lock.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         long lockId = lock.getBody().path("id").asLong();
+        assertThat(lock.getBody().path("operator").asText()).isEqualTo("dave");
         assertThat(lock.getBody().path("repositoryVersion").asLong()).isEqualTo(3L);
         assertThat(lock.getBody().path("entries")).hasSize(2);
         assertThat(lock.getBody().path("entries").get(0).path("name").asText()).isEqualTo("app");
@@ -168,11 +200,73 @@ class ArtifactControllerHttpTest {
     }
 
     @Test
+    void peerScenarioBacktracksAndFreezesHostMatch() {
+        // 合成：root 普通依赖 H1 与 P[1,2]；P2 peer H2，P1 peer H1 → 锁定回退 P1。
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBodyWithPeers("root", 1, "alice",
+                        List.of(range("h", 1, 1), range("p", 1, 2)), List.of()),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("h", 1, "alice"),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBodyWithPeers("p", 2, "alice", List.of(),
+                        List.of(range("h", 2, 2))),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBodyWithPeers("p", 1, "alice", List.of(),
+                        List.of(range("h", 1, 1))),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+
+        String lockBody = "{\"rootName\":\"root\",\"rootVersion\":1,\"operator\":\"dave\","
+                + "\"expectedRepositoryVersion\":4}";
+        ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(lock.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        JsonNode entries = lock.getBody().path("entries");
+        assertThat(entries).hasSize(3);
+        assertThat(entries.get(1).path("name").asText()).isEqualTo("p");
+        assertThat(entries.get(1).path("version").asInt()).isEqualTo(1);
+
+        JsonNode peerMatches = lock.getBody().path("peerMatches");
+        assertThat(peerMatches).hasSize(1);
+        assertThat(peerMatches.get(0).path("declarerName").asText()).isEqualTo("p");
+        assertThat(peerMatches.get(0).path("declarerVersion").asInt()).isEqualTo(1);
+        assertThat(peerMatches.get(0).path("hostName").asText()).isEqualTo("h");
+        assertThat(peerMatches.get(0).path("matchedVersion").asInt()).isEqualTo(1);
+    }
+
+    @Test
+    void peerWithoutReachableHostReturns422() {
+        // root 只普通依赖 P；P peer H，但无 H 普通边 → peer 不拉宿主，422。
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBodyWithPeers("root", 1, "alice",
+                        List.of(range("p", 1, 1)), List.of()),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("h", 1, "alice"),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBodyWithPeers("p", 1, "alice", List.of(),
+                        List.of(range("h", 1, 2))),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+
+        String lockBody = "{\"rootName\":\"root\",\"rootVersion\":1,\"operator\":\"dave\","
+                + "\"expectedRepositoryVersion\":3}";
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+    }
+
+    @Test
     void staleRepositoryVersionReturns409() {
         restTemplate.postForEntity("/api/artifacts",
-                new HttpEntity<>(registerBody("app", 1),
+                new HttpEntity<>(registerBody("app", 1, "alice"),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":0}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"operator\":\"dave\","
+                + "\"expectedRepositoryVersion\":0}";
         ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
@@ -182,12 +276,13 @@ class ArtifactControllerHttpTest {
     @Test
     void infeasibleLockReturns422() {
         restTemplate.postForEntity("/api/artifacts",
-                new HttpEntity<>(registerBody("app", 1, dependency("lib", 2, 2)),
+                new HttpEntity<>(registerBody("app", 1, "alice", range("lib", 2, 2)),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
         restTemplate.postForEntity("/api/artifacts",
-                new HttpEntity<>(registerBody("lib", 1),
+                new HttpEntity<>(registerBody("lib", 1, "alice"),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":2}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"operator\":\"dave\","
+                + "\"expectedRepositoryVersion\":2}";
         ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
@@ -195,23 +290,33 @@ class ArtifactControllerHttpTest {
     }
 
     @Test
-    void withdrawWorkflowAndRepositoryVersionAdvances() {
+    void withdrawWorkflowChecksExpectedVersionAndAdvances() {
         restTemplate.postForEntity("/api/artifacts",
-                new HttpEntity<>(registerBody("app", 1),
+                new HttpEntity<>(registerBody("app", 1, "alice"),
                         jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
 
         String rid = UUID.randomUUID().toString();
+        // 期望版本错误（实际为 1）→ 409。
+        ResponseEntity<JsonNode> stale = restTemplate.exchange(
+                "/api/artifacts/app/versions/1/withdraw",
+                HttpMethod.POST,
+                new HttpEntity<>(withdrawBody("eve", 0L), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(stale.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+
         ResponseEntity<JsonNode> withdrawn = restTemplate.exchange(
                 "/api/artifacts/app/versions/1/withdraw",
                 HttpMethod.POST,
-                new HttpEntity<>("", jsonHeaders(rid)),
+                new HttpEntity<>(withdrawBody("eve", 1L), jsonHeaders(rid)),
                 JsonNode.class);
         assertThat(withdrawn.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(withdrawn.getBody().path("withdrawn").asBoolean()).isTrue();
+        assertThat(withdrawn.getBody().path("operator").asText()).isEqualTo("eve");
         assertThat(withdrawn.getBody().path("repositoryVersion").asLong()).isEqualTo(2L);
 
         // 撤回后锁定撤回的根 → 409。
-        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"expectedRepositoryVersion\":2}";
+        String lockBody = "{\"rootName\":\"app\",\"rootVersion\":1,\"operator\":\"dave\","
+                + "\"expectedRepositoryVersion\":2}";
         ResponseEntity<JsonNode> lockOnWithdrawn = restTemplate.postForEntity(
                 "/api/artifacts/locks",
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),

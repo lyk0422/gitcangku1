@@ -4,6 +4,7 @@ import com.example.starter.api.dto.ArtifactResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.api.dto.WithdrawRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Positive;
 import org.springframework.http.HttpStatus;
@@ -21,6 +22,8 @@ import java.util.List;
 
 /**
  * 软件制品依赖锁定 REST API。
+ *
+ * <p>全部写接口均要求请求头 X-Request-Id（全局唯一、非空）与请求体内非空 operator。
  */
 @RestController
 @RequestMapping("/api/artifacts")
@@ -41,13 +44,14 @@ public class ArtifactController {
         return ResponseEntity.status(HttpStatus.CREATED).body(artifactService.registerArtifact(requestId, request));
     }
 
-    /** 撤回制品版本。 */
+    /** 撤回制品版本（携带操作者与期望仓库版本）。 */
     @PostMapping("/{name}/versions/{version}/withdraw")
     public ArtifactResponse withdraw(
             @RequestHeader("X-Request-Id") String requestId,
             @PathVariable String name,
-            @PathVariable @Positive int version) {
-        return artifactService.withdrawArtifact(requestId, name, version);
+            @PathVariable @Positive int version,
+            @Valid @RequestBody WithdrawRequest request) {
+        return artifactService.withdrawArtifact(requestId, name, version, request);
     }
 
     /** 创建锁文件。 */

@@ -19,7 +19,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
- * 仓库数据访问：制品、依赖、锁文件、仓库版本与幂等记录。
+ * 仓库数据访问：制品、普通依赖、peer 依赖、锁文件、仓库版本与幂等记录。
  *
  * <p>所有多语句业务操作均在 Service 层事务内执行；写事务通过
  * {@code SELECT ... FOR UPDATE} 锁定单行仓库版本表实现串行化，
@@ -51,7 +51,7 @@ public class RepositoryDao {
     }
 
     /**
-     * 读取仓库一致性快照：全部制品版本（含撤回，版本号降序）及其依赖。
+     * 读取仓库一致性快照：全部制品版本（含撤回，版本号降序）及其普通依赖与 peer 声明。
      * 须在已持有 repository_state 行锁的事务内调用。
      */
     public RepositorySnapshot loadSnapshot() {
@@ -60,23 +60,30 @@ public class RepositoryDao {
                 (rs, n) -> new ArtifactRow(rs.getLong("id"), rs.getString("name"),
                         rs.getInt("version"), rs.getInt("withdrawn") == 1));
 
-        List<DepRow> depRows = jdbcTemplate.query(
-                "SELECT artifact_id, name, minimum_version, maximum_version FROM artifact_dependency",
-                (rs, n) -> new DepRow(rs.getLong("artifact_id"), rs.getString("name"),
-                        rs.getInt("minimum_version"), rs.getInt("maximum_version")));
-        Map<Long, List<DependencyRange>> depsByArtifact = depRows.stream()
-                .collect(Collectors.groupingBy(DepRow::artifactId,
-                        Collectors.mapping(d -> new DependencyRange(d.name(), d.minimumVersion(), d.maximumVersion()),
-                                Collectors.toList())));
+        Map<Long, List<DependencyRange>> depsByArtifact = loadRanges(
+                "SELECT artifact_id, name, minimum_version, maximum_version FROM artifact_dependency");
+        Map<Long, List<DependencyRange>> peersByArtifact = loadRanges(
+                "SELECT artifact_id, name, minimum_version, maximum_version FROM artifact_peer");
 
         Map<String, List<ArtifactVersion>> artifacts = new LinkedHashMap<>();
         for (ArtifactRow row : rows) {
             List<DependencyRange> deps = depsByArtifact.getOrDefault(row.id(), List.of());
+            List<DependencyRange> peers = peersByArtifact.getOrDefault(row.id(), List.of());
             ArtifactVersion version = new ArtifactVersion(row.id(), row.name(), row.version(),
-                    row.withdrawn(), List.copyOf(deps));
+                    row.withdrawn(), List.copyOf(deps), List.copyOf(peers));
             artifacts.computeIfAbsent(row.name(), k -> new ArrayList<>()).add(version);
         }
         return new RepositorySnapshot(getRepositoryVersion(), Map.copyOf(artifacts));
+    }
+
+    /** 按制品 ID 分组加载区间声明（普通依赖或 peer）。 */
+    private Map<Long, List<DependencyRange>> loadRanges(String sql) {
+        List<DepRow> rows = jdbcTemplate.query(sql,
+                (rs, n) -> new DepRow(rs.getLong(1), rs.getString(2),
+                        rs.getInt(3), rs.getInt(4)));
+        return rows.stream().collect(Collectors.groupingBy(DepRow::artifactId,
+                Collectors.mapping(d -> new DependencyRange(d.name(), d.minimumVersion(), d.maximumVersion()),
+                        Collectors.toList())));
     }
 
     /** name+version 的制品版本是否已存在（含撤回版本）。 */
@@ -101,16 +108,18 @@ public class RepositoryDao {
         return count == null ? 0 : count;
     }
 
-    /** 新增制品版本，返回自增主键。 */
-    public long insertArtifact(String name, int version, Instant createdAt) {
+    /** 新增制品版本（含非空登记操作者），返回自增主键。 */
+    public long insertArtifact(String name, int version, String operator, Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbcTemplate.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO artifact (name, version, withdrawn, created_at) VALUES (?, ?, 0, ?)",
+                    "INSERT INTO artifact (name, version, withdrawn, operator, created_at) "
+                            + "VALUES (?, ?, 0, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, name);
             ps.setInt(2, version);
-            ps.setTimestamp(3, Timestamp.from(createdAt));
+            ps.setString(3, operator);
+            ps.setTimestamp(4, Timestamp.from(createdAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -120,7 +129,7 @@ public class RepositoryDao {
         return key.longValue();
     }
 
-    /** 为制品版本写入一条依赖声明。 */
+    /** 为制品版本写入一条普通依赖声明（建立可达边）。 */
     public void insertDependency(long artifactId, String name, int minimumVersion, int maximumVersion) {
         jdbcTemplate.update(
                 "INSERT INTO artifact_dependency (artifact_id, name, minimum_version, maximum_version) "
@@ -128,7 +137,15 @@ public class RepositoryDao {
                 artifactId, name, minimumVersion, maximumVersion);
     }
 
-    /** 读取单个制品版本（含依赖），不存在返回 null。 */
+    /** 为制品版本写入一条 peer 声明（不建立可达边）。 */
+    public void insertPeer(long artifactId, String name, int minimumVersion, int maximumVersion) {
+        jdbcTemplate.update(
+                "INSERT INTO artifact_peer (artifact_id, name, minimum_version, maximum_version) "
+                        + "VALUES (?, ?, ?, ?)",
+                artifactId, name, minimumVersion, maximumVersion);
+    }
+
+    /** 读取单个制品版本（含普通依赖与 peer），不存在返回 null。 */
     public ArtifactVersion loadArtifact(String name, int version) {
         List<ArtifactRow> rows = jdbcTemplate.query(
                 "SELECT id, name, version, withdrawn FROM artifact WHERE name = ? AND version = ?",
@@ -144,8 +161,13 @@ public class RepositoryDao {
                 (rs, n) -> new DependencyRange(rs.getString("name"),
                         rs.getInt("minimum_version"), rs.getInt("maximum_version")),
                 row.id());
+        List<DependencyRange> peers = jdbcTemplate.query(
+                "SELECT name, minimum_version, maximum_version FROM artifact_peer WHERE artifact_id = ?",
+                (rs, n) -> new DependencyRange(rs.getString("name"),
+                        rs.getInt("minimum_version"), rs.getInt("maximum_version")),
+                row.id());
         return new ArtifactVersion(row.id(), row.name(), row.version(), row.withdrawn(),
-                List.copyOf(deps));
+                List.copyOf(deps), List.copyOf(peers));
     }
 
     /** 仓库版本号加一，返回加一后的版本号（须在持有行锁时调用）。 */
@@ -163,20 +185,21 @@ public class RepositoryDao {
                 "UPDATE artifact SET withdrawn = 1 WHERE id = ? AND withdrawn = 0", artifactId);
     }
 
-    /** 新增锁文件主记录，返回自增主键。 */
-    public long insertLockFile(String rootName, int rootVersion, long repositoryVersion,
-                               String requestId, Instant createdAt) {
+    /** 新增锁文件主记录（含非空锁定操作者），返回自增主键。 */
+    public long insertLockFile(String rootName, int rootVersion, String operator,
+                               long repositoryVersion, String requestId, Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbcTemplate.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO lock_file (root_name, root_version, repository_version, request_id, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO lock_file (root_name, root_version, operator, repository_version, "
+                            + "request_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, rootName);
             ps.setInt(2, rootVersion);
-            ps.setLong(3, repositoryVersion);
-            ps.setString(4, requestId);
-            ps.setTimestamp(5, Timestamp.from(createdAt));
+            ps.setString(3, operator);
+            ps.setLong(4, repositoryVersion);
+            ps.setString(5, requestId);
+            ps.setTimestamp(6, Timestamp.from(createdAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -191,6 +214,18 @@ public class RepositoryDao {
         jdbcTemplate.update(
                 "INSERT INTO lock_file_entry (lock_file_id, name, version) VALUES (?, ?, ?)",
                 lockFileId, name, version);
+    }
+
+    /** 新增一条锁定时刻冻结的 peer 匹配依据。 */
+    public void insertLockPeerMatch(long lockFileId, String declarerName, int declarerVersion,
+                                    String hostName, int minimumVersion, int maximumVersion,
+                                    int matchedVersion) {
+        jdbcTemplate.update(
+                "INSERT INTO lock_file_peer_match (lock_file_id, declarer_name, declarer_version, "
+                        + "host_name, minimum_version, maximum_version, matched_version) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                lockFileId, declarerName, declarerVersion, hostName,
+                minimumVersion, maximumVersion, matchedVersion);
     }
 
     /** 幂等记录视图。 */
@@ -234,7 +269,7 @@ public class RepositoryDao {
     }
 
     /** 锁文件列表行：不含条目明细。 */
-    public record LockFileRow(long id, String rootName, int rootVersion,
+    public record LockFileRow(long id, String rootName, int rootVersion, String operator,
                               long repositoryVersion, Instant createdAt) {
     }
 
@@ -242,23 +277,31 @@ public class RepositoryDao {
     public record LockEntryRow(long lockFileId, String name, int version) {
     }
 
+    /** 锁文件冻结的 peer 匹配行。 */
+    public record LockPeerMatchRow(long lockFileId, String declarerName, int declarerVersion,
+                                   String hostName, int minimumVersion, int maximumVersion,
+                                   int matchedVersion) {
+    }
+
     /** 查询全部历史锁文件，按 ID 升序。 */
     public List<LockFileRow> listLockFiles() {
         return jdbcTemplate.query(
-                "SELECT id, root_name, root_version, repository_version, created_at "
+                "SELECT id, root_name, root_version, operator, repository_version, created_at "
                         + "FROM lock_file ORDER BY id ASC",
                 (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
-                        rs.getInt("root_version"), rs.getLong("repository_version"),
+                        rs.getInt("root_version"), rs.getString("operator"),
+                        rs.getLong("repository_version"),
                         rs.getTimestamp("created_at").toInstant()));
     }
 
     /** 按主键查询锁文件，不存在返回 null。 */
     public LockFileRow getLockFile(long id) {
         List<LockFileRow> rows = jdbcTemplate.query(
-                "SELECT id, root_name, root_version, repository_version, created_at "
+                "SELECT id, root_name, root_version, operator, repository_version, created_at "
                         + "FROM lock_file WHERE id = ?",
                 (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
-                        rs.getInt("root_version"), rs.getLong("repository_version"),
+                        rs.getInt("root_version"), rs.getString("operator"),
+                        rs.getLong("repository_version"),
                         rs.getTimestamp("created_at").toInstant()),
                 id);
         return rows.isEmpty() ? null : rows.get(0);
@@ -271,6 +314,20 @@ public class RepositoryDao {
                         + "WHERE lock_file_id = ? ORDER BY name ASC",
                 (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
                         rs.getString("name"), rs.getInt("version")),
+                lockFileId);
+    }
+
+    /** 查询某锁文件冻结的全部 peer 匹配依据，按声明方、宿主名称升序。 */
+    public List<LockPeerMatchRow> listLockPeerMatches(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT lock_file_id, declarer_name, declarer_version, host_name, "
+                        + "minimum_version, maximum_version, matched_version "
+                        + "FROM lock_file_peer_match WHERE lock_file_id = ? "
+                        + "ORDER BY declarer_name ASC, host_name ASC",
+                (rs, n) -> new LockPeerMatchRow(rs.getLong("lock_file_id"),
+                        rs.getString("declarer_name"), rs.getInt("declarer_version"),
+                        rs.getString("host_name"), rs.getInt("minimum_version"),
+                        rs.getInt("maximum_version"), rs.getInt("matched_version")),
                 lockFileId);
     }
 
