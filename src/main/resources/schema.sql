@@ -100,3 +100,45 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS command_plans (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    plan_key VARCHAR(128) NOT NULL COMMENT '计划业务键，事件内唯一；同键同内容幂等，同键不同内容冲突',
+    status VARCHAR(16) NOT NULL COMMENT '状态：RUNNING 执行中（未全部执行）/ COMPLETED 全部执行 / COMPENSATING 补偿中 / CANCELLED 已取消（全部补偿完成）；RUNNING/COMPENSATING 阻止事件进入 RESOLVED',
+    version INT NOT NULL COMMENT '计划版本：创建为 1，每次执行/取消/补偿成功递增，补偿失败不变',
+    created_by VARCHAR(128) NOT NULL COMMENT '创建人（创建时的当前指挥人）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    cancelled_by VARCHAR(128) NULL COMMENT '取消人（操作时的当前指挥人）；仅 COMPENSATING/CANCELLED 有值，否则为空',
+    cancelled_at TIMESTAMP(6) NULL COMMENT '取消 UTC 时间；仅 COMPENSATING/CANCELLED 有值，否则为空',
+    CONSTRAINT uk_plan_key UNIQUE (incident_id, plan_key)
+) COMMENT='指令计划表';
+
+CREATE TABLE IF NOT EXISTS command_plan_steps (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    plan_id BIGINT NOT NULL COMMENT '所属计划 id，关联 command_plans.id',
+    step_key VARCHAR(128) NOT NULL COMMENT '步骤业务键，计划内唯一',
+    seq INT NOT NULL COMMENT '执行顺序，从 1 递增；执行按 seq 正序，补偿按 seq 逆序',
+    effect_text VARCHAR(1024) NOT NULL COMMENT '合成效果说明（只操作合成状态，无外部调用）',
+    compensation_text VARCHAR(1024) NOT NULL COMMENT '补偿说明',
+    status VARCHAR(16) NOT NULL COMMENT '状态：PENDING 未执行 / APPLIED 已执行 / COMPENSATED 已补偿',
+    applied_by VARCHAR(128) NULL COMMENT '执行人（操作时的当前指挥人）；仅 APPLIED/COMPENSATED 有值，否则为空',
+    applied_at TIMESTAMP(6) NULL COMMENT '执行 UTC 时间；仅 APPLIED/COMPENSATED 有值，否则为空',
+    compensated_by VARCHAR(128) NULL COMMENT '补偿人（操作时的当前指挥人）；仅 COMPENSATED 有值，否则为空',
+    compensated_at TIMESTAMP(6) NULL COMMENT '补偿 UTC 时间；仅 COMPENSATED 有值，否则为空',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    CONSTRAINT uk_step_key UNIQUE (plan_id, step_key)
+) COMMENT='指令计划步骤表';
+
+CREATE TABLE IF NOT EXISTS command_plan_compensations (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    plan_id BIGINT NOT NULL COMMENT '所属计划 id，关联 command_plans.id',
+    step_id BIGINT NOT NULL COMMENT '被补偿步骤 id，关联 command_plan_steps.id',
+    step_key VARCHAR(128) NOT NULL COMMENT '被补偿步骤业务键（冗余，便于查询）',
+    evidence VARCHAR(1024) NOT NULL COMMENT '补偿证据；每次补偿尝试均记录一条',
+    outcome VARCHAR(16) NOT NULL COMMENT '结果：SUCCESS 成功（步骤置 COMPENSATED）/ FAILED 失败（仅保存诊断，步骤保持 APPLIED，允许新 requestId 重试）',
+    diagnostics VARCHAR(1024) NULL COMMENT '失败诊断；仅 FAILED 有值，否则为空',
+    actor VARCHAR(128) NOT NULL COMMENT '操作人（操作时的当前指挥人）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '记录 UTC 时间'
+) COMMENT='指令计划补偿证据表';

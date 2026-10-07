@@ -100,3 +100,45 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS command_plans (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    plan_key VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    version INT NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    cancelled_by VARCHAR(128) NULL,
+    cancelled_at TIMESTAMP(6) NULL,
+    CONSTRAINT uk_plan_key UNIQUE (incident_id, plan_key)
+);
+
+CREATE TABLE IF NOT EXISTS command_plan_steps (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    plan_id BIGINT NOT NULL,
+    step_key VARCHAR(128) NOT NULL,
+    seq INT NOT NULL,
+    effect_text VARCHAR(1024) NOT NULL,
+    compensation_text VARCHAR(1024) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    applied_by VARCHAR(128) NULL,
+    applied_at TIMESTAMP(6) NULL,
+    compensated_by VARCHAR(128) NULL,
+    compensated_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_step_key UNIQUE (plan_id, step_key)
+);
+
+CREATE TABLE IF NOT EXISTS command_plan_compensations (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    plan_id BIGINT NOT NULL,
+    step_id BIGINT NOT NULL,
+    step_key VARCHAR(128) NOT NULL,
+    evidence VARCHAR(1024) NOT NULL,
+    outcome VARCHAR(16) NOT NULL,
+    diagnostics VARCHAR(1024) NULL,
+    actor VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL
+);

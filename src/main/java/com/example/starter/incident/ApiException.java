@@ -47,6 +47,11 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.CONFLICT, "CONFLICT", message, null);
     }
 
+    /** 403：权限不足（如指令计划操作中交接后旧指挥人继续写入）。 */
+    public static ApiException forbidden(String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, "FORBIDDEN", message, null);
+    }
+
     /** 409：携带结构化明细的冲突（如解决门禁未完成项、任务未解除阻塞事件列表）。 */
     public static ApiException conflict(String message, Object details) {
         return new ApiException(HttpStatus.CONFLICT, "CONFLICT", message, details);

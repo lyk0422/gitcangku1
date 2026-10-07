@@ -55,4 +55,33 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /** 指令计划步骤定义：stepKey 计划内唯一，effectText/compensationText 非空。 */
+    public record PlanStepInput(String stepKey, String effectText, String compensationText) {
+    }
+
+    /**
+     * 指令计划创建请求：requestId 为全局幂等键；planKey 事件内唯一；
+     * steps 为 1~5 个有序步骤，按列表顺序执行、逆序补偿。
+     */
+    public record PlanCreateRequest(String requestId, String planKey, List<PlanStepInput> steps) {
+    }
+
+    /**
+     * 步骤执行请求：expectedVersion 为期望的计划版本（按值比较），
+     * 与当前版本不一致时拒绝执行（409）。
+     */
+    public record PlanExecuteRequest(String requestId, Long expectedVersion) {
+    }
+
+    /** 计划取消请求。 */
+    public record PlanCancelRequest(String requestId) {
+    }
+
+    /**
+     * 步骤补偿请求：evidence 为非空补偿证据；expectedVersion 为期望的计划版本，
+     * 不一致时补偿失败（仅记录失败诊断，不改变步骤 APPLIED 状态，允许新 requestId 重试）。
+     */
+    public record PlanCompensateRequest(String requestId, String evidence, Long expectedVersion) {
+    }
 }

@@ -34,6 +34,7 @@ import com.example.starter.incident.dto.Responses.StatusChangeView;
 import com.example.starter.incident.dto.Responses.TaskBlockerView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
+import com.example.starter.incident.dto.Responses.UnfinishedPlanView;
 import com.example.starter.incident.dto.Responses.UnfinishedTaskView;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -72,16 +73,19 @@ public class IncidentService {
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
     private final CommandKeyRepository commandKeys;
+    private final CommandPlanRepository plans;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
                            IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           CommandPlanRepository plans,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
         this.commandKeys = commandKeys;
+        this.plans = plans;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -271,6 +275,16 @@ public class IncidentService {
                         if (!unfinished.isEmpty()) {
                             throw ApiException.conflict(
                                     "仍有未完成的处置任务，不能进入 RESOLVED", unfinished);
+                        }
+                        // 解决门禁：全部指令计划进入 COMPLETED/CANCELLED 后才可解决，
+                        // RUNNING/COMPENSATING 阻止解决
+                        List<UnfinishedPlanView> unfinishedPlans = plans
+                                .listBlockingResolve(incident.id()).stream()
+                                .map(p -> new UnfinishedPlanView(p.planKey(), p.status().name()))
+                                .toList();
+                        if (!unfinishedPlans.isEmpty()) {
+                            throw ApiException.conflict(
+                                    "仍有未完成的指令计划，不能进入 RESOLVED", unfinishedPlans);
                         }
                     }
                     Instant now = now();

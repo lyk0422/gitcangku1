@@ -78,4 +78,46 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /**
+     * 指令计划步骤视图：appliedBy/appliedAt 仅 APPLIED/COMPENSATED 有值，
+     * compensatedBy/compensatedAt 仅 COMPENSATED 有值。
+     */
+    public record PlanStepView(String stepKey, int seq, String effectText, String compensationText,
+                              String status, String appliedBy, Instant appliedAt,
+                              String compensatedBy, Instant compensatedAt) {
+    }
+
+    /**
+     * 补偿证据视图：outcome 为 SUCCESS/FAILED；diagnostics 仅 FAILED 有值。
+     */
+    public record CompensationView(String stepKey, String evidence, String outcome,
+                                   String diagnostics, String actor, Instant createdAt) {
+    }
+
+    /**
+     * 指令计划视图：status 为 RUNNING/COMPLETED/COMPENSATING/CANCELLED；
+     * version 为计划版本（创建为 1，执行/取消/补偿成功递增）；
+     * steps 按执行顺序返回；compensations 按记录顺序返回；
+     * cancelledBy/cancelledAt 仅 COMPENSATING/CANCELLED 有值。
+     */
+    public record PlanView(String planKey, String status, int version,
+                          List<PlanStepView> steps, List<CompensationView> compensations,
+                          String createdBy, Instant createdAt,
+                          String cancelledBy, Instant cancelledAt) {
+    }
+
+    /** 指令计划摘要视图（列表用）。 */
+    public record PlanSummaryView(String planKey, String status, int version,
+                                  String createdBy, Instant createdAt,
+                                  String cancelledBy, Instant cancelledAt) {
+    }
+
+    /** 按事件分组的指令计划列表视图。 */
+    public record IncidentPlansView(String incidentKey, List<PlanSummaryView> plans) {
+    }
+
+    /** 解决门禁未完成指令计划项：仍有 RUNNING/COMPENSATING 计划时按 planKey 返回。 */
+    public record UnfinishedPlanView(String planKey, String status) {
+    }
 }
