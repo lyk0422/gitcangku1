@@ -183,4 +183,96 @@ class LockResolverTest {
         assertThat(result).isNotNull();
         assertThat(result.keySet()).containsExactly("alib", "root", "zlib");
     }
+
+    // ------------------------------------------------------------------
+    // 协调组约束
+    // ------------------------------------------------------------------
+
+    /** 构造含协调组的快照。 */
+    private static RepositorySnapshot snapshotWithGroups(List<CoordinationGroup> groups,
+                                                         Object... nameGroups) {
+        RepositorySnapshot base = snapshot(0, nameGroups);
+        return new RepositorySnapshot(base.repositoryVersion(), base.artifacts(), groups);
+    }
+
+    private static CoordinationGroup group(String groupId, List<String> members,
+                                           List<Map<String, Integer>> tuples) {
+        return new CoordinationGroup(groupId, members, tuples);
+    }
+
+    @Test
+    void coordinationGroupForcesBacktrackToMatchingTupleProjection() {
+        // 合成场景：允许 (X1,Y2) 与 (X2,Y1)；根固定 Y2，X 范围 1..2。
+        // 贪心取 X2 时 (X2,Y2) 不是任何元组的投影，必须回退到 X1；也不能强制两者同号。
+        RepositorySnapshot s = snapshotWithGroups(
+                List.of(group("g1", List.of("x", "y"),
+                        List.of(Map.of("x", 1, "y", 2), Map.of("x", 2, "y", 1)))),
+                "y", List.of(v(2, dep("x", 1, 2)), v(1)),
+                "x", List.of(v(2), v(1)));
+
+        LockSolution solution = LockResolver.resolveSolution(s, "y", 2);
+        assertThat(solution).isNotNull();
+        assertThat(solution.versions()).containsEntry("x", 1).containsEntry("y", 2);
+        assertThat(solution.hits()).hasSize(1);
+        assertThat(solution.hits().get(0).groupId()).isEqualTo("g1");
+        assertThat(solution.hits().get(0).tuple())
+                .containsEntry("x", 1).containsEntry("y", 2);
+    }
+
+    @Test
+    void coordinationGroupCanMakeLockInfeasible() {
+        // 只允许 (X1,Y1)，根固定 Y2：X 任何版本都无法与 Y2 同元组，无解。
+        RepositorySnapshot s = snapshotWithGroups(
+                List.of(group("g1", List.of("x", "y"),
+                        List.of(Map.of("x", 1, "y", 1)))),
+                "y", List.of(v(2, dep("x", 1, 2)), v(1)),
+                "x", List.of(v(2), v(1)));
+
+        assertThat(LockResolver.resolve(s, "y", 2)).isNull();
+    }
+
+    @Test
+    void singleMemberOfGroupDoesNotTriggerConstraint() {
+        // 锁图只含组中 1 名成员：不受约束，也不把另一名成员引入锁图。
+        RepositorySnapshot s = snapshotWithGroups(
+                List.of(group("g1", List.of("x", "y"),
+                        List.of(Map.of("x", 1, "y", 1)))),
+                "x", List.of(v(2), v(1)),
+                "y", List.of(v(1)));
+
+        LockSolution solution = LockResolver.resolveSolution(s, "x", 2);
+        assertThat(solution).isNotNull();
+        assertThat(solution.versions()).containsOnly(Map.entry("x", 2));
+        assertThat(solution.hits()).isEmpty();
+    }
+
+    @Test
+    void withdrawnVersionInTupleIsNotSelectable() {
+        // 元组 (X1,Y2) 保留，但 X1 已撤回：新锁不能选它，无解。
+        RepositorySnapshot s = snapshotWithGroups(
+                List.of(group("g1", List.of("x", "y"),
+                        List.of(Map.of("x", 1, "y", 2)))),
+                "y", List.of(v(2, dep("x", 1, 2)), v(1)),
+                "x", List.of(w(1)));
+
+        assertThat(LockResolver.resolve(s, "y", 2)).isNull();
+    }
+
+    @Test
+    void threeMembersMustAllMatchSameTuple() {
+        // 组 {a,b,c}：允许 (a1,b1,c1)；根 a1 -> b[1,1], c[1,2]。
+        // 贪心取 c2 时三元组无元组覆盖，必须回退到 c1。
+        RepositorySnapshot s = snapshotWithGroups(
+                List.of(group("g1", List.of("a", "b", "c"),
+                        List.of(Map.of("a", 1, "b", 1, "c", 1)))),
+                "a", List.of(v(1, dep("b", 1, 1), dep("c", 1, 2))),
+                "b", List.of(v(1)),
+                "c", List.of(v(2), v(1)));
+
+        LockSolution solution = LockResolver.resolveSolution(s, "a", 1);
+        assertThat(solution).isNotNull();
+        assertThat(solution.versions())
+                .containsEntry("a", 1).containsEntry("b", 1).containsEntry("c", 1);
+        assertThat(solution.hits()).hasSize(1);
+    }
 }

@@ -1,6 +1,7 @@
 package com.example.starter.repo;
 
 import com.example.starter.domain.ArtifactVersion;
+import com.example.starter.domain.CoordinationGroup;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.RepositorySnapshot;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -76,7 +77,8 @@ public class RepositoryDao {
                     row.withdrawn(), List.copyOf(deps));
             artifacts.computeIfAbsent(row.name(), k -> new ArrayList<>()).add(version);
         }
-        return new RepositorySnapshot(getRepositoryVersion(), Map.copyOf(artifacts));
+        return new RepositorySnapshot(getRepositoryVersion(), Map.copyOf(artifacts),
+                loadCoordinationGroups());
     }
 
     /** name+version 的制品版本是否已存在（含撤回版本）。 */
@@ -272,6 +274,173 @@ public class RepositoryDao {
                 (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
                         rs.getString("name"), rs.getInt("version")),
                 lockFileId);
+    }
+
+    // ------------------------------------------------------------------
+    // 协调组
+    // ------------------------------------------------------------------
+
+    /** 协调组完整记录：主键、元数据与规范化后的成员、允许元组。 */
+    public record CoordinationGroupRecord(long id, String groupId, String operator,
+                                          long repositoryVersion, Instant createdAt,
+                                          List<String> members,
+                                          List<Map<String, Integer>> tuples) {
+    }
+
+    /** 协调组数量（按 group_id 计）。 */
+    public int countCoordinationGroups() {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM coordination_group", Integer.class);
+        return count == null ? 0 : count;
+    }
+
+    /** 按业务标识查协调组完整记录，不存在返回 null。 */
+    public CoordinationGroupRecord findCoordinationGroup(String groupId) {
+        List<CoordinationGroupRecord> records = jdbcTemplate.query(
+                "SELECT id, group_id, operator, repository_version, created_at "
+                        + "FROM coordination_group WHERE group_id = ?",
+                (rs, n) -> new CoordinationGroupRecord(rs.getLong("id"), rs.getString("group_id"),
+                        rs.getString("operator"), rs.getLong("repository_version"),
+                        rs.getTimestamp("created_at").toInstant(), List.of(), List.of()),
+                groupId);
+        if (records.isEmpty()) {
+            return null;
+        }
+        return withContent(records.get(0));
+    }
+
+    /** 全部协调组（含成员与元组），按 group_id 升序。 */
+    public List<CoordinationGroupRecord> listCoordinationGroups() {
+        List<CoordinationGroupRecord> records = jdbcTemplate.query(
+                "SELECT id, group_id, operator, repository_version, created_at "
+                        + "FROM coordination_group ORDER BY group_id ASC",
+                (rs, n) -> new CoordinationGroupRecord(rs.getLong("id"), rs.getString("group_id"),
+                        rs.getString("operator"), rs.getLong("repository_version"),
+                        rs.getTimestamp("created_at").toInstant(), List.of(), List.of()));
+        return records.stream().map(this::withContent).toList();
+    }
+
+    /** 快照视图：全部协调组规则（组 ID 升序）。 */
+    public List<CoordinationGroup> loadCoordinationGroups() {
+        return listCoordinationGroups().stream()
+                .map(r -> new CoordinationGroup(r.groupId(), r.members(), r.tuples()))
+                .toList();
+    }
+
+    /** 为组记录装配成员与允许元组（均按名称/键升序规范化）。 */
+    private CoordinationGroupRecord withContent(CoordinationGroupRecord base) {
+        List<String> members = jdbcTemplate.query(
+                "SELECT name FROM coordination_group_member WHERE group_ref = ? ORDER BY name ASC",
+                (rs, n) -> rs.getString("name"), base.id());
+        List<TupleRow> tupleRows = jdbcTemplate.query(
+                "SELECT id FROM coordination_tuple WHERE group_ref = ? ORDER BY tuple_key ASC",
+                (rs, n) -> new TupleRow(rs.getLong("id")), base.id());
+        List<Map<String, Integer>> tuples = new ArrayList<>();
+        for (TupleRow tupleRow : tupleRows) {
+            Map<String, Integer> entries = jdbcTemplate.query(
+                    "SELECT name, version FROM coordination_tuple_entry WHERE tuple_ref = ? "
+                            + "ORDER BY name ASC",
+                    (rs, n) -> Map.entry(rs.getString("name"), rs.getInt("version")),
+                    tupleRow.id()).stream()
+                    .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue,
+                            (a, b) -> a, LinkedHashMap::new));
+            tuples.add(Map.copyOf(entries));
+        }
+        return new CoordinationGroupRecord(base.id(), base.groupId(), base.operator(),
+                base.repositoryVersion(), base.createdAt(),
+                List.copyOf(members), List.copyOf(tuples));
+    }
+
+    /** 新增协调组主记录，返回自增主键。 */
+    public long insertCoordinationGroup(String groupId, String operator,
+                                        long repositoryVersion, Instant createdAt) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO coordination_group (group_id, operator, repository_version, created_at) "
+                            + "VALUES (?, ?, ?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setString(1, groupId);
+            ps.setString(2, operator);
+            ps.setLong(3, repositoryVersion);
+            ps.setTimestamp(4, Timestamp.from(createdAt));
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入协调组未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 修订：更新组元数据并清空旧成员与元组（同事务内随后写入新内容）。 */
+    public void replaceCoordinationGroupContent(long groupRef, String operator,
+                                                long repositoryVersion, Instant createdAt) {
+        jdbcTemplate.update(
+                "UPDATE coordination_group SET operator = ?, repository_version = ?, created_at = ? "
+                        + "WHERE id = ?",
+                operator, repositoryVersion, Timestamp.from(createdAt), groupRef);
+        jdbcTemplate.update(
+                "DELETE FROM coordination_tuple_entry WHERE tuple_ref IN "
+                        + "(SELECT id FROM coordination_tuple WHERE group_ref = ?)", groupRef);
+        jdbcTemplate.update("DELETE FROM coordination_tuple WHERE group_ref = ?", groupRef);
+        jdbcTemplate.update("DELETE FROM coordination_group_member WHERE group_ref = ?", groupRef);
+    }
+
+    /** 写入一个组成员。 */
+    public void insertCoordinationMember(long groupRef, String name) {
+        jdbcTemplate.update(
+                "INSERT INTO coordination_group_member (group_ref, name) VALUES (?, ?)",
+                groupRef, name);
+    }
+
+    /** 写入一条允许元组，返回自增主键。 */
+    public long insertCoordinationTuple(long groupRef, String tupleKey) {
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "INSERT INTO coordination_tuple (group_ref, tuple_key) VALUES (?, ?)",
+                    Statement.RETURN_GENERATED_KEYS);
+            ps.setLong(1, groupRef);
+            ps.setString(2, tupleKey);
+            return ps;
+        }, keyHolder);
+        Number key = keyHolder.getKey();
+        if (key == null) {
+            throw new IllegalStateException("插入允许元组未获取自增主键");
+        }
+        return key.longValue();
+    }
+
+    /** 写入元组的一个成员版本条目。 */
+    public void insertCoordinationTupleEntry(long tupleRef, String name, int version) {
+        jdbcTemplate.update(
+                "INSERT INTO coordination_tuple_entry (tuple_ref, name, version) VALUES (?, ?, ?)",
+                tupleRef, name, version);
+    }
+
+    /** 记录锁文件的协调组命中依据。 */
+    public void insertLockCoordinationHit(long lockFileId, String groupId, String tupleJson) {
+        jdbcTemplate.update(
+                "INSERT INTO lock_coordination_hit (lock_file_id, group_id, tuple_json) "
+                        + "VALUES (?, ?, ?)",
+                lockFileId, groupId, tupleJson);
+    }
+
+    /** 锁文件命中依据行。 */
+    public record LockHitRow(String groupId, String tupleJson) {
+    }
+
+    /** 查询某锁文件的全部协调组命中依据，按组 ID 升序。 */
+    public List<LockHitRow> listLockCoordinationHits(long lockFileId) {
+        return jdbcTemplate.query(
+                "SELECT group_id, tuple_json FROM lock_coordination_hit "
+                        + "WHERE lock_file_id = ? ORDER BY group_id ASC",
+                (rs, n) -> new LockHitRow(rs.getString("group_id"), rs.getString("tuple_json")),
+                lockFileId);
+    }
+
+    private record TupleRow(long id) {
     }
 
     private record ArtifactRow(long id, String name, int version, boolean withdrawn) {

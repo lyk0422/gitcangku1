@@ -35,8 +35,13 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_coordination_hit");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM coordination_tuple_entry");
+        jdbcTemplate.update("DELETE FROM coordination_tuple");
+        jdbcTemplate.update("DELETE FROM coordination_group_member");
+        jdbcTemplate.update("DELETE FROM coordination_group");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -217,5 +222,104 @@ class ArtifactControllerHttpTest {
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
         assertThat(lockOnWithdrawn.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    // ------------------------------------------------------------------
+    // 协调组
+    // ------------------------------------------------------------------
+
+    private String groupBody(String groupId, long expected, String membersJson, String tuplesJson) {
+        return "{\"groupId\":\"" + groupId + "\",\"operator\":\"tester\","
+                + "\"members\":" + membersJson + ",\"tuples\":" + tuplesJson
+                + ",\"expectedRepositoryVersion\":" + expected + "}";
+    }
+
+    @Test
+    void coordinationGroupUpsertReplayAndListViaHttp() {
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("x", 1), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("y", 2), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+
+        String body = groupBody("g1", 2L, "[\"y\",\"x\"]",
+                "[[{\"name\":\"y\",\"version\":2},{\"name\":\"x\",\"version\":1}]]");
+        String rid = UUID.randomUUID().toString();
+        ResponseEntity<JsonNode> first = restTemplate.postForEntity(
+                "/api/artifacts/coordination-groups",
+                new HttpEntity<>(body, jsonHeaders(rid)), JsonNode.class);
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(first.getBody().path("repositoryVersion").asLong()).isEqualTo(3L);
+        assertThat(first.getBody().path("members")).hasSize(2);
+        assertThat(first.getBody().path("members").get(0).asText()).isEqualTo("x");
+
+        // 同 requestId 重放：返回首次响应，版本不再推进。
+        ResponseEntity<JsonNode> replay = restTemplate.postForEntity(
+                "/api/artifacts/coordination-groups",
+                new HttpEntity<>(body, jsonHeaders(rid)), JsonNode.class);
+        assertThat(replay.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(replay.getBody().path("createdAt").asText())
+                .isEqualTo(first.getBody().path("createdAt").asText());
+
+        ResponseEntity<JsonNode> list = restTemplate.getForEntity(
+                "/api/artifacts/coordination-groups", JsonNode.class);
+        assertThat(list.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(list.getBody()).hasSize(1);
+        assertThat(list.getBody().get(0).path("tuples")).hasSize(1);
+    }
+
+    @Test
+    void coordinationGroupStaleVersionReturns409ViaHttp() {
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("x", 1), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("y", 1), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        String body = groupBody("g1", 0L, "[\"x\",\"y\"]",
+                "[[{\"name\":\"x\",\"version\":1},{\"name\":\"y\",\"version\":1}]]");
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity(
+                "/api/artifacts/coordination-groups",
+                new HttpEntity<>(body, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
+    void lockResponseContainsFrozenCoordinationHits() {
+        // y2 -> x[1,2]；允许 (x1,y2) 与 (x2,y1)；锁定应回退到 x1 并冻结命中依据。
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("y", 2, dependency("x", 1, 2)),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("y", 1), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("x", 1), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody("x", 2), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        String groupBody = groupBody("g1", 4L, "[\"x\",\"y\"]",
+                "[[{\"name\":\"x\",\"version\":1},{\"name\":\"y\",\"version\":2}],"
+                        + "[{\"name\":\"x\",\"version\":2},{\"name\":\"y\",\"version\":1}]]");
+        ResponseEntity<JsonNode> group = restTemplate.postForEntity(
+                "/api/artifacts/coordination-groups",
+                new HttpEntity<>(groupBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(group.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        String lockBody = "{\"rootName\":\"y\",\"rootVersion\":2,\"expectedRepositoryVersion\":5}";
+        ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(lock.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(lock.getBody().path("entries").get(0).path("name").asText()).isEqualTo("x");
+        assertThat(lock.getBody().path("entries").get(0).path("version").asInt()).isEqualTo(1);
+        JsonNode hits = lock.getBody().path("coordinationHits");
+        assertThat(hits).hasSize(1);
+        assertThat(hits.get(0).path("groupId").asText()).isEqualTo("g1");
+        assertThat(hits.get(0).path("tuple")).hasSize(2);
     }
 }

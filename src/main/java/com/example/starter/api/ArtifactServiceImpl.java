@@ -1,20 +1,27 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.CoordinationGroupRequest;
+import com.example.starter.api.dto.CoordinationGroupResponse;
+import com.example.starter.api.dto.CoordinationHitView;
 import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.DependencyView;
 import com.example.starter.api.dto.LockEntryResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
+import com.example.starter.api.dto.TupleEntrySpec;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.LockResolver;
+import com.example.starter.domain.LockSolution;
 import com.example.starter.domain.RepositorySnapshot;
 import com.example.starter.repo.RepositoryDao;
+import com.example.starter.repo.RepositoryDao.CoordinationGroupRecord;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
 import com.example.starter.repo.RepositoryDao.LockEntryRow;
 import com.example.starter.repo.RepositoryDao.LockFileRow;
+import com.example.starter.repo.RepositoryDao.LockHitRow;
 import com.example.starter.support.ApiException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -28,6 +35,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -45,10 +53,12 @@ public class ArtifactServiceImpl implements ArtifactService {
 
     private static final int MAX_NAMES = 20;
     private static final int MAX_VERSIONS_PER_NAME = 5;
+    private static final int MAX_COORDINATION_GROUPS = 3;
 
     private static final String OP_REGISTER = "REGISTER_ARTIFACT";
     private static final String OP_WITHDRAW = "WITHDRAW_ARTIFACT";
     private static final String OP_LOCK = "CREATE_LOCK";
+    private static final String OP_UPSERT_GROUP = "UPSERT_COORDINATION_GROUP";
 
     private final RepositoryDao repositoryDao;
     private final TransactionTemplate transactionTemplate;
@@ -105,6 +115,24 @@ public class ArtifactServiceImpl implements ArtifactService {
             result.add(toLockResponse(row, repositoryDao.listLockEntries(row.id())));
         }
         return result;
+    }
+
+    @Override
+    public CoordinationGroupResponse upsertCoordinationGroup(String requestId,
+                                                             CoordinationGroupRequest request) {
+        requireRequestId(requestId);
+        validateGroupRequest(request);
+        // 结构化身份：操作 + 资源 + 非空操作者 + 全参数（成员/元组规范化排序）+ 期望版本。
+        String hash = sha256(writeJson(canonicalGroupIdentity(request)));
+        return executeIdempotent(requestId, OP_UPSERT_GROUP, hash, 201,
+                () -> doUpsertGroup(request), CoordinationGroupResponse.class);
+    }
+
+    @Override
+    public List<CoordinationGroupResponse> listCoordinationGroups() {
+        return repositoryDao.listCoordinationGroups().stream()
+                .map(this::toGroupResponse)
+                .toList();
     }
 
     @Override
@@ -187,20 +215,81 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
 
         RepositorySnapshot snapshot = repositoryDao.loadSnapshot();
-        Map<String, Integer> solution = LockResolver.resolve(snapshot, rootName, rootVersion);
+        LockSolution solution = LockResolver.resolveSolution(snapshot, rootName, rootVersion);
         if (solution == null) {
             throw ApiException.unprocessable(
-                    "不存在满足全部依赖区间的未撤回版本组合，无法锁定");
+                    "不存在满足全部依赖区间与协调组约束的未撤回版本组合，无法锁定");
         }
 
         Instant now = Instant.now(clock);
         long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, currentVersion,
                 currentRequestId.get(), now);
-        solution.forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
+        solution.versions().forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
+        // 冻结命中依据：组与允许元组此后修订/删除都不影响本锁。
+        for (LockSolution.CoordinationHit hit : solution.hits()) {
+            repositoryDao.insertLockCoordinationHit(lockFileId, hit.groupId(),
+                    writeJson(toTupleEntries(hit.tuple())));
+        }
 
         List<LockEntryResponse> entries = new ArrayList<>();
-        solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
-        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
+        solution.versions().forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
+        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now,
+                entries, toHitViews(solution.hits()));
+    }
+
+    private CoordinationGroupResponse doUpsertGroup(CoordinationGroupRequest request) {
+        String groupId = request.groupId().trim();
+        String operator = request.operator().trim();
+
+        // 当前事务已在入口持有 repository_state 行锁；此处读取版本号并做乐观校验。
+        long currentVersion = repositoryDao.lockRepositoryState();
+        if (currentVersion != request.expectedRepositoryVersion()) {
+            throw ApiException.conflict("仓库版本不匹配：expected="
+                    + request.expectedRepositoryVersion() + ", actual=" + currentVersion);
+        }
+
+        // 允许元组引用的版本必须已登记（撤回版本保留在历史元组中，仍视为存在）。
+        for (List<TupleEntrySpec> tuple : request.tuples()) {
+            for (TupleEntrySpec entry : tuple) {
+                if (!repositoryDao.artifactExists(entry.name(), entry.version())) {
+                    throw ApiException.notFound("允许元组引用的制品版本不存在: "
+                            + entry.name() + ":" + entry.version());
+                }
+            }
+        }
+
+        CoordinationGroupRecord existing = repositoryDao.findCoordinationGroup(groupId);
+        if (existing == null && repositoryDao.countCoordinationGroups() >= MAX_COORDINATION_GROUPS) {
+            throw ApiException.unprocessable(
+                    "协调组数量已达上限 " + MAX_COORDINATION_GROUPS);
+        }
+
+        Instant now = Instant.now(clock);
+        long repositoryVersion = repositoryDao.incrementRepositoryVersion();
+        long groupRef;
+        if (existing == null) {
+            groupRef = repositoryDao.insertCoordinationGroup(groupId, operator,
+                    repositoryVersion, now);
+        } else {
+            groupRef = existing.id();
+            repositoryDao.replaceCoordinationGroupContent(groupRef, operator,
+                    repositoryVersion, now);
+        }
+
+        List<String> members = normalizedMembers(request);
+        for (String member : members) {
+            repositoryDao.insertCoordinationMember(groupRef, member);
+        }
+        List<List<TupleEntrySpec>> tuples = normalizedTuples(request);
+        for (List<TupleEntrySpec> tuple : tuples) {
+            long tupleRef = repositoryDao.insertCoordinationTuple(groupRef, tupleKey(tuple));
+            for (TupleEntrySpec entry : tuple) {
+                repositoryDao.insertCoordinationTupleEntry(tupleRef, entry.name(), entry.version());
+            }
+        }
+
+        return new CoordinationGroupResponse(groupId, operator, members,
+                toTupleViews(tuples), repositoryVersion, now);
     }
 
     // ------------------------------------------------------------------
@@ -321,8 +410,164 @@ public class ArtifactServiceImpl implements ArtifactService {
         List<LockEntryResponse> entryViews = entries.stream()
                 .map(e -> new LockEntryResponse(e.name(), e.version()))
                 .toList();
+        List<CoordinationHitView> hitViews = repositoryDao.listLockCoordinationHits(row.id())
+                .stream()
+                .map(this::toHitView)
+                .toList();
         return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(),
-                row.repositoryVersion(), row.createdAt(), entryViews);
+                row.repositoryVersion(), row.createdAt(), entryViews, hitViews);
+    }
+
+    // ------------------------------------------------------------------
+    // 协调组：校验、规范化与视图转换
+    // ------------------------------------------------------------------
+
+    /** 请求形状校验（不依赖数据库状态）；成员与元组数量边界在此兜底。 */
+    private void validateGroupRequest(CoordinationGroupRequest request) {
+        if (request.groupId() == null || request.groupId().isBlank()) {
+            throw ApiException.badRequest("groupId 不能为空");
+        }
+        if (request.operator() == null || request.operator().isBlank()) {
+            throw ApiException.badRequest("operator 不能为空");
+        }
+        List<String> members = request.members();
+        if (members == null || members.size() < 2 || members.size() > 4) {
+            throw ApiException.badRequest("协调组成员数量必须为 2 至 4");
+        }
+        Set<String> distinct = new HashSet<>();
+        for (String member : members) {
+            if (member == null || member.isBlank()) {
+                throw ApiException.badRequest("协调组成员名称不能为空");
+            }
+            if (!distinct.add(member)) {
+                throw ApiException.badRequest("协调组成员重复: " + member);
+            }
+        }
+        List<List<TupleEntrySpec>> tuples = request.tuples();
+        if (tuples == null || tuples.isEmpty() || tuples.size() > 5) {
+            throw ApiException.badRequest("允许元组数量必须为 1 至 5");
+        }
+        Set<String> tupleKeys = new HashSet<>();
+        for (List<TupleEntrySpec> tuple : tuples) {
+            if (tuple == null || tuple.size() != members.size()) {
+                throw ApiException.badRequest("每条允许元组必须完整列出组内全部成员");
+            }
+            Set<String> covered = new HashSet<>();
+            for (TupleEntrySpec entry : tuple) {
+                if (entry == null || entry.name() == null || entry.name().isBlank()) {
+                    throw ApiException.badRequest("允许元组条目名称不能为空");
+                }
+                if (!distinct.contains(entry.name())) {
+                    throw ApiException.badRequest("允许元组包含组外成员: " + entry.name());
+                }
+                if (!covered.add(entry.name())) {
+                    throw ApiException.badRequest("允许元组内成员重复: " + entry.name());
+                }
+            }
+            if (!covered.equals(distinct)) {
+                throw ApiException.badRequest("每条允许元组必须完整列出组内全部成员");
+            }
+            if (!tupleKeys.add(tupleKey(sortedTuple(tuple)))) {
+                throw ApiException.badRequest("允许元组重复: " + tupleKey(sortedTuple(tuple)));
+            }
+        }
+    }
+
+    /** 成员按名称升序规范化（换序同参）。 */
+    private List<String> normalizedMembers(CoordinationGroupRequest request) {
+        return request.members().stream().sorted().toList();
+    }
+
+    /** 元组规范化：每条元组内按名称升序，元组之间按规范化键升序（换序同参）。 */
+    private List<List<TupleEntrySpec>> normalizedTuples(CoordinationGroupRequest request) {
+        return request.tuples().stream()
+                .map(this::sortedTuple)
+                .sorted((a, b) -> tupleKey(a).compareTo(tupleKey(b)))
+                .toList();
+    }
+
+    /** 单条元组按成员名称升序排序。 */
+    private List<TupleEntrySpec> sortedTuple(List<TupleEntrySpec> tuple) {
+        return tuple.stream()
+                .sorted((a, b) -> a.name().compareTo(b.name()))
+                .toList();
+    }
+
+    /** 规范化元组键：name=version 按名称升序拼接，用于唯一约束与重复判定。 */
+    private String tupleKey(List<TupleEntrySpec> sortedTuple) {
+        StringBuilder sb = new StringBuilder();
+        for (TupleEntrySpec entry : sortedTuple) {
+            if (sb.length() > 0) {
+                sb.append(';');
+            }
+            sb.append(entry.name()).append('=').append(entry.version());
+        }
+        return sb.toString();
+    }
+
+    /** 幂等身份：操作、资源、操作者、规范化全参数与期望版本的结构化表示。 */
+    private Map<String, Object> canonicalGroupIdentity(CoordinationGroupRequest request) {
+        Map<String, Object> identity = new LinkedHashMap<>();
+        identity.put("operation", OP_UPSERT_GROUP);
+        identity.put("groupId", request.groupId().trim());
+        identity.put("operator", request.operator().trim());
+        identity.put("members", normalizedMembers(request));
+        identity.put("tuples", normalizedTuples(request).stream()
+                .map(this::toTupleEntries)
+                .toList());
+        identity.put("expectedRepositoryVersion", request.expectedRepositoryVersion());
+        return identity;
+    }
+
+    private List<LockEntryResponse> toTupleEntries(Map<String, Integer> tuple) {
+        return tuple.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .map(e -> new LockEntryResponse(e.getKey(), e.getValue()))
+                .toList();
+    }
+
+    private List<LockEntryResponse> toTupleEntries(List<TupleEntrySpec> sortedTuple) {
+        return sortedTuple.stream()
+                .map(e -> new LockEntryResponse(e.name(), e.version()))
+                .toList();
+    }
+
+    private List<List<LockEntryResponse>> toTupleViews(List<List<TupleEntrySpec>> tuples) {
+        return tuples.stream().map(this::toTupleEntries).toList();
+    }
+
+    private List<CoordinationHitView> toHitViews(List<LockSolution.CoordinationHit> hits) {
+        return hits.stream()
+                .map(h -> new CoordinationHitView(h.groupId(), toTupleEntries(h.tuple())))
+                .toList();
+    }
+
+    private CoordinationHitView toHitView(LockHitRow row) {
+        return new CoordinationHitView(row.groupId(), readTupleEntries(row.tupleJson()));
+    }
+
+    private CoordinationGroupResponse toGroupResponse(CoordinationGroupRecord record) {
+        List<List<LockEntryResponse>> tupleViews = record.tuples().stream()
+                .map(this::toTupleEntries)
+                .toList();
+        return new CoordinationGroupResponse(record.groupId(), record.operator(),
+                record.members(), tupleViews, record.repositoryVersion(),
+                record.createdAt());
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<LockEntryResponse> readTupleEntries(String json) {
+        try {
+            List<Map<String, Object>> raw = objectMapper.readValue(json, List.class);
+            List<LockEntryResponse> entries = new ArrayList<>();
+            for (Map<String, Object> item : raw) {
+                entries.add(new LockEntryResponse(
+                        (String) item.get("name"), ((Number) item.get("version")).intValue()));
+            }
+            return List.copyOf(entries);
+        } catch (Exception e) {
+            throw new IllegalStateException("命中元组反序列化失败", e);
+        }
     }
 
     private void requireRequestId(String requestId) {

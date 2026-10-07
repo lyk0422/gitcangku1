@@ -1,6 +1,8 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.CoordinationGroupRequest;
+import com.example.starter.api.dto.CoordinationGroupResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
@@ -20,6 +22,12 @@ public interface ArtifactService {
 
     /** 创建锁文件（requestId 幂等）。 */
     LockFileResponse createLock(String requestId, LockRequest request);
+
+    /** 登记或修订协调组（requestId 幂等，expectedRepositoryVersion 乐观校验）。 */
+    CoordinationGroupResponse upsertCoordinationGroup(String requestId, CoordinationGroupRequest request);
+
+    /** 查询全部协调组，按组 ID 升序。 */
+    List<CoordinationGroupResponse> listCoordinationGroups();
 
     /** 查询全部历史锁文件，按名称排序返回条目。 */
     List<LockFileResponse> listLocks();

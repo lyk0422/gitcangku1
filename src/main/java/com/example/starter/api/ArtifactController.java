@@ -1,6 +1,8 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.CoordinationGroupRequest;
+import com.example.starter.api.dto.CoordinationGroupResponse;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
@@ -68,5 +70,20 @@ public class ArtifactController {
     @GetMapping("/locks/{id}")
     public LockFileResponse getLock(@PathVariable long id) {
         return artifactService.getLock(id);
+    }
+
+    /** 登记或修订协调组。 */
+    @PostMapping("/coordination-groups")
+    public ResponseEntity<CoordinationGroupResponse> upsertCoordinationGroup(
+            @RequestHeader("X-Request-Id") String requestId,
+            @Valid @RequestBody CoordinationGroupRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(artifactService.upsertCoordinationGroup(requestId, request));
+    }
+
+    /** 查询全部协调组。 */
+    @GetMapping("/coordination-groups")
+    public List<CoordinationGroupResponse> listCoordinationGroups() {
+        return artifactService.listCoordinationGroups();
     }
 }

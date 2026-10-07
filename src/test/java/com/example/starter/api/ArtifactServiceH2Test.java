@@ -41,8 +41,13 @@ class ArtifactServiceH2Test {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_coordination_hit");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM coordination_tuple_entry");
+        jdbcTemplate.update("DELETE FROM coordination_tuple");
+        jdbcTemplate.update("DELETE FROM coordination_group_member");
+        jdbcTemplate.update("DELETE FROM coordination_group");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
