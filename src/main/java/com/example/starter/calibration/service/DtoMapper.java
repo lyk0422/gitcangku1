@@ -4,9 +4,11 @@ import java.math.BigDecimal;
 import java.util.List;
 
 import com.example.starter.calibration.api.dto.CertificateResponse;
+import com.example.starter.calibration.api.dto.DriftArchiveResponse;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRecordResponse;
 import com.example.starter.calibration.model.Certificate;
+import com.example.starter.calibration.model.DriftArchive;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.model.ReleaseRecord;
@@ -41,12 +43,27 @@ final class DtoMapper {
                 cert.createdAt());
     }
 
+    static DriftArchiveResponse toResponse(DriftArchive archive) {
+        return new DriftArchiveResponse(
+                archive.id(),
+                archive.instrumentId(),
+                archive.referencedAt(),
+                format(archive.offset()),
+                archive.revoked(),
+                archive.revokedAt(),
+                archive.createdAt());
+    }
+
+    /**
+     * 测量明细。usable 要求已放行且全部证据有效：证书未撤销，参考漂移模式的两端档案也未撤销。
+     */
     static MeasurementResponse toResponse(Measurement m, boolean certificateRevoked,
-                                          List<ReleaseRecord> releases) {
-        boolean usable = m.status() == MeasurementStatus.RELEASED && !certificateRevoked;
+                                          boolean referencesRevoked, List<ReleaseRecord> releases) {
+        boolean usable = m.status() == MeasurementStatus.RELEASED && !certificateRevoked && !referencesRevoked;
         return new MeasurementResponse(
                 m.id(),
                 m.measurementKey(),
+                m.mode().name(),
                 m.instrumentId(),
                 m.measuredAt(),
                 format(m.rawReading()),
@@ -55,6 +72,9 @@ final class DtoMapper {
                 m.submittedBy(),
                 m.certificateId(),
                 format(m.computedValue()),
+                m.refArchiveId0(),
+                m.refArchiveId1(),
+                m.finalValueString(),
                 m.displayValue().toPlainString(),
                 m.passed(),
                 m.status().name(),

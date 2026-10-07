@@ -2,6 +2,7 @@ package com.example.starter.calibration.service;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.List;
 
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -9,6 +10,7 @@ import org.springframework.transaction.annotation.Transactional;
 import com.example.starter.calibration.api.ApiException;
 import com.example.starter.calibration.api.dto.CertificateResponse;
 import com.example.starter.calibration.api.dto.CreateCertificateRequest;
+import com.example.starter.calibration.api.dto.RevokeRequest;
 import com.example.starter.calibration.model.Certificate;
 import com.example.starter.calibration.repo.CertificateRepository;
 
@@ -19,9 +21,11 @@ import com.example.starter.calibration.repo.CertificateRepository;
 public class CertificateService {
 
     private final CertificateRepository certificates;
+    private final RequestDedupService dedup;
 
-    public CertificateService(CertificateRepository certificates) {
+    public CertificateService(CertificateRepository certificates, RequestDedupService dedup) {
         this.certificates = certificates;
+        this.dedup = dedup;
     }
 
     /**
@@ -30,6 +34,18 @@ public class CertificateService {
      */
     @Transactional
     public CertificateResponse create(CreateCertificateRequest request) {
+        return dedup.execute(request.requestId(), "CREATE_CERTIFICATE", "certificate",
+                request.operator(), request.expectedVersion(),
+                List.of(IdentityHash.text(request.instrumentId()),
+                        IdentityHash.text(request.validFrom()),
+                        IdentityHash.text(request.validTo()),
+                        IdentityHash.decimal(request.a()),
+                        IdentityHash.decimal(request.b())),
+                CertificateResponse.class,
+                () -> doCreate(request));
+    }
+
+    private CertificateResponse doCreate(CreateCertificateRequest request) {
         String instrumentId = Inputs.requireText(request.instrumentId(), "instrumentId");
         Instant validFrom = Inputs.requireInstant(request.validFrom(), "validFrom");
         Instant validTo = Inputs.requireInstant(request.validTo(), "validTo");
@@ -52,7 +68,17 @@ public class CertificateService {
      * 与批量放行并发时按事务提交顺序生效：撤销先提交则放行整批拒绝。
      */
     @Transactional
-    public CertificateResponse revoke(long id) {
+    public CertificateResponse revoke(long id, RevokeRequest request) {
+        String operator = request == null ? null : request.operator();
+        String requestId = request == null ? null : request.requestId();
+        String expectedVersion = request == null ? null : request.expectedVersion();
+        return dedup.execute(requestId, "REVOKE_CERTIFICATE", "certificate:" + id,
+                operator, expectedVersion, List.of(Long.toString(id)),
+                CertificateResponse.class,
+                () -> doRevoke(id));
+    }
+
+    private CertificateResponse doRevoke(long id) {
         Certificate cert = certificates.findByIdForUpdate(id)
                 .orElseThrow(() -> ApiException.notFound("证书不存在: " + id));
         if (cert.revoked()) {

@@ -16,12 +16,13 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRequest;
 import com.example.starter.calibration.api.dto.ReleaseResponse;
+import com.example.starter.calibration.api.dto.SubmitDriftMeasurementRequest;
 import com.example.starter.calibration.api.dto.SubmitMeasurementRequest;
 import com.example.starter.calibration.service.MeasurementService;
 import com.example.starter.calibration.service.ReleaseService;
 
 /**
- * 测量接口：提交、批量放行、历史明细、当前可用结果查询。
+ * 测量接口：普通提交、参考漂移提交、批量放行、历史明细、当前可用结果查询。
  */
 @RestController
 @RequestMapping("/api/measurements")
@@ -36,11 +37,20 @@ public class MeasurementController {
     }
 
     /**
-     * 提交测量：201；参数非法 400；测量键重复 409；无匹配有效证书 422。
+     * 提交普通测量：201；参数非法 400；测量键重复 409；无匹配有效证书 422。
      */
     @PostMapping
     public ResponseEntity<MeasurementResponse> submit(@RequestBody SubmitMeasurementRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(measurements.submit(request));
+    }
+
+    /**
+     * 提交参考漂移模式测量：201；参数或精度非法 400；测量键重复 409；
+     * 仪器不符、两端间隔超时、测量时刻出界、任一参考撤销或无有效证书 422。
+     */
+    @PostMapping("/drift")
+    public ResponseEntity<MeasurementResponse> submitDrift(@RequestBody SubmitDriftMeasurementRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(measurements.submitDrift(request));
     }
 
     /**
@@ -50,11 +60,11 @@ public class MeasurementController {
     @PostMapping("/release")
     public ReleaseResponse release(@RequestBody ReleaseRequest request,
                                    @RequestHeader("X-Actor-Id") String actor) {
-        return releases.release(request.keys(), actor);
+        return releases.release(request.keys(), actor, request.requestId(), request.expectedVersion());
     }
 
     /**
-     * 当前可用结果：已放行且证书未撤销；可按仪器过滤。
+     * 当前可用结果：已放行且证书与相关档案均未撤销；可按仪器过滤。
      */
     @GetMapping("/usable")
     public List<MeasurementResponse> usable(@RequestParam(required = false) String instrumentId) {

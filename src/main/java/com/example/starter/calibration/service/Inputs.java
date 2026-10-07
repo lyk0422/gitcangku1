@@ -44,4 +44,13 @@ final class Inputs {
             throw ApiException.badRequest(field + " 必须为带时区的 ISO-8601 时间");
         }
     }
+
+    /**
+     * 要求时刻为毫秒精度（UTC 毫秒时刻）；亚毫秒精度视为超精度输入，返回 400。
+     */
+    static void requireMillisPrecision(Instant instant, String field) {
+        if (instant.getNano() % 1_000_000 != 0) {
+            throw ApiException.badRequest(field + " 必须为毫秒精度（不允许亚毫秒）");
+        }
+    }
 }

@@ -11,6 +11,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.calibration.api.dto.CertificateResponse;
 import com.example.starter.calibration.api.dto.CreateCertificateRequest;
+import com.example.starter.calibration.api.dto.RevokeRequest;
 import com.example.starter.calibration.service.CertificateService;
 
 /**
@@ -35,11 +36,12 @@ public class CertificateController {
     }
 
     /**
-     * 撤销证书：200；不存在 404；重复撤销 409。
+     * 撤销证书：200；不存在 404；重复撤销 409。请求体可选，用于幂等去重。
      */
     @PostMapping("/{id}/revoke")
-    public CertificateResponse revoke(@PathVariable long id) {
-        return certificates.revoke(id);
+    public CertificateResponse revoke(@PathVariable long id,
+                                      @RequestBody(required = false) RevokeRequest request) {
+        return certificates.revoke(id, request);
     }
 
     /**

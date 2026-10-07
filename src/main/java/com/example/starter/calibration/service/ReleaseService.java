@@ -15,14 +15,18 @@ import com.example.starter.calibration.api.BatchRejectedException;
 import com.example.starter.calibration.api.ItemFailure;
 import com.example.starter.calibration.api.dto.ReleaseResponse;
 import com.example.starter.calibration.model.Certificate;
+import com.example.starter.calibration.model.DriftArchive;
 import com.example.starter.calibration.model.Measurement;
+import com.example.starter.calibration.model.MeasurementMode;
 import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.repo.CertificateRepository;
+import com.example.starter.calibration.repo.DriftArchiveRepository;
 import com.example.starter.calibration.repo.MeasurementRepository;
 import com.example.starter.calibration.repo.ReleaseRepository;
 
 /**
  * 批量放行服务：每批 1～50 条，整批原子生效；任一项不满足条件则整批拒绝（409）并返回各项原因。
+ * 放行核对全部证据：原证书与（参考漂移模式的）两端漂移档案，任一失效整批不放。
  */
 @Service
 public class ReleaseService {
@@ -32,22 +36,38 @@ public class ReleaseService {
 
     private final MeasurementRepository measurements;
     private final CertificateRepository certificates;
+    private final DriftArchiveRepository archives;
     private final ReleaseRepository releases;
+    private final RequestDedupService dedup;
 
     public ReleaseService(MeasurementRepository measurements,
                           CertificateRepository certificates,
-                          ReleaseRepository releases) {
+                          DriftArchiveRepository archives,
+                          ReleaseRepository releases,
+                          RequestDedupService dedup) {
         this.measurements = measurements;
         this.certificates = certificates;
+        this.archives = archives;
         this.releases = releases;
+        this.dedup = dedup;
     }
 
     /**
-     * 原子批量放行。每条结果必须：处于待放行、判定合格、证书仍有效、放行人不同于提交人。
-     * 行锁按测量键字典序获取，避免并发批次间死锁；证书行锁使撤销与放行按事务提交顺序生效。
+     * 原子批量放行。每条结果必须：处于待放行、判定合格、证书仍有效、（漂移模式）两端档案未撤销、
+     * 放行人不同于提交人。行锁按测量键字典序获取，避免并发批次间死锁；
+     * 证书与档案行锁使撤销与放行按事务提交顺序生效。
      */
     @Transactional
-    public ReleaseResponse release(List<String> keys, String actor) {
+    public ReleaseResponse release(List<String> keys, String actor,
+                                   String requestId, String expectedVersion) {
+        List<String> identityParams = keys == null ? List.of() : new ArrayList<>(keys);
+        return dedup.execute(requestId, "RELEASE_BATCH", "release",
+                actor, expectedVersion, identityParams,
+                ReleaseResponse.class,
+                () -> doRelease(keys, actor));
+    }
+
+    private ReleaseResponse doRelease(List<String> keys, String actor) {
         String releaser = Inputs.requireText(actor, "X-Actor-Id");
         if (keys == null || keys.isEmpty() || keys.size() > MAX_BATCH_SIZE) {
             throw ApiException.badRequest("批量放行条数必须为 1～" + MAX_BATCH_SIZE);
@@ -81,6 +101,19 @@ public class ReleaseService {
                             "测量关联的证书不存在: " + measurement.certificateId()));
             if (cert.revoked()) {
                 reasons.add("CERTIFICATE_REVOKED");
+            }
+            if (measurement.mode() == MeasurementMode.DRIFT_REF) {
+                List<Long> refIds = List.of(measurement.refArchiveId0(), measurement.refArchiveId1())
+                        .stream().sorted().toList();
+                for (Long refId : refIds) {
+                    DriftArchive archive = archives.findByIdForUpdate(refId)
+                            .orElseThrow(() -> ApiException.conflict("DRIFT_ARCHIVE_MISSING",
+                                    "测量关联的漂移档案不存在: " + refId));
+                    if (archive.revoked()) {
+                        reasons.add("REFERENCE_REVOKED");
+                        break;
+                    }
+                }
             }
             if (measurement.submittedBy().equals(releaser)) {
                 reasons.add("SAME_ACTOR");
