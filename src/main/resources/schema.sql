@@ -100,3 +100,20 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS incident_schedule_state (
+    incident_id BIGINT PRIMARY KEY COMMENT '事件 id，关联 incidents.id',
+    state_version BIGINT NOT NULL COMMENT '事件排程相关版本：处置任务完成、取消或指挥交接接受时 +1；提交排程提案时冻结该版本'
+) COMMENT='事件排程版本表';
+
+CREATE TABLE IF NOT EXISTS incident_schedules (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    schedule_version INT NOT NULL COMMENT '排程版本，事件内从 1 递增；替换须携带 expectedScheduleVersion 等于当前最新版本',
+    status VARCHAR(16) NOT NULL COMMENT '状态：CURRENT 当前有效 / STALE 已失效（被新版本替换或事件版本推进）；历史保留不删除',
+    base_instant TIMESTAMP(6) NOT NULL COMMENT '提案固定 UTC 基准零点，任务最早开始/最晚完成偏移均以分钟相对该时刻',
+    snapshot MEDIUMTEXT NOT NULL COMMENT '提交时冻结的完整提案 JSON：任务状态、事件版本及全部有向时间约束',
+    created_by VARCHAR(128) NOT NULL COMMENT '提交人（提交时的当前指挥人）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '提交 UTC 时间',
+    CONSTRAINT uk_schedule_version UNIQUE (incident_id, schedule_version)
+) COMMENT='整案排程提案表';

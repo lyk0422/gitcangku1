@@ -56,4 +56,9 @@ public class ApiException extends RuntimeException {
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
     }
+
+    /** 422：排程提案不存在可行时间赋值，整体拒绝且不留部分排程。 */
+    public static ApiException infeasibleSchedule(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "SCHEDULE_INFEASIBLE", message, null);
+    }
 }

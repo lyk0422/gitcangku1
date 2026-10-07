@@ -78,4 +78,34 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /**
+     * 排程任务视图：taskStatus 为提交时冻结的任务状态；
+     * 偏移为相对提案基准零点的分钟数。
+     */
+    public record ScheduledTaskView(String taskKey, String taskStatus, long durationMinutes,
+                                    long earliestStartOffset, long latestFinishOffset) {
+    }
+
+    /** 排程有向约束视图：toTaskKey 开始 − fromTaskKey 完成 ∈ [lowerBound, upperBound]（分钟）。 */
+    public record ScheduleConstraintView(String fromTaskKey, String toTaskKey,
+                                         long lowerBound, long upperBound) {
+    }
+
+    /**
+     * 整案排程提案视图：stateVersion 为提交时冻结的事件版本；
+     * status 为 CURRENT/STALE；tasks 与 constraints 为提交时冻结的完整内容。
+     */
+    public record ScheduleView(long scheduleVersion, String status, Instant baseInstant,
+                               long stateVersion, List<ScheduledTaskView> tasks,
+                               List<ScheduleConstraintView> constraints,
+                               String createdBy, Instant createdAt) {
+    }
+
+    /**
+     * 排程查询视图：current 为最新版本提案（无则 null，可能已 STALE），
+     * history 为全部版本按版本升序；只读，不隐式写入。
+     */
+    public record ScheduleHistoryView(ScheduleView current, List<ScheduleView> history) {
+    }
 }

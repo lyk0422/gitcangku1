@@ -99,3 +99,20 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS incident_schedule_state (
+    incident_id BIGINT PRIMARY KEY,
+    state_version BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS incident_schedules (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    schedule_version INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    base_instant TIMESTAMP(6) NOT NULL,
+    snapshot CLOB NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_schedule_version UNIQUE (incident_id, schedule_version)
+);
