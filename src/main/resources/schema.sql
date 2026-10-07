@@ -5,9 +5,17 @@ CREATE TABLE IF NOT EXISTS device (
   model VARCHAR(64) NOT NULL COMMENT '设备型号，登记后不可修改',
   current_version VARCHAR(64) NOT NULL COMMENT '设备当前固件版本',
   bucket_no INT NOT NULL COMMENT '灰度分桶号，取值0~99，登记后不可修改',
+  config_version INT NOT NULL DEFAULT 1 COMMENT '配置版本，从1开始；本地配置修改或SUCCESS回执应用迁移后加一',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
   PRIMARY KEY (device_id)
 ) COMMENT='设备登记表';
+
+CREATE TABLE IF NOT EXISTS device_config (
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  config_key VARCHAR(64) NOT NULL COMMENT '配置键，非空字符串，设备内唯一，单设备至多10个',
+  config_value INT NOT NULL COMMENT '配置整数值，取值0~1000000',
+  PRIMARY KEY (device_id, config_key)
+) COMMENT='设备合成配置键值表，随SUCCESS回执整体替换或本地修改逐键更新';
 
 CREATE TABLE IF NOT EXISTS release_order (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '发布单ID',
@@ -19,6 +27,7 @@ CREATE TABLE IF NOT EXISTS release_order (
   status VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE投放中，PAUSED失败率自动暂停，CANCELLED已取消（终态）',
   sample_floor INT NOT NULL COMMENT '失败率统计样本下限，取值2~100；本轮样本数达到下限才评估暂停',
   failure_threshold_percent INT NOT NULL COMMENT '失败率阈值百分比，取值1~100；FAILED×100>=样本数×阈值时自动暂停',
+  migration_rules CLOB NOT NULL COMMENT '配置迁移规则JSON数组，有序执行、顺序是发布单身份一部分，至多5条；元素{type:RENAME/MULTIPLY,key,targetKey?,factor?}，RENAME目标键不得已存在，MULTIPLY乘数1~10且结果值0~1000000',
   monitor_round INT NOT NULL DEFAULT 1 COMMENT '当前监控轮次，从1开始，人工恢复后加一并清零统计',
   round_success INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入SUCCESS的任务数，重复回执不重复计数',
   round_failed INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入FAILED的任务数，重复回执不重复计数',
@@ -36,6 +45,10 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  config_version_before INT NULL COMMENT '领取时冻结的设备配置版本',
+  config_before CLOB NULL COMMENT '领取时冻结的迁移前完整配置快照JSON（按键排序）',
+  config_after CLOB NULL COMMENT '领取时预演通过的迁移后完整配置快照JSON；SUCCESS回执时整体替换设备配置',
+  failure_reason VARCHAR(256) NULL COMMENT '首次FAILED回执携带的失败原因，冻结后不可改，未提供为NULL',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),

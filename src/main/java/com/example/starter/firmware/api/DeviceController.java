@@ -35,6 +35,12 @@ public class DeviceController {
         return deviceService.get(deviceId);
     }
 
+    @PostMapping("/{deviceId}/config")
+    public DeviceView updateConfig(@PathVariable String deviceId,
+                                   @Valid @RequestBody UpdateDeviceConfigRequest request) {
+        return deviceService.updateConfig(deviceId, request);
+    }
+
     @PostMapping("/{deviceId}/pull")
     public PullResponse pull(@PathVariable String deviceId, @Valid @RequestBody RequestIdBody request) {
         return taskService.pull(deviceId, request.requestId());

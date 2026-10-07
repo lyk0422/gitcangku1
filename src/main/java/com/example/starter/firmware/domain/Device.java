@@ -7,6 +7,7 @@ package com.example.starter.firmware.domain;
  * @param model          设备型号，登记后不可修改
  * @param currentVersion 设备当前固件版本
  * @param bucketNo       灰度分桶号，取值0~99，登记后不可修改
+ * @param configVersion  配置版本，从1开始；本地配置修改或 SUCCESS 回执应用迁移后加一
  */
-public record Device(String deviceId, String model, String currentVersion, int bucketNo) {
+public record Device(String deviceId, String model, String currentVersion, int bucketNo, int configVersion) {
 }

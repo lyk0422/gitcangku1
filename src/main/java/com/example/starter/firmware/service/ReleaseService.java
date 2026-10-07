@@ -8,6 +8,8 @@ import com.example.starter.firmware.api.ReleaseHistoryResponse;
 import com.example.starter.firmware.api.ReleaseView;
 import com.example.starter.firmware.api.ResumeRecordView;
 import com.example.starter.firmware.api.ResumeReleaseRequest;
+import com.example.starter.firmware.domain.MigrationRule;
+import com.example.starter.firmware.domain.MigrationRuleCodec;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.error.ApiException;
@@ -20,6 +22,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.List;
 
 /**
  * 发布单生命周期：创建（版本从1开始）、扩量（版本校验+只增不减）、失败率自动暂停、
@@ -32,17 +35,20 @@ public class ReleaseService {
     private final TaskRepository taskRepository;
     private final PauseRecordRepository pauseRecordRepository;
     private final ResumeRecordRepository resumeRecordRepository;
+    private final ConfigMigrationService configMigrationService;
     private final IdempotencyService idempotency;
     private final Clock clock;
 
     public ReleaseService(ReleaseRepository releaseRepository, TaskRepository taskRepository,
                           PauseRecordRepository pauseRecordRepository,
                           ResumeRecordRepository resumeRecordRepository,
+                          ConfigMigrationService configMigrationService,
                           IdempotencyService idempotency, Clock clock) {
         this.releaseRepository = releaseRepository;
         this.taskRepository = taskRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.resumeRecordRepository = resumeRecordRepository;
+        this.configMigrationService = configMigrationService;
         this.idempotency = idempotency;
         this.clock = clock;
     }
@@ -53,14 +59,16 @@ public class ReleaseService {
         }
         int sampleFloor = request.effectiveSampleFloor();
         int threshold = request.effectiveFailureThresholdPercent();
+        List<MigrationRule> rules = configMigrationService.validateRules(request.effectiveMigrationRules());
+        String rulesJson = MigrationRuleCodec.toJson(rules);
         String fingerprint = String.join("|", "release.create", request.model(), request.fromVersion(),
                 request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
-                String.valueOf(threshold));
+                String.valueOf(threshold), rulesJson);
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
             long id;
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
-                        request.ratio(), sampleFloor, threshold);
+                        request.ratio(), sampleFloor, threshold, rulesJson);
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
             }

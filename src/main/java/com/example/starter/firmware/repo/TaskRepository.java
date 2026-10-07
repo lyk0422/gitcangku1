@@ -15,18 +15,25 @@ import java.util.Optional;
 
 /**
  * 投放任务数据访问。同设备同发布单由唯一约束 uk_task_release_device 保证最多一条。
+ * 领取时冻结配置版本与迁移前后完整快照；首次 FAILED 回执冻结失败原因。
  */
 @Repository
 public class TaskRepository {
 
     private static final RowMapper<RolloutTask> MAPPER = (rs, rowNum) -> {
         String firstResult = rs.getString("first_result");
+        int configVersionBefore = rs.getInt("config_version_before");
+        boolean configVersionNull = rs.wasNull();
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                configVersionNull ? null : configVersionBefore,
+                rs.getString("config_before"), rs.getString("config_after"),
+                rs.getString("failure_reason"));
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result,"
+            + " config_version_before, config_before, config_after, failure_reason";
 
     private final JdbcTemplate jdbc;
 
@@ -34,14 +41,22 @@ public class TaskRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(long releaseId, String deviceId) {
+    /**
+     * 创建任务并冻结配置版本与迁移前后完整快照。
+     */
+    public long insert(long releaseId, String deviceId, int configVersionBefore,
+                       String configBeforeJson, String configAfterJson) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rollout_task (release_id, device_id, status) VALUES (?, ?, 'PENDING')",
+                    "INSERT INTO rollout_task (release_id, device_id, status, config_version_before,"
+                            + " config_before, config_after) VALUES (?, ?, 'PENDING', ?, ?, ?)",
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            ps.setInt(3, configVersionBefore);
+            ps.setString(4, configBeforeJson);
+            ps.setString(5, configAfterJson);
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -62,9 +77,13 @@ public class TaskRepository {
                 MAPPER, releaseId, deviceId).stream().findFirst();
     }
 
-    public void complete(long id, ReceiptResult result) {
-        jdbc.update("UPDATE rollout_task SET status = ?, first_result = ?, updated_at = CURRENT_TIMESTAMP"
-                + " WHERE id = ?", result.name(), result.name(), id);
+    /**
+     * 首次回执终结任务；FAILED 时同时冻结失败原因（未提供为 null）。
+     */
+    public void complete(long id, ReceiptResult result, String failureReason) {
+        jdbc.update("UPDATE rollout_task SET status = ?, first_result = ?, failure_reason = ?,"
+                        + " updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                result.name(), result.name(), failureReason, id);
     }
 
     public int cancelPendingByRelease(long releaseId) {
@@ -85,6 +104,16 @@ public class TaskRepository {
         Long count = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM rollout_task WHERE release_id = ? AND device_id = ?",
                 Long.class, releaseId, deviceId);
+        return count == null ? 0 : count;
+    }
+
+    /**
+     * 设备当前进行中（PENDING）任务数；本地配置修改仅在该数为 0 时允许。
+     */
+    public long countPendingByDevice(String deviceId) {
+        Long count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM rollout_task WHERE device_id = ? AND status = 'PENDING'",
+                Long.class, deviceId);
         return count == null ? 0 : count;
     }
 }
