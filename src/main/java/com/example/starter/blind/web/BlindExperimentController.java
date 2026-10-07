@@ -4,6 +4,7 @@ import com.example.starter.blind.Actor;
 import com.example.starter.blind.ActorContext;
 import com.example.starter.blind.ApiException;
 import com.example.starter.blind.RequestTokens;
+import com.example.starter.blind.dto.AllocationCreateRequest;
 import com.example.starter.blind.dto.AllocationView;
 import com.example.starter.blind.dto.CreateExperimentRequest;
 import com.example.starter.blind.dto.ExperimentView;
@@ -24,6 +25,7 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -58,7 +60,7 @@ public class BlindExperimentController {
 
     // ---------------- 实验 ----------------
 
-    /** 创建实验（仅 COORDINATOR）；区组数量 2~8，创建后不可改。 */
+    /** 创建实验（仅 COORDINATOR）；BLOCK 区组数量 2~8，MINIMIZE 容量为 4~20 偶数，创建后不可改。 */
     @PostMapping("/experiments/{experimentId}")
     public ResponseEntity<String> createExperiment(
             @PathVariable String experimentId,
@@ -67,11 +69,16 @@ public class BlindExperimentController {
         Actor actor = requireCoordinator();
         String expId = RequestTokens.requireId("experimentId", experimentId);
         String reqId = RequestTokens.requireRequestId(requestId);
-        String fingerprint = idempotencyService.fingerprint(OP_EXPERIMENT_CREATE,
-                Map.of("experimentId", expId, "blockCount", request.blockCount()));
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("experimentId", expId);
+        params.put("mode", request.mode());
+        params.put("blockCount", request.blockCount());
+        params.put("capacity", request.capacity());
+        String fingerprint = idempotencyService.fingerprint(OP_EXPERIMENT_CREATE, params);
         return idempotencyService.runWrite(reqId, OP_EXPERIMENT_CREATE, fingerprint, actor,
                 () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
-                        experimentService.createExperiment(expId, request.blockCount())));
+                        experimentService.createExperiment(expId, request.mode(),
+                                request.blockCount(), request.capacity())));
     }
 
     /** 查询实验信息（COORDINATOR / REVIEWER 均可）。 */
@@ -98,21 +105,29 @@ public class BlindExperimentController {
 
     // ---------------- 分配 / 退组 / 查询 ----------------
 
-    /** 登记参与者（仅 COORDINATOR）：原子领取第一个空位。 */
+    /** 登记参与者（仅 COORDINATOR）：BLOCK 原子领取第一个空位；MINIMIZE 按特征最小化选位。 */
     @PostMapping("/experiments/{experimentId}/participants/{participantId}/allocations")
     public ResponseEntity<String> register(
             @PathVariable String experimentId,
             @PathVariable String participantId,
+            @RequestBody(required = false) AllocationCreateRequest body,
             @RequestHeader(IdempotencyService.HEADER_REQUEST_ID) String requestId) {
         Actor actor = requireCoordinator();
         String expId = RequestTokens.requireId("experimentId", experimentId);
         String pid = RequestTokens.requireId("participantId", participantId);
         String reqId = RequestTokens.requireRequestId(requestId);
-        String fingerprint = idempotencyService.fingerprint(OP_ALLOCATION_CREATE,
-                Map.of("experimentId", expId, "participantId", pid));
+        Integer feature1 = body == null ? null : body.feature1();
+        Integer feature2 = body == null ? null : body.feature2();
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("experimentId", expId);
+        params.put("participantId", pid);
+        params.put("feature1", feature1);
+        params.put("feature2", feature2);
+        String fingerprint = idempotencyService.fingerprint(OP_ALLOCATION_CREATE, params);
         return idempotencyService.runWrite(reqId, OP_ALLOCATION_CREATE, fingerprint, actor,
                 () -> IdempotencyService.WriteOutcome.of(HttpStatus.CREATED.value(),
-                        experimentService.register(expId, pid, actor.actorId())));
+                        experimentService.register(expId, pid, actor.actorId(),
+                                feature1, feature2)));
     }
 
     /** 退组（仅 COORDINATOR）：不释放席位、不重排。 */
