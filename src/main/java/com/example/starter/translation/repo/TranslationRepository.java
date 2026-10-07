@@ -24,15 +24,24 @@ import java.util.Optional;
 @Repository
 public class TranslationRepository {
 
+    private static final String DOCUMENT_COLUMNS =
+            "document_id, doc_mode, target_languages, draft_version, published_version, term_version";
+
+    private static final String SEGMENT_COLUMNS =
+            "segment_id, source_text, source_version, zero_point_ms, start_ms, end_ms";
+
     private static final RowMapper<DocumentRow> DOCUMENT_MAPPER = (rs, n) -> new DocumentRow(
             rs.getLong("document_id"),
+            rs.getString("doc_mode"),
             Arrays.stream(rs.getString("target_languages").split(",")).toList(),
             rs.getInt("draft_version"),
             rs.getInt("published_version"),
             rs.getInt("term_version"));
 
     private static final RowMapper<SegmentRow> SEGMENT_MAPPER = (rs, n) -> new SegmentRow(
-            rs.getString("segment_id"), rs.getString("source_text"), rs.getInt("source_version"));
+            rs.getString("segment_id"), rs.getString("source_text"), rs.getInt("source_version"),
+            rs.getObject("zero_point_ms", Long.class), rs.getObject("start_ms", Long.class),
+            rs.getObject("end_ms", Long.class));
 
     private static final RowMapper<TranslationRow> TRANSLATION_MAPPER = (rs, n) -> new TranslationRow(
             rs.getString("segment_id"), rs.getString("language"), rs.getString("content"),
@@ -54,13 +63,19 @@ public class TranslationRepository {
 
     /** 插入文档并返回自增 ID，初始草稿版本 1、发布版本 0、术语版本 0。 */
     public long insertDocument(List<String> targetLanguages) {
+        return insertDocument("standard", targetLanguages);
+    }
+
+    /** 按指定模式插入文档（standard/subtitle）并返回自增 ID。 */
+    public long insertDocument(String docMode, List<String> targetLanguages) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO document (target_languages, draft_version, published_version, term_version) "
-                            + "VALUES (?, 1, 0, 0)",
+                    "INSERT INTO document (doc_mode, target_languages, draft_version, published_version, "
+                            + "term_version) VALUES (?, ?, 1, 0, 0)",
                     new String[]{"document_id"});
-            ps.setString(1, String.join(",", targetLanguages));
+            ps.setString(1, docMode);
+            ps.setString(2, String.join(",", targetLanguages));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -73,8 +88,7 @@ public class TranslationRepository {
     /** 按 ID 查询文档并加行级写锁（FOR UPDATE），用于串行化同一文档的写操作。 */
     public Optional<DocumentRow> findDocumentForUpdate(long documentId) {
         List<DocumentRow> rows = jdbc.query(
-                "SELECT document_id, target_languages, draft_version, published_version, term_version "
-                        + "FROM document WHERE document_id = ? FOR UPDATE",
+                "SELECT " + DOCUMENT_COLUMNS + " FROM document WHERE document_id = ? FOR UPDATE",
                 DOCUMENT_MAPPER, documentId);
         return rows.stream().findFirst();
     }
@@ -82,8 +96,7 @@ public class TranslationRepository {
     /** 只读查询文档（不加锁），用于快照查询。 */
     public Optional<DocumentRow> findDocument(long documentId) {
         List<DocumentRow> rows = jdbc.query(
-                "SELECT document_id, target_languages, draft_version, published_version, term_version "
-                        + "FROM document WHERE document_id = ?",
+                "SELECT " + DOCUMENT_COLUMNS + " FROM document WHERE document_id = ?",
                 DOCUMENT_MAPPER, documentId);
         return rows.stream().findFirst();
     }
@@ -105,9 +118,17 @@ public class TranslationRepository {
                 documentId, segmentId, sourceText);
     }
 
+    /** 插入字幕段：携带相对零点（UTC 毫秒）与非负起止毫秒，区间左闭右开。 */
+    public void insertSubtitleSegment(long documentId, String segmentId, String sourceText,
+                                      long zeroPointMs, long startMs, long endMs) {
+        jdbc.update("INSERT INTO segment (document_id, segment_id, source_text, source_version, "
+                        + "zero_point_ms, start_ms, end_ms) VALUES (?, ?, ?, 1, ?, ?, ?)",
+                documentId, segmentId, sourceText, zeroPointMs, startMs, endMs);
+    }
+
     public Optional<SegmentRow> findSegment(long documentId, String segmentId) {
         List<SegmentRow> rows = jdbc.query(
-                "SELECT segment_id, source_text, source_version FROM segment "
+                "SELECT " + SEGMENT_COLUMNS + " FROM segment "
                         + "WHERE document_id = ? AND segment_id = ?",
                 SEGMENT_MAPPER, documentId, segmentId);
         return rows.stream().findFirst();
@@ -115,7 +136,7 @@ public class TranslationRepository {
 
     public List<SegmentRow> listSegments(long documentId) {
         return jdbc.query(
-                "SELECT segment_id, source_text, source_version FROM segment "
+                "SELECT " + SEGMENT_COLUMNS + " FROM segment "
                         + "WHERE document_id = ? ORDER BY segment_id",
                 SEGMENT_MAPPER, documentId);
     }
@@ -124,6 +145,15 @@ public class TranslationRepository {
         jdbc.update("UPDATE segment SET source_text = ?, source_version = ? "
                         + "WHERE document_id = ? AND segment_id = ?",
                 sourceText, sourceVersion, documentId, segmentId);
+    }
+
+    /** 字幕源时段修订：同时更新源文、源文版本与时段；文本未变也推进源文版本。 */
+    public void updateSubtitleSegmentSource(long documentId, String segmentId, String sourceText,
+                                            int sourceVersion, long zeroPointMs, long startMs, long endMs) {
+        jdbc.update("UPDATE segment SET source_text = ?, source_version = ?, "
+                        + "zero_point_ms = ?, start_ms = ?, end_ms = ? "
+                        + "WHERE document_id = ? AND segment_id = ?",
+                sourceText, sourceVersion, zeroPointMs, startMs, endMs, documentId, segmentId);
     }
 
     public Optional<TranslationRow> findTranslation(long documentId, String segmentId, String language) {

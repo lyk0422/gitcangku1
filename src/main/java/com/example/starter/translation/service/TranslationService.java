@@ -30,6 +30,11 @@ import java.util.stream.Collectors;
 @Service
 public class TranslationService {
 
+    /** 普通文档模式（无时间轴）。 */
+    public static final String MODE_STANDARD = "standard";
+    /** 字幕文档模式（段落带时段，译文受阅读速率约束）。 */
+    public static final String MODE_SUBTITLE = "subtitle";
+
     private final TranslationRepository repository;
     private final ObjectMapper objectMapper;
 
@@ -51,7 +56,36 @@ public class TranslationService {
         for (ApiDtos.SegmentInput segment : segments) {
             repository.insertSegment(documentId, segment.segmentId(), segment.sourceText());
         }
-        return new ApiDtos.DocumentResponse(documentId, 1, 0, languages);
+        return new ApiDtos.DocumentResponse(documentId, MODE_STANDARD, 1, 0, languages);
+    }
+
+    /**
+     * 建字幕文档：初始字幕段附 UTC 毫秒相对零点及非负起止毫秒，
+     * 区间左闭右开、长度至少 500 毫秒、同一时间轴各段无重叠，任一不满足整次 422。
+     */
+    @Transactional
+    public ApiDtos.DocumentResponse createSubtitleDocument(ApiDtos.CreateSubtitleDocumentRequest request) {
+        List<String> languages = normalizeLanguages(request.targetLanguages());
+        List<ApiDtos.SubtitleSegmentInput> segments = request.segments();
+        long distinct = segments.stream().map(ApiDtos.SubtitleSegmentInput::segmentId).distinct().count();
+        if (distinct != segments.size()) {
+            throw ApiException.unprocessable("初始字幕段 segmentId 重复");
+        }
+        List<long[]> intervals = new ArrayList<>();
+        List<String> labels = new ArrayList<>();
+        for (ApiDtos.SubtitleSegmentInput segment : segments) {
+            SubtitleTiming.durationOf(segment.startMs(), segment.endMs());
+            intervals.add(SubtitleTiming.absoluteInterval(
+                    segment.zeroPointMs(), segment.startMs(), segment.endMs()));
+            labels.add(segment.segmentId());
+        }
+        assertNoOverlap(intervals, labels);
+        long documentId = repository.insertDocument(MODE_SUBTITLE, languages);
+        for (ApiDtos.SubtitleSegmentInput segment : segments) {
+            repository.insertSubtitleSegment(documentId, segment.segmentId(), segment.sourceText(),
+                    segment.zeroPointMs(), segment.startMs(), segment.endMs());
+        }
+        return new ApiDtos.DocumentResponse(documentId, MODE_SUBTITLE, 1, 0, languages);
     }
 
     /** 增加段落：segmentId 文档内唯一，草稿版本加一。 */
@@ -71,9 +105,46 @@ public class TranslationService {
     public ApiDtos.SegmentResponse reviseSource(long documentId, String segmentId,
                                               ApiDtos.ReviseSourceRequest request) {
         DocumentRow document = lockDocument(documentId);
+        if (MODE_SUBTITLE.equals(document.docMode())) {
+            throw ApiException.unprocessable("字幕文档须使用字幕源时段修订入口");
+        }
         SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
         int sourceVersion = segment.sourceVersion() + 1;
         repository.updateSegmentSource(documentId, segmentId, request.sourceText(), sourceVersion);
+        int draftVersion = bumpDraftVersion(document);
+        return new ApiDtos.SegmentResponse(documentId, segmentId, sourceVersion, draftVersion);
+    }
+
+    /**
+     * 字幕源时段修订：仅字幕文档可用；校验时段合法且与其他段不重叠后，
+     * 推进源文版本（文本未变也推进，原批准随之失效须重审）并更新时段，草稿版本加一。
+     */
+    @Transactional
+    public ApiDtos.SegmentResponse reviseSubtitleSource(long documentId, String segmentId,
+                                                        ApiDtos.ReviseSubtitleSourceRequest request) {
+        DocumentRow document = lockDocument(documentId);
+        if (!MODE_SUBTITLE.equals(document.docMode())) {
+            throw ApiException.unprocessable("文档不是字幕模式: " + documentId);
+        }
+        SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
+        SubtitleTiming.durationOf(request.startMs(), request.endMs());
+        List<SegmentRow> segments = repository.listSegments(documentId);
+        List<long[]> intervals = new ArrayList<>();
+        List<String> labels = new ArrayList<>();
+        for (SegmentRow other : segments) {
+            if (other.segmentId().equals(segmentId)) {
+                intervals.add(SubtitleTiming.absoluteInterval(
+                        request.zeroPointMs(), request.startMs(), request.endMs()));
+            } else {
+                intervals.add(SubtitleTiming.absoluteInterval(
+                        other.zeroPointMs(), other.startMs(), other.endMs()));
+            }
+            labels.add(other.segmentId());
+        }
+        assertNoOverlap(intervals, labels);
+        int sourceVersion = segment.sourceVersion() + 1;
+        repository.updateSubtitleSegmentSource(documentId, segmentId, request.sourceText(), sourceVersion,
+                request.zeroPointMs(), request.startMs(), request.endMs());
         int draftVersion = bumpDraftVersion(document);
         return new ApiDtos.SegmentResponse(documentId, segmentId, sourceVersion, draftVersion);
     }
@@ -102,6 +173,11 @@ public class TranslationService {
         if (!violations.isEmpty()) {
             throw ApiException.termViolation("译文违反 " + violations.size() + " 条术语规则", violations);
         }
+        if (MODE_SUBTITLE.equals(document.docMode())) {
+            // 字幕译文阅读速率校验：超速 422 且不写稿
+            SubtitleTiming.assertReadingSpeed(SubtitleTiming.countCodePoints(request.content()),
+                    SubtitleTiming.durationOf(segment.startMs(), segment.endMs()));
+        }
         int translationVersion = repository.findTranslation(documentId, segmentId, normalizedLanguage)
                 .map(TranslationRow::translationVersion).orElse(0) + 1;
         repository.upsertTranslation(documentId, new TranslationRow(segmentId, normalizedLanguage,
@@ -115,7 +191,7 @@ public class TranslationService {
     @Transactional
     public ApiDtos.ApprovalResponse approveTranslation(long documentId, String segmentId, String language,
                                                        String actorId, ApiDtos.ApproveTranslationRequest request) {
-        lockDocument(documentId);
+        DocumentRow document = lockDocument(documentId);
         String normalizedLanguage = normalizeLanguage(language);
         SegmentRow segment = findSegmentOrThrow(documentId, segmentId);
         TranslationRow translation = repository.findTranslation(documentId, segmentId, normalizedLanguage)
@@ -131,6 +207,12 @@ public class TranslationService {
         if (translation.sourceVersion() != segment.sourceVersion()) {
             throw ApiException.unprocessable("译文基于源文版本 " + translation.sourceVersion()
                     + "，当前源文版本 " + segment.sourceVersion() + "，译文待更新，不能批准");
+        }
+        if (MODE_SUBTITLE.equals(document.docMode())) {
+            // 批准前重新检查当前时间轴：任一段重叠或该译文按当前时段超速，整次 422
+            assertTimelineNoOverlap(repository.listSegments(documentId));
+            SubtitleTiming.assertReadingSpeed(SubtitleTiming.countCodePoints(translation.content()),
+                    SubtitleTiming.durationOf(segment.startMs(), segment.endMs()));
         }
         repository.upsertApproval(documentId, new ApprovalRow(segmentId, normalizedLanguage, actorId,
                 segment.sourceVersion(), translation.translationVersion()));
@@ -189,6 +271,11 @@ public class TranslationService {
                     + request.expectedDraftVersion() + "/" + request.expectedPublishedVersion() + " 不一致");
         }
         List<SegmentRow> segments = repository.listSegments(documentId);
+        boolean subtitle = MODE_SUBTITLE.equals(document.docMode());
+        if (subtitle) {
+            // 发布前重新检查当前时间轴：任一段重叠整次 422
+            assertTimelineNoOverlap(segments);
+        }
         Map<String, TranslationRow> translations = repository.listTranslations(documentId).stream()
                 .collect(Collectors.toMap(t -> key(t.segmentId(), t.language()), Function.identity()));
         Map<String, ApprovalRow> approvals = repository.listApprovals(documentId).stream()
@@ -221,6 +308,11 @@ public class TranslationService {
                         || approval.sourceVersion() != segment.sourceVersion()) {
                     throw ApiException.unprocessable("批准已失效: " + segment.segmentId() + "/" + language
                             + "，源文或译文版本已改变");
+                }
+                if (subtitle) {
+                    // 发布前按当前时段重新校验阅读速率：任一超速整次 422
+                    SubtitleTiming.assertReadingSpeed(SubtitleTiming.countCodePoints(translation.content()),
+                            SubtitleTiming.durationOf(segment.startMs(), segment.endMs()));
                 }
                 termViolations.addAll(findViolations(
                         segment.sourceText(), language, translation.content(), termRules));
@@ -307,6 +399,38 @@ public class TranslationService {
         return draftVersion;
     }
 
+    /**
+     * 字幕时间轴重叠检查：按绝对起始毫秒排序，左闭右开区间相邻不重叠，
+     * 后段绝对起始早于前段绝对结束即重叠，整次 422。
+     */
+    private static void assertNoOverlap(List<long[]> intervals, List<String> labels) {
+        List<Integer> order = new ArrayList<>();
+        for (int i = 0; i < intervals.size(); i++) {
+            order.add(i);
+        }
+        order.sort((a, b) -> Long.compare(intervals.get(a)[0], intervals.get(b)[0]));
+        for (int i = 1; i < order.size(); i++) {
+            long[] previous = intervals.get(order.get(i - 1));
+            long[] current = intervals.get(order.get(i));
+            if (current[0] < previous[1]) {
+                throw ApiException.unprocessable("字幕时段重叠: " + labels.get(order.get(i - 1))
+                        + " 与 " + labels.get(order.get(i)));
+            }
+        }
+    }
+
+    /** 从当前段落行构建时间轴并检查重叠；字幕段的时段字段必然非空。 */
+    private static void assertTimelineNoOverlap(List<SegmentRow> segments) {
+        List<long[]> intervals = new ArrayList<>();
+        List<String> labels = new ArrayList<>();
+        for (SegmentRow segment : segments) {
+            intervals.add(SubtitleTiming.absoluteInterval(
+                    segment.zeroPointMs(), segment.startMs(), segment.endMs()));
+            labels.add(segment.segmentId());
+        }
+        assertNoOverlap(intervals, labels);
+    }
+
     private static String key(String segmentId, String language) {
         return segmentId + " " + language;
     }
@@ -352,7 +476,9 @@ public class TranslationService {
                                      Map<String, TranslationRow> translations,
                                      Map<String, ApprovalRow> approvals, List<TermRuleRow> termRules) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
+        boolean subtitle = MODE_SUBTITLE.equals(document.docMode());
         snapshot.put("documentId", document.documentId());
+        snapshot.put("mode", document.docMode());
         snapshot.put("publishedVersion", publishedVersion);
         snapshot.put("draftVersion", document.draftVersion());
         snapshot.put("termVersion", document.termVersion());
@@ -372,6 +498,12 @@ public class TranslationService {
             segmentJson.put("segmentId", segment.segmentId());
             segmentJson.put("sourceText", segment.sourceText());
             segmentJson.put("sourceVersion", segment.sourceVersion());
+            if (subtitle) {
+                // 字幕段冻结时段：相对零点（UTC 毫秒）与起止毫秒
+                segmentJson.put("zeroPointMs", segment.zeroPointMs());
+                segmentJson.put("startMs", segment.startMs());
+                segmentJson.put("endMs", segment.endMs());
+            }
             List<Map<String, Object>> translationList = new ArrayList<>();
             for (String language : document.targetLanguages()) {
                 TranslationRow translation = translations.get(key(segment.segmentId(), language));
@@ -384,6 +516,10 @@ public class TranslationService {
                 translationJson.put("sourceVersion", translation.sourceVersion());
                 translationJson.put("termVersion", translation.termVersion());
                 translationJson.put("reviewer", approval.reviewer());
+                if (subtitle) {
+                    // 字幕译文冻结去空白后的码点数，与批准依据（审核人及版本）一同固化
+                    translationJson.put("codePointCount", SubtitleTiming.countCodePoints(translation.content()));
+                }
                 translationList.add(translationJson);
             }
             segmentJson.put("translations", translationList);

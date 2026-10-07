@@ -65,6 +65,34 @@ public final class ApiDtos {
             @PositiveOrZero(message = "expectedPublishedVersion 不能为负数") int expectedPublishedVersion) {
     }
 
+    /** 字幕段输入：源段附 UTC 毫秒相对零点及非负起止毫秒，区间左闭右开、长度至少 500 毫秒。 */
+    public record SubtitleSegmentInput(
+            @NotBlank(message = "segmentId 不能为空") @Size(max = 64) String segmentId,
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            @NotNull(message = "zeroPointMs 不能为空") Long zeroPointMs,
+            @NotNull(message = "startMs 不能为空") @PositiveOrZero(message = "startMs 不能为负数") Long startMs,
+            @NotNull(message = "endMs 不能为空") @PositiveOrZero(message = "endMs 不能为负数") Long endMs) {
+    }
+
+    /** 建字幕文档请求：非空操作者、全局 requestId、1~5 种目标语言及带时段的初始字幕段。 */
+    public record CreateSubtitleDocumentRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "operator 不能为空") @Size(max = 128) String operator,
+            @NotNull(message = "targetLanguages 不能为空") @Size(min = 1, max = 5, message = "目标语言须为 1~5 种")
+            List<@NotBlank(message = "语言码不能为空") String> targetLanguages,
+            @NotNull(message = "segments 不能为空") List<@Valid SubtitleSegmentInput> segments) {
+    }
+
+    /** 字幕源时段修订请求：推进源版本并失效原批准，文本未变也须重审。 */
+    public record ReviseSubtitleSourceRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @NotBlank(message = "operator 不能为空") @Size(max = 128) String operator,
+            @NotBlank(message = "sourceText 不能为空") String sourceText,
+            @NotNull(message = "zeroPointMs 不能为空") Long zeroPointMs,
+            @NotNull(message = "startMs 不能为空") @PositiveOrZero(message = "startMs 不能为负数") Long startMs,
+            @NotNull(message = "endMs 不能为空") @PositiveOrZero(message = "endMs 不能为负数") Long endMs) {
+    }
+
     /** 术语规则输入：sourceTerm 区分大小写，requiredTranslation 非空。 */
     public record TermRuleInput(
             @NotBlank(message = "sourceTerm 不能为空") @Size(max = 512) String sourceTerm,
@@ -81,7 +109,7 @@ public final class ApiDtos {
     }
 
     /** 建文档响应。 */
-    public record DocumentResponse(long documentId, int draftVersion, int publishedVersion,
+    public record DocumentResponse(long documentId, String mode, int draftVersion, int publishedVersion,
                                    List<String> targetLanguages) {
     }
 

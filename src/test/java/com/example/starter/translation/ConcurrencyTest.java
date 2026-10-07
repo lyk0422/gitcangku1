@@ -59,6 +59,48 @@ class ConcurrencyTest extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("并发提交字幕译文：多段并发提交全部通过速率校验，草稿版本无丢失更新")
+    void concurrentSubtitleSubmits() throws Exception {
+        int segmentCount = 5;
+        StringBuilder segments = new StringBuilder("[");
+        for (int i = 1; i <= segmentCount; i++) {
+            if (i > 1) {
+                segments.append(',');
+            }
+            long start = (long) (i - 1) * 1000;
+            segments.append("{\"segmentId\":\"s").append(i).append("\",\"sourceText\":\"原文").append(i)
+                    .append("\",\"zeroPointMs\":1700000000000,\"startMs\":").append(start)
+                    .append(",\"endMs\":").append(start + 1000).append('}');
+        }
+        segments.append(']');
+        long docId = createSubtitleDocument(newRequestId(), "op1", "[\"en\"]", segments.toString());
+
+        ExecutorService pool = Executors.newFixedThreadPool(segmentCount);
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<ApiResult>> futures = new ArrayList<>();
+        for (int i = 1; i <= segmentCount; i++) {
+            final String segmentId = "s" + i;
+            futures.add(pool.submit(() -> {
+                gate.await();
+                return submitTranslation(docId, segmentId, "en", "alice", "译文" + segmentId, 1,
+                        newRequestId());
+            }));
+        }
+        gate.countDown();
+        for (Future<ApiResult> future : futures) {
+            assertThat(future.get(30, TimeUnit.SECONDS).status()).isEqualTo(200);
+        }
+        pool.shutdown();
+
+        Integer draftVersion = jdbc.queryForObject(
+                "SELECT draft_version FROM document WHERE document_id = ?", Integer.class, docId);
+        assertThat(draftVersion).isEqualTo(1 + segmentCount);
+        Integer translations = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM translation WHERE document_id = ?", Integer.class, docId);
+        assertThat(translations).isEqualTo(segmentCount);
+    }
+
+    @Test
     @DisplayName("并发同 requestId 同参：仅执行一次，全部重放同一成功结果")
     void concurrentSameRequestId() throws Exception {
         String requestId = newRequestId();

@@ -130,6 +130,28 @@ public abstract class AbstractIntegrationTest {
         return putJson("/api/documents/" + documentId + "/terms", body);
     }
 
+    /** 建字幕文档并返回 documentId；segmentsJson 为带时段的字幕段数组 JSON。 */
+    protected long createSubtitleDocument(String requestId, String operator, String targetLanguagesJson,
+                                          String segmentsJson) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"operator\":\"" + operator
+                + "\",\"targetLanguages\":" + targetLanguagesJson + ",\"segments\":" + segmentsJson + "}";
+        ApiResult result = postJson("/api/documents/subtitle", body);
+        if (result.status() != 201) {
+            throw new IllegalStateException("建字幕文档失败: " + result.status() + " " + result.body());
+        }
+        return result.body().get("documentId").asLong();
+    }
+
+    /** 字幕源时段修订。 */
+    protected ApiResult reviseSubtitleSource(long documentId, String segmentId, String operator,
+                                             String sourceText, long zeroPointMs, long startMs, long endMs,
+                                             String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"operator\":\"" + operator
+                + "\",\"sourceText\":\"" + sourceText + "\",\"zeroPointMs\":" + zeroPointMs
+                + ",\"startMs\":" + startMs + ",\"endMs\":" + endMs + "}";
+        return putJson("/api/documents/" + documentId + "/segments/" + segmentId + "/subtitle-source", body);
+    }
+
     /** HTTP 响应结果：状态码与 JSON 响应体。 */
     protected record ApiResult(int status, JsonNode body) {
     }

@@ -47,6 +47,24 @@ public class TranslationController {
                 () -> WriteResult.of(201, translationService.createDocument(request))).toResponseEntity();
     }
 
+    /** 建字幕文档：非空操作者、1~5 种目标语言，初始字幕段带时段且无重叠。 */
+    @PostMapping("/subtitle")
+    public ResponseEntity<String> createSubtitleDocument(
+            @Valid @RequestBody ApiDtos.CreateSubtitleDocumentRequest request) {
+        return writeExecutor.execute(request.requestId(), hash("POST /api/documents/subtitle", request),
+                () -> WriteResult.of(201, translationService.createSubtitleDocument(request))).toResponseEntity();
+    }
+
+    /** 字幕源时段修订：推进源版本并失效原批准，文本未变也须重审。 */
+    @PutMapping("/{documentId}/segments/{segmentId}/subtitle-source")
+    public ResponseEntity<String> reviseSubtitleSource(@PathVariable long documentId, @PathVariable String segmentId,
+                                                       @Valid @RequestBody ApiDtos.ReviseSubtitleSourceRequest request) {
+        String operation = "PUT /api/documents/" + documentId + "/segments/" + segmentId + "/subtitle-source";
+        return writeExecutor.execute(request.requestId(), hash(operation, request),
+                () -> WriteResult.of(200, translationService.reviseSubtitleSource(documentId, segmentId, request)))
+                .toResponseEntity();
+    }
+
     /** 增加段落：文档草稿版本加一。 */
     @PostMapping("/{documentId}/segments")
     public ResponseEntity<String> addSegment(@PathVariable long documentId,

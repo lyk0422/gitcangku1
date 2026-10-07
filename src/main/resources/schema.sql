@@ -3,6 +3,7 @@
 
 CREATE TABLE IF NOT EXISTS document (
     document_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    doc_mode VARCHAR(16) NOT NULL DEFAULT 'standard',
     target_languages VARCHAR(255) NOT NULL,
     draft_version INT NOT NULL,
     published_version INT NOT NULL,
@@ -11,6 +12,7 @@ CREATE TABLE IF NOT EXISTS document (
 );
 COMMENT ON TABLE document IS '文档：全局唯一 documentId，含 1~5 种目标语言及草稿/发布/术语版本';
 COMMENT ON COLUMN document.document_id IS '全局唯一文档 ID，自增';
+COMMENT ON COLUMN document.doc_mode IS '文档模式：standard 普通文档（无时间轴），subtitle 字幕文档（段落带时段）';
 COMMENT ON COLUMN document.target_languages IS '目标语言列表，逗号分隔的小写语言码，1~5 种';
 COMMENT ON COLUMN document.draft_version IS '文档草稿版本，从 1 开始；增段落或修改源文/译文/术语时加一';
 COMMENT ON COLUMN document.published_version IS '已发布版本号，从 0 开始，每次成功发布加一';
@@ -22,13 +24,19 @@ CREATE TABLE IF NOT EXISTS segment (
     segment_id VARCHAR(64) NOT NULL,
     source_text LONGTEXT NOT NULL,
     source_version INT NOT NULL,
+    zero_point_ms BIGINT NULL,
+    start_ms BIGINT NULL,
+    end_ms BIGINT NULL,
     PRIMARY KEY (document_id, segment_id)
 );
-COMMENT ON TABLE segment IS '段落：文档内唯一 segmentId，含源文及源文版本';
+COMMENT ON TABLE segment IS '段落：文档内唯一 segmentId，含源文及源文版本；字幕文档另含时段';
 COMMENT ON COLUMN segment.document_id IS '所属文档 ID';
 COMMENT ON COLUMN segment.segment_id IS '文档内唯一段落 ID';
 COMMENT ON COLUMN segment.source_text IS '源文正文，UTF-8';
 COMMENT ON COLUMN segment.source_version IS '源文版本，从 1 开始，每次源文修订加一';
+COMMENT ON COLUMN segment.zero_point_ms IS '字幕段相对零点，UTC 毫秒（epoch）；普通文档为 NULL';
+COMMENT ON COLUMN segment.start_ms IS '字幕段起始毫秒，相对零点、非负，区间左闭；普通文档为 NULL';
+COMMENT ON COLUMN segment.end_ms IS '字幕段结束毫秒，相对零点，区间右开，end-start 至少 500；普通文档为 NULL';
 
 CREATE TABLE IF NOT EXISTS translation (
     document_id BIGINT NOT NULL,
