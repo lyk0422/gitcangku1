@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS batch (
     batch_no VARCHAR(64) NOT NULL COMMENT '批号，创建后不可修改',
     produced_at VARCHAR(40) NOT NULL COMMENT '生产时间，ISO-8601 UTC  instant 字符串',
     status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT',
+    version INT NOT NULL DEFAULT 0 COMMENT '批次版本号：初始 0，每次状态变更加 1；写命令可携带期望版本做乐观并发校验',
     created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_batch_key UNIQUE (batch_key)
 );
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS recall (
 );
 
 CREATE TABLE IF NOT EXISTS command_log (
-    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT',
+    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/SUBMIT_PRESSURE_PROFILE/APPROVE/RECALL/SPLIT',
     command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409',
     fingerprint VARCHAR(64) NOT NULL COMMENT '业务参数（不含 commandKey）的 SHA-256 摘要，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',
@@ -65,4 +66,19 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
+);
+
+-- 压力曲线检验：密封产品在单点检验之外的持续泄漏门禁；记录提交即冻结，不可改写。
+CREATE TABLE IF NOT EXISTS pressure_profile (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键；每批次仅一条压力曲线检验记录，拆分子批不继承须重新测',
+    request_id VARCHAR(64) NOT NULL COMMENT '全局幂等请求键；同参重放返回首次完整响应，异参 409，失败不占键',
+    operator VARCHAR(64) NOT NULL COMMENT '操作者标识，非空；同时作为检验人记录，不得担任该批次批准人',
+    point_count INT NOT NULL COMMENT '测量点数，2～10；首点秒数 0，末点至少 10，按秒严格递增',
+    points TEXT NOT NULL COMMENT '曲线节点规范序列化：offsetSeconds:pressureKpa 逗号分隔，压力按值规范化（去尾零），单位千帕；节点顺序属于曲线身份',
+    cumulative_descent VARCHAR(64) NOT NULL COMMENT '累计下降：各下降段正下降之和（上升段不抵扣，不以首末差代替），精确十进制，单位千帕',
+    max_descent_rate VARCHAR(64) NOT NULL COMMENT '最大逐段下降速率，单位千帕/秒，展示精度 10 位小数；门禁判定使用精确交叉乘，不提前舍入',
+    outcome VARCHAR(8) NOT NULL COMMENT '检验结论：PASS/FAIL；FAIL 立即使批次 REJECTED，合法失败曲线保留不可改为 PASS',
+    created_at VARCHAR(40) NOT NULL COMMENT '提交时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_pressure_profile_batch UNIQUE (batch_key)
 );

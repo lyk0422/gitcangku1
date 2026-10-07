@@ -6,10 +6,12 @@ import com.example.starter.batch.dto.BatchHistoryResponse;
 import com.example.starter.batch.dto.BatchResponse;
 import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
+import com.example.starter.batch.dto.PressureProfileResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.RecallResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
+import com.example.starter.batch.dto.SubmitPressureProfileRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import com.example.starter.batch.dto.TestResultResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -47,9 +49,16 @@ public class BatchService {
 
     private static final String CMD_CREATE = "CREATE_BATCH";
     private static final String CMD_TEST = "SUBMIT_TEST";
+    private static final String CMD_PRESSURE_PROFILE = "SUBMIT_PRESSURE_PROFILE";
     private static final String CMD_APPROVE = "APPROVE";
     private static final String CMD_RECALL = "RECALL";
     private static final String CMD_SPLIT = "SPLIT";
+
+    /**
+     * 压力曲线检验在 test_result 中的保留检验项名：曲线结论同步写入 test_result，
+     * 复用原状态机（FAIL→REJECTED）与历史快照；该名称不属于任何批次必做项。
+     */
+    private static final String PRESSURE_PROFILE_ITEM = "PRESSURE_PROFILE";
 
     /**
      * 指纹拼接分隔符（NUL）：业务参数不可能包含该字符，避免拼接碰撞。
@@ -86,12 +95,12 @@ public class BatchService {
             });
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now, 0));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
             BatchResponse body = new BatchResponse(req.batchKey(), req.productCode(), req.batchNo(),
-                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now));
+                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now), 0);
             return new StoredResponse(201, toJson(body));
         });
     }
@@ -151,6 +160,75 @@ public class BatchService {
             }
             TestResultResponse body = new TestResultResponse(batchKey, req.testKey(), req.testItem(),
                     req.result(), req.inspector(), newStatus, Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
+     * 提交压力曲线检验：密封产品单点检验之外的持续泄漏门禁。
+     * 曲线语法非法返回 400，不留检验记录、不占 requestId；合法曲线任一门禁不满足记录 FAIL
+     * 并使批次进入 REJECTED，记录保留不可改为 PASS；PASS 后仍需原必做检验项与两角色批准。
+     * 与检验/批准/拆分/祖先召回按批次行锁串行裁决；曲线节点与逐段下降提交即冻结。
+     */
+    public StoredResponse submitPressureProfile(String batchKey, SubmitPressureProfileRequest req) {
+        // 语法校验在事务外完成：非法曲线 400，既不写检验记录也不占用 requestId（失败不占键）
+        List<PressureCurveEvaluator.Point> points = req.points().stream()
+                .map(p -> new PressureCurveEvaluator.Point(p.offsetSeconds(), p.pressureKpa()))
+                .toList();
+        PressureCurveEvaluator.validateSyntax(points);
+        String operator = req.operator();
+        String canonicalPoints = canonicalPoints(points);
+        // 结构化指纹：操作 + 资源 + 操作者 + 期望版本 + 全参数（十进制按值、文本原样）
+        String fingerprint = fingerprint("pressure-profile", batchKey, operator,
+                req.expectedVersion() == null ? "" : req.expectedVersion().toString(),
+                canonicalPoints);
+        return executeIdempotent(CMD_PRESSURE_PROFILE, req.requestId(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            // 批次行锁后重查命令快照：并发同 requestId 请求在锁等待期间可能已由对方提交
+            var logged = loggedResponse(CMD_PRESSURE_PROFILE, req.requestId(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            assertNoRecalledAncestor(batchKey);
+            BatchStatus status = BatchStatus.valueOf(batch.status());
+            if (status == BatchStatus.REJECTED || status == BatchStatus.RELEASED
+                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT) {
+                throw ApiException.conflict("批次状态 " + status + " 不允许提交压力曲线检验");
+            }
+            if (req.expectedVersion() != null
+                    && req.expectedVersion().longValue() != batch.version()) {
+                throw ApiException.conflict("期望版本 " + req.expectedVersion()
+                        + " 与批次当前版本 " + batch.version() + " 不一致");
+            }
+            if (repo.findPressureProfile(batchKey).isPresent()) {
+                throw ApiException.conflict("该批次已存在压力曲线检验记录，不可改写: " + batchKey);
+            }
+            PressureCurveEvaluator.Evaluation evaluation = PressureCurveEvaluator.evaluate(points);
+            String now = now();
+            repo.insertPressureProfile(new BatchRepository.PressureProfileRow(0L, batchKey,
+                    req.requestId(), operator, points.size(), canonicalPoints,
+                    evaluation.cumulativeDescentKpa().toPlainString(),
+                    evaluation.maxDescentRateKpaPerSec().toPlainString(),
+                    evaluation.outcome().name(), now));
+            // 同步写入 test_result（保留检验项名 PRESSURE_PROFILE），复用原状态机与历史快照
+            repo.insertTest(new BatchRepository.TestRow(0L, batchKey, req.requestId(),
+                    PRESSURE_PROFILE_ITEM, evaluation.outcome().name(), operator, now));
+            BatchStatus newStatus = status;
+            if (evaluation.outcome() == TestOutcome.FAIL) {
+                newStatus = BatchStatus.REJECTED;
+            } else if (status == BatchStatus.QUARANTINED
+                    && allRequiredPassed(batchKey, repo.findRequiredTests(batchKey))) {
+                newStatus = BatchStatus.PENDING_RELEASE;
+            }
+            if (newStatus != status) {
+                repo.updateStatus(batchKey, newStatus.name());
+            }
+            PressureProfileResponse body = new PressureProfileResponse(batchKey, req.requestId(),
+                    operator, points.size(), canonicalPoints,
+                    evaluation.cumulativeDescentKpa().toPlainString(),
+                    evaluation.maxDescentRateKpaPerSec().toPlainString(),
+                    evaluation.outcome(), newStatus, Instant.parse(now));
             return new StoredResponse(201, toJson(body));
         });
     }
@@ -286,7 +364,19 @@ public class BatchService {
                 .map(r -> new RecallResponse(r.batchKey(), r.actorId(), r.reason(),
                         BatchStatus.RECALLED, Instant.parse(r.createdAt())))
                 .orElse(null);
-        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall);
+        // 压力曲线检验快照：批次状态取对应 test_result 行的提交后快照，与检验列表口径一致
+        PressureProfileResponse pressureProfile = repo.findPressureProfile(batchKey)
+                .map(p -> {
+                    BatchStatus snapshot = testRows.stream()
+                            .filter(t -> t.testKey().equals(p.requestId()))
+                            .findFirst()
+                            .map(t -> snapshotAfter(t, testRows, required))
+                            .orElse(BatchStatus.valueOf(batch.status()));
+                    return toProfileResponse(p, snapshot);
+                })
+                .orElse(null);
+        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall,
+                pressureProfile);
     }
 
     /**
@@ -343,13 +433,36 @@ public class BatchService {
     private BatchResponse toBatchResponse(BatchRepository.BatchRow row) {
         return new BatchResponse(row.batchKey(), row.productCode(), row.batchNo(),
                 Instant.parse(row.producedAt()), BatchStatus.valueOf(row.status()),
-                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()));
+                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()), row.version());
     }
 
     private TestResultResponse toTestResponse(BatchRepository.TestRow row, String batchStatus) {
         return new TestResultResponse(row.batchKey(), row.testKey(), row.testItem(),
                 TestOutcome.valueOf(row.outcome()), row.inspector(),
                 BatchStatus.valueOf(batchStatus), Instant.parse(row.createdAt()));
+    }
+
+    /**
+     * 曲线节点规范序列化：offsetSeconds:pressureKpa 逗号分隔；压力按值规范化（去尾零、
+     * 零值统一为 "0"），节点顺序即提交顺序（顺序属于曲线身份，不重排）。
+     */
+    private String canonicalPoints(List<PressureCurveEvaluator.Point> points) {
+        List<String> parts = points.stream()
+                .map(p -> p.offsetSeconds() + ":" + canonicalPressure(p.pressureKpa()))
+                .toList();
+        return String.join(",", parts);
+    }
+
+    private String canonicalPressure(java.math.BigDecimal pressure) {
+        java.math.BigDecimal stripped = pressure.stripTrailingZeros();
+        return (stripped.signum() == 0 ? java.math.BigDecimal.ZERO : stripped).toPlainString();
+    }
+
+    private PressureProfileResponse toProfileResponse(BatchRepository.PressureProfileRow row,
+                                                      BatchStatus batchStatus) {
+        return new PressureProfileResponse(row.batchKey(), row.requestId(), row.operator(),
+                row.pointCount(), row.points(), row.cumulativeDescent(), row.maxDescentRate(),
+                TestOutcome.valueOf(row.outcome()), batchStatus, Instant.parse(row.createdAt()));
     }
 
     /**
@@ -459,7 +572,7 @@ public class BatchService {
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now, 0));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }

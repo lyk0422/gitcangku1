@@ -14,10 +14,10 @@ import java.util.Optional;
 public class BatchRepository {
 
     /**
-     * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
+     * batch 表行记录；id 同时作为同批次事件的提交顺序依据；version 随每次状态变更加 1。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, String status, String createdAt, int version) {
     }
 
     /**
@@ -54,10 +54,18 @@ public class BatchRepository {
     public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
     }
 
+    /**
+     * pressure_profile 表行记录：压力曲线检验，提交即冻结，不可改写。
+     */
+    public record PressureProfileRow(long id, String batchKey, String requestId, String operator,
+                                     int pointCount, String points, String cumulativeDescent,
+                                     String maxDescentRate, String outcome, String createdAt) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
-            rs.getString("status"), rs.getString("created_at"));
+            rs.getString("status"), rs.getString("created_at"), rs.getInt("version"));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("test_key"),
@@ -80,6 +88,13 @@ public class BatchRepository {
     private static final RowMapper<LineageRow> LINEAGE_MAPPER = (rs, n) -> new LineageRow(
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
             rs.getInt("seq"), rs.getString("created_at"));
+
+    private static final RowMapper<PressureProfileRow> PRESSURE_PROFILE_MAPPER = (rs, n) ->
+            new PressureProfileRow(rs.getLong("id"), rs.getString("batch_key"),
+                    rs.getString("request_id"), rs.getString("operator"),
+                    rs.getInt("point_count"), rs.getString("points"),
+                    rs.getString("cumulative_descent"), rs.getString("max_descent_rate"),
+                    rs.getString("outcome"), rs.getString("created_at"));
 
     private final JdbcTemplate jdbc;
 
@@ -119,7 +134,8 @@ public class BatchRepository {
     }
 
     public void updateStatus(String batchKey, String status) {
-        jdbc.update("UPDATE batch SET status = ? WHERE batch_key = ?", status, batchKey);
+        jdbc.update("UPDATE batch SET status = ?, version = version + 1 WHERE batch_key = ?",
+                status, batchKey);
     }
 
     public List<BatchRow> findAvailableBatches() {
@@ -208,5 +224,23 @@ public class BatchRepository {
     public List<String> findRecalledKeys() {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
+    }
+
+    /**
+     * 某批次的压力曲线检验记录；每批次至多一条，拆分子批不继承。
+     */
+    public Optional<PressureProfileRow> findPressureProfile(String batchKey) {
+        return jdbc.query("SELECT * FROM pressure_profile WHERE batch_key = ?",
+                        PRESSURE_PROFILE_MAPPER, batchKey)
+                .stream().findFirst();
+    }
+
+    public void insertPressureProfile(PressureProfileRow row) {
+        jdbc.update("INSERT INTO pressure_profile (batch_key, request_id, operator, point_count,"
+                        + " points, cumulative_descent, max_descent_rate, outcome, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.requestId(), row.operator(), row.pointCount(),
+                row.points(), row.cumulativeDescent(), row.maxDescentRate(),
+                row.outcome(), row.createdAt());
     }
 }

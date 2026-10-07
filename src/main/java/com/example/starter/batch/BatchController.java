@@ -7,6 +7,7 @@ import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
+import com.example.starter.batch.dto.SubmitPressureProfileRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
@@ -50,6 +51,16 @@ public class BatchController {
     public ResponseEntity<String> submitTest(@PathVariable String batchKey,
                                              @Valid @RequestBody SubmitTestRequest request) {
         return stored(service.submitTest(batchKey, request));
+    }
+
+    /**
+     * 提交压力曲线检验：密封产品的持续泄漏门禁；requestId 全局幂等，曲线非法 400 不留痕。
+     */
+    @PostMapping("/{batchKey}/pressure-profiles")
+    public ResponseEntity<String> submitPressureProfile(
+            @PathVariable String batchKey,
+            @Valid @RequestBody SubmitPressureProfileRequest request) {
+        return stored(service.submitPressureProfile(batchKey, request));
     }
 
     /**

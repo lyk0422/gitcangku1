@@ -6,7 +6,8 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * 批次概要响应。producedAt/createdAt 为 UTC instant。
+ * 批次概要响应。producedAt/createdAt 为 UTC instant；version 为批次版本号，
+ * 初始 0，每次状态变更加 1，写命令可携带期望版本做乐观并发校验。
  */
 public record BatchResponse(
         String batchKey,
@@ -15,6 +16,7 @@ public record BatchResponse(
         Instant producedAt,
         BatchStatus status,
         List<String> requiredTests,
-        Instant createdAt
+        Instant createdAt,
+        int version
 ) {
 }
