@@ -1,8 +1,10 @@
 package com.example.starter.playout;
 
+import com.example.starter.playout.PlayoutRepository.DraftCompanionRow;
 import com.example.starter.playout.PlayoutRepository.DraftRow;
 import com.example.starter.playout.PlayoutRepository.GrantRow;
 import com.example.starter.playout.PlayoutRepository.OverrideRow;
+import com.example.starter.playout.PlayoutRepository.PublicationCompanionRow;
 import com.example.starter.playout.PlayoutRepository.PublicationRow;
 import com.example.starter.playout.PlayoutRepository.PublicationSegmentRow;
 import com.example.starter.playout.PlayoutRepository.RequestRow;
@@ -10,6 +12,8 @@ import com.example.starter.playout.PlayoutRepository.SegmentRow;
 import com.example.starter.playout.api.ApiException;
 import com.example.starter.playout.api.Dtos.AssetResponse;
 import com.example.starter.playout.api.Dtos.ChannelResponse;
+import com.example.starter.playout.api.Dtos.CompanionInput;
+import com.example.starter.playout.api.Dtos.CompanionResponse;
 import com.example.starter.playout.api.Dtos.CreateAssetRequest;
 import com.example.starter.playout.api.Dtos.CreateChannelRequest;
 import com.example.starter.playout.api.Dtos.CreateEmergencyOverrideRequest;
@@ -28,6 +32,7 @@ import com.example.starter.playout.api.Dtos.SegmentInput;
 import com.example.starter.playout.api.Dtos.SegmentResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -40,10 +45,14 @@ import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 /**
  * 播出编排核心服务：素材、频道、授权、草稿、发布与播出决定。
@@ -158,7 +167,8 @@ public class PlayoutService {
                 .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
 
         String hash = sha256(OP_REPLACE_DRAFT + "|" + channelId + "|" + businessDay
-                + "|" + request.expectedDraftVersion() + "|" + canonicalSegments(request.segments()));
+                + "|" + request.operator() + "|" + request.expectedDraftVersion()
+                + "|" + canonicalSegments(request.segments()));
         return idempotent(request.requestId(), OP_REPLACE_DRAFT, hash, DraftResponse.class, () -> {
             List<ValidatedSegment> segments = validateSegments(channelId, businessDay, request.segments());
             long newVersion;
@@ -180,9 +190,15 @@ public class PlayoutService {
                 newVersion = request.expectedDraftVersion() + 1;
             }
             repo.deleteDraftSegments(channelId, businessDay);
+            repo.deleteDraftCompanions(channelId, businessDay);
             for (ValidatedSegment segment : segments) {
                 repo.insertDraftSegment(segment.id(), channelId, businessDay,
                         segment.assetId(), segment.startMs(), segment.endMs());
+                for (int i = 0; i < segment.companions().size(); i++) {
+                    ValidatedCompanion companion = segment.companions().get(i);
+                    repo.insertDraftCompanion(segment.id(), channelId, businessDay,
+                            companion.assetId(), companion.grantId(), i, nowMs());
+                }
             }
             return new DraftResponse(channelId, businessDay.toString(), newVersion,
                     segments.stream().map(ValidatedSegment::toResponse).toList());
@@ -201,11 +217,15 @@ public class PlayoutService {
                 .orElseThrow(() -> ApiException.notFound("频道不存在: " + channelId));
 
         String hash = sha256(OP_PUBLISH + "|" + channelId + "|" + businessDay
-                + "|" + request.draftVersion() + "|" + request.expectedPublishedVersion());
+                + "|" + request.operator() + "|" + request.draftVersion()
+                + "|" + request.expectedPublishedVersion());
         return idempotent(request.requestId(), OP_PUBLISH, hash, PublishResponse.class, () -> {
             DraftRow draft = repo.findDraft(channelId, businessDay)
                     .orElseThrow(() -> ApiException.notFound("草稿不存在: " + channelId + " " + businessDay));
             List<SegmentRow> segments = repo.findDraftSegments(channelId, businessDay);
+            Map<String, List<DraftCompanionRow>> companionsBySegment = repo
+                    .findDraftCompanions(channelId, businessDay).stream()
+                    .collect(Collectors.groupingBy(DraftCompanionRow::segmentId));
             if (draft.version() != request.draftVersion()) {
                 throw ApiException.conflict("DRAFT_VERSION_CONFLICT",
                         "草稿版本不符，当前 " + draft.version());
@@ -220,6 +240,13 @@ public class PlayoutService {
                 GrantRow grant = selectCoveringGrantForUpdate(channelId, segment);
                 grantIds.add(grant.id());
             }
+            // 伴随轨指定授权逐条加锁复核：频道与素材一致、未撤销、完整覆盖区间，任一失效整次发布 422。
+            for (SegmentRow segment : segments) {
+                for (DraftCompanionRow companion
+                        : companionsBySegment.getOrDefault(segment.id(), List.of())) {
+                    checkCompanionGrantForUpdate(channelId, segment, companion);
+                }
+            }
             long newVersion = currentPublished + 1;
             long publicationId;
             try {
@@ -233,6 +260,13 @@ public class PlayoutService {
                 SegmentRow segment = segments.get(i);
                 repo.insertPublicationSegment(publicationId, segment.id(), segment.assetId(),
                         grantIds.get(i), segment.startMs(), segment.endMs());
+                // 冻结伴随轨成员身份、授权与源区间，快照之后不按当前状态重算。
+                for (DraftCompanionRow companion
+                        : companionsBySegment.getOrDefault(segment.id(), List.of())) {
+                    repo.insertPublicationCompanion(publicationId, segment.id(),
+                            companion.assetId(), companion.grantId(), companion.seqNo(),
+                            segment.startMs(), segment.endMs());
+                }
             }
             return new PublishResponse(publicationId, channelId, businessDay.toString(),
                     newVersion, draft.version());
@@ -256,8 +290,9 @@ public class PlayoutService {
         Optional<OverrideRow> override = selectActiveOverrideAt(channelId, atMs);
         if (override.isPresent()) {
             OverrideRow hit = override.get();
+            // 插播命中时只播放原插播素材，无日片段伴随。
             return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
-                    DecisionSource.EMERGENCY, null, null, null, hit.overrideKey());
+                    DecisionSource.EMERGENCY, null, null, null, hit.overrideKey(), List.of());
         }
 
         LocalDate businessDay = at.atZoneSameInstant(ZONE).toLocalDate();
@@ -277,15 +312,30 @@ public class PlayoutService {
         GrantRow grant = repo.findGrant(hit.grantId())
                 .orElseThrow(() -> ApiException.unprocessable("SNAPSHOT_INCOMPLETE",
                         "发布快照引用的授权不存在: " + hit.grantId()));
-        if (grant.revoked()) {
+        List<PublicationCompanionRow> companions =
+                repo.findPublicationCompanions(publication.get().id(), hit.segmentId());
+        List<GrantRow> companionGrants = new ArrayList<>();
+        for (PublicationCompanionRow companion : companions) {
+            companionGrants.add(repo.findGrant(companion.grantId())
+                    .orElseThrow(() -> ApiException.unprocessable("SNAPSHOT_INCOMPLETE",
+                            "发布快照伴随轨引用的授权不存在: " + companion.grantId())));
+        }
+        // 主素材或任一伴随授权当前失效：整个片段回退频道保底素材，伴随集合为空，快照不改写。
+        boolean anyRevoked = grant.revoked()
+                || companionGrants.stream().anyMatch(GrantRow::revoked);
+        if (anyRevoked) {
             return new PlayoutDecisionResponse(channelId, at, channel.fallbackAssetId(),
                     DecisionSource.FALLBACK,
                     FallbackReason.GRANT_REVOKED,
-                    publication.get().id(), hit.segmentId(), null);
+                    publication.get().id(), hit.segmentId(), null, List.of());
+        }
+        List<CompanionResponse> companionResponses = new ArrayList<>();
+        for (PublicationCompanionRow companion : companions) {
+            companionResponses.add(new CompanionResponse(companion.assetId(), companion.grantId()));
         }
         return new PlayoutDecisionResponse(channelId, at, hit.assetId(),
                 DecisionSource.PROGRAM, null,
-                publication.get().id(), hit.segmentId(), null);
+                publication.get().id(), hit.segmentId(), null, companionResponses);
     }
 
     /**
@@ -455,7 +505,8 @@ public class PlayoutService {
             }
             String id = input.id() == null || input.id().isBlank()
                     ? UUID.randomUUID().toString() : input.id();
-            segments.add(new ValidatedSegment(id, input.assetId(), startMs, endMs));
+            segments.add(new ValidatedSegment(id, input.assetId(), startMs, endMs,
+                    validateCompanionSyntax(input)));
         }
 
         List<ValidatedSegment> sorted = segments.stream()
@@ -479,8 +530,78 @@ public class PlayoutService {
                 throw ApiException.unprocessable("NO_COVERING_GRANT",
                         "片段未被单条有效授权完整覆盖: " + segment.id());
             }
+            for (ValidatedCompanion companion : segment.companions()) {
+                validateCompanionGrant(channelId, segment, companion);
+            }
         }
         return segments;
+    }
+
+    /**
+     * 伴随轨语法校验：最多 2 条、素材与授权必填、同素材不得重复（400）。
+     * 伴随轨与主片段同 UTC 毫秒起止，区间沿用主片段。
+     */
+    private List<ValidatedCompanion> validateCompanionSyntax(SegmentInput input) {
+        List<CompanionInput> companions = input.companions() == null
+                ? List.of() : input.companions();
+        if (companions.size() > 2) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "COMPANION_LIMIT_EXCEEDED",
+                    "每个片段最多 2 条伴随轨: " + input.id());
+        }
+        Set<String> seenAssets = new HashSet<>();
+        List<ValidatedCompanion> result = new ArrayList<>();
+        for (CompanionInput companion : companions) {
+            if (companion == null || companion.assetId() == null || companion.assetId().isBlank()
+                    || companion.grantId() == null) {
+                throw ApiException.badRequest("伴随轨素材与授权不能为空: " + input.id());
+            }
+            if (!seenAssets.add(companion.assetId())) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "DUPLICATE_COMPANION_ASSET",
+                        "同一片段伴随轨素材重复: " + companion.assetId());
+            }
+            result.add(new ValidatedCompanion(companion.assetId(), companion.grantId()));
+        }
+        return result;
+    }
+
+    /** 伴随轨授权校验：素材存在、授权存在且属于该频道与素材、未撤销、完整覆盖片段区间。 */
+    private void validateCompanionGrant(String channelId, ValidatedSegment segment,
+                                        ValidatedCompanion companion) {
+        if (repo.findAsset(companion.assetId()).isEmpty()) {
+            throw ApiException.notFound("伴随素材不存在: " + companion.assetId());
+        }
+        GrantRow grant = repo.findGrant(companion.grantId())
+                .orElseThrow(() -> ApiException.notFound("伴随授权不存在: " + companion.grantId()));
+        checkCompanionGrant(channelId, segment.id(),
+                segment.startMs(), segment.endMs(), companion, grant);
+    }
+
+    /** 发布时伴随轨授权复核（行锁）：与撤销事务按提交顺序串行，撤销先提交则 422 拒绝整次发布。 */
+    private void checkCompanionGrantForUpdate(String channelId, SegmentRow segment,
+                                              DraftCompanionRow companion) {
+        GrantRow grant = repo.findGrantForUpdate(companion.grantId())
+                .orElseThrow(() -> ApiException.unprocessable("GRANT_INVALID",
+                        "伴随授权不存在，发布拒绝: " + companion.grantId()));
+        checkCompanionGrant(channelId, segment.id(),
+                segment.startMs(), segment.endMs(),
+                new ValidatedCompanion(companion.assetId(), companion.grantId()), grant);
+    }
+
+    private void checkCompanionGrant(String channelId, String segmentId,
+                                     long startMs, long endMs,
+                                     ValidatedCompanion companion, GrantRow grant) {
+        if (!grant.channelId().equals(channelId) || !grant.assetId().equals(companion.assetId())) {
+            throw ApiException.unprocessable("GRANT_NOT_MATCHED",
+                    "伴随授权不属于该频道或素材: " + companion.grantId());
+        }
+        if (grant.revoked()) {
+            throw ApiException.unprocessable("GRANT_INVALID",
+                    "伴随授权已撤销: " + companion.grantId());
+        }
+        if (grant.validFromMs() > startMs || grant.validToMs() < endMs) {
+            throw ApiException.unprocessable("GRANT_NOT_COVERING",
+                    "伴随授权未完整覆盖片段区间: " + segmentId);
+        }
     }
 
     /** 发布时加行锁选取覆盖授权；不存在或未撤销的覆盖授权时 422 拒绝整次发布。 */
@@ -547,7 +668,14 @@ public class PlayoutService {
             sb.append(s.id() == null ? "" : s.id()).append(',')
                     .append(s.assetId()).append(',')
                     .append(s.start() == null ? "" : toMs(s.start())).append(',')
-                    .append(s.end() == null ? "" : toMs(s.end())).append(';');
+                    .append(s.end() == null ? "" : toMs(s.end())).append(',');
+            if (s.companions() != null) {
+                for (CompanionInput c : s.companions()) {
+                    sb.append(c == null ? "" : c.assetId()).append('/')
+                            .append(c == null ? "" : c.grantId()).append('+');
+                }
+            }
+            sb.append(';');
         }
         return sb.toString();
     }
@@ -555,7 +683,7 @@ public class PlayoutService {
     private PlayoutDecisionResponse fallback(String channelId, OffsetDateTime at, String assetId,
                                              FallbackReason reason) {
         return new PlayoutDecisionResponse(channelId, at, assetId,
-                DecisionSource.FALLBACK, reason, null, null, null);
+                DecisionSource.FALLBACK, reason, null, null, null, List.of());
     }
 
     private static long toMs(OffsetDateTime time) {
@@ -586,9 +714,17 @@ public class PlayoutService {
     }
 
     /** 校验后的片段。 */
-    private record ValidatedSegment(String id, String assetId, long startMs, long endMs) {
+    private record ValidatedSegment(String id, String assetId, long startMs, long endMs,
+                                    List<ValidatedCompanion> companions) {
         SegmentResponse toResponse() {
-            return new SegmentResponse(id, assetId, atMs(startMs), atMs(endMs));
+            return new SegmentResponse(id, assetId, atMs(startMs), atMs(endMs),
+                    companions.stream()
+                            .map(c -> new CompanionResponse(c.assetId(), c.grantId()))
+                            .toList());
         }
+    }
+
+    /** 校验后的伴随轨：素材与指定授权，区间与主片段一致。 */
+    private record ValidatedCompanion(String assetId, long grantId) {
     }
 }

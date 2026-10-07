@@ -58,6 +58,15 @@ public class PlayoutRepository {
                                         long startMs, long endMs) {
     }
 
+    /** 草稿片段伴随轨行；grantId 为客户端指定的伴随授权，seqNo 从 0 开始、顺序有意义。 */
+    public record DraftCompanionRow(String segmentId, String assetId, long grantId, int seqNo) {
+    }
+
+    /** 发布快照伴随轨行；素材、授权与源区间在发布时冻结，之后不按当前状态重算。 */
+    public record PublicationCompanionRow(String segmentId, String assetId, long grantId,
+                                          int seqNo, long startMs, long endMs) {
+    }
+
     /** 幂等请求记录行；responseBody 为 NULL 表示尚未成功完成（同事务回滚后记录不保留）。 */
     public record RequestRow(String requestId, String operation, String paramsHash,
                              String responseBody) {
@@ -99,6 +108,15 @@ public class PlayoutRepository {
     private static final RowMapper<PublicationSegmentRow> PUBLICATION_SEGMENT_MAPPER = (rs, n) ->
             new PublicationSegmentRow(rs.getLong("id"), rs.getLong("publication_id"),
                     rs.getString("segment_id"), rs.getString("asset_id"), rs.getLong("grant_id"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"));
+
+    private static final RowMapper<DraftCompanionRow> DRAFT_COMPANION_MAPPER = (rs, n) ->
+            new DraftCompanionRow(rs.getString("segment_id"), rs.getString("asset_id"),
+                    rs.getLong("grant_id"), rs.getInt("seq_no"));
+
+    private static final RowMapper<PublicationCompanionRow> PUBLICATION_COMPANION_MAPPER = (rs, n) ->
+            new PublicationCompanionRow(rs.getString("segment_id"), rs.getString("asset_id"),
+                    rs.getLong("grant_id"), rs.getInt("seq_no"),
                     rs.getLong("start_ms"), rs.getLong("end_ms"));
 
     private static final RowMapper<RequestRow> REQUEST_MAPPER = (rs, n) ->
@@ -236,6 +254,31 @@ public class PlayoutRepository {
                 SEGMENT_MAPPER, channelId, Date.valueOf(businessDay));
     }
 
+    // ---------- 草稿片段伴随轨 ----------
+
+    public void insertDraftCompanion(String segmentId, String channelId, LocalDate businessDay,
+                                     String assetId, long grantId, int seqNo, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_draft_segment_companion"
+                        + " (segment_id, channel_id, business_day, asset_id, grant_id, seq_no, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                segmentId, channelId, Date.valueOf(businessDay), assetId, grantId, seqNo, createdAtMs);
+    }
+
+    public void deleteDraftCompanions(String channelId, LocalDate businessDay) {
+        jdbc.update("DELETE FROM playout_draft_segment_companion"
+                        + " WHERE channel_id = ? AND business_day = ?",
+                channelId, Date.valueOf(businessDay));
+    }
+
+    /** 指定频道+业务日的全部草稿伴随轨，按片段与顺序排序。 */
+    public List<DraftCompanionRow> findDraftCompanions(String channelId, LocalDate businessDay) {
+        return jdbc.query("SELECT segment_id, asset_id, grant_id, seq_no"
+                        + " FROM playout_draft_segment_companion"
+                        + " WHERE channel_id = ? AND business_day = ?"
+                        + " ORDER BY segment_id, seq_no",
+                DRAFT_COMPANION_MAPPER, channelId, Date.valueOf(businessDay));
+    }
+
     // ---------- 发布快照 ----------
 
     /** 当前发布版本，无发布记录时为 0。 */
@@ -289,6 +332,26 @@ public class PlayoutRepository {
                         + " WHERE publication_id = ? AND start_ms <= ? AND end_ms > ?"
                         + " ORDER BY start_ms LIMIT 1",
                 PUBLICATION_SEGMENT_MAPPER, publicationId, atMs, atMs).stream().findFirst();
+    }
+
+    // ---------- 发布快照伴随轨 ----------
+
+    public void insertPublicationCompanion(long publicationId, String segmentId, String assetId,
+                                           long grantId, int seqNo, long startMs, long endMs) {
+        jdbc.update("INSERT INTO playout_publication_segment_companion"
+                        + " (publication_id, segment_id, asset_id, grant_id, seq_no, start_ms, end_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                publicationId, segmentId, assetId, grantId, seqNo, startMs, endMs);
+    }
+
+    /** 快照中某片段的有序伴随轨（按 seq_no 升序）。 */
+    public List<PublicationCompanionRow> findPublicationCompanions(long publicationId,
+                                                                   String segmentId) {
+        return jdbc.query("SELECT segment_id, asset_id, grant_id, seq_no, start_ms, end_ms"
+                        + " FROM playout_publication_segment_companion"
+                        + " WHERE publication_id = ? AND segment_id = ?"
+                        + " ORDER BY seq_no",
+                PUBLICATION_COMPANION_MAPPER, publicationId, segmentId);
     }
 
     // ---------- 幂等请求记录 ----------

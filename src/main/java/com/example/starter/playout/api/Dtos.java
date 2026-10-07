@@ -60,27 +60,42 @@ public final class Dtos {
     public record RevokeGrantRequest(@NotBlank String requestId) {
     }
 
-    /** 草稿片段输入；id 为空时由系统生成。 */
+    /** 伴随轨输入：与主片段同 UTC 毫秒起止，各指定一条完整覆盖区间的授权。 */
+    public record CompanionInput(
+            @NotBlank String assetId,
+            @NotNull @Positive Long grantId) {
+    }
+
+    /** 草稿片段输入；id 为空时由系统生成；companions 为空表示无伴随轨，最多 2 条不同素材。 */
     public record SegmentInput(
             String id,
             @NotBlank String assetId,
             @NotNull OffsetDateTime start,
-            @NotNull OffsetDateTime end) {
+            @NotNull OffsetDateTime end,
+            List<CompanionInput> companions) {
     }
 
-    /** 整份替换草稿请求。 */
+    /** 整份替换草稿请求；operator 为必填操作者标识，计入幂等参数指纹。 */
     public record ReplaceDraftRequest(
             @NotBlank String requestId,
+            @NotBlank String operator,
             @NotNull @PositiveOrZero Long expectedDraftVersion,
             @NotNull List<@NotNull SegmentInput> segments) {
     }
 
-    /** 草稿片段响应。 */
+    /** 伴随轨响应，顺序与草稿一致。 */
+    public record CompanionResponse(
+            String assetId,
+            long grantId) {
+    }
+
+    /** 草稿片段响应；companions 为有序伴随集合，无伴随时为空列表。 */
     public record SegmentResponse(
             String id,
             String assetId,
             OffsetDateTime start,
-            OffsetDateTime end) {
+            OffsetDateTime end,
+            List<CompanionResponse> companions) {
     }
 
     /** 草稿响应。 */
@@ -91,9 +106,10 @@ public final class Dtos {
             List<SegmentResponse> segments) {
     }
 
-    /** 发布请求。 */
+    /** 发布请求；operator 为必填操作者标识，计入幂等参数指纹。 */
     public record PublishRequest(
             @NotBlank String requestId,
+            @NotBlank String operator,
             @NotNull @Positive Long draftVersion,
             @NotNull @PositiveOrZero Long expectedPublishedVersion) {
     }
@@ -117,7 +133,10 @@ public final class Dtos {
         NO_PUBLISHED_SCHEDULE, GAP, GRANT_REVOKED
     }
 
-    /** 播出决定响应；source 为 FALLBACK 时 reason 非空；source 为 EMERGENCY 时 overrideKey 非空。 */
+    /**
+     * 播出决定响应；source 为 FALLBACK 时 reason 非空；source 为 EMERGENCY 时 overrideKey 非空。
+     * companions 为命中节目片段时的有序伴随集合；FALLBACK 与 EMERGENCY 时恒为空列表。
+     */
     public record PlayoutDecisionResponse(
             String channelId,
             OffsetDateTime at,
@@ -126,7 +145,8 @@ public final class Dtos {
             FallbackReason reason,
             Long publicationId,
             String segmentId,
-            String overrideKey) {
+            String overrideKey,
+            List<CompanionResponse> companions) {
     }
 
     /** 紧急插播状态：创建即 ACTIVE，取消后为 CANCELLED，均为终态语义（ACTIVE 只能转为 CANCELLED）。 */

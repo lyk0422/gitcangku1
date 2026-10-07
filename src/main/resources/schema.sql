@@ -49,6 +49,19 @@ CREATE TABLE IF NOT EXISTS playout_draft_segment (
     KEY idx_draft_segment (channel_id, business_day)
 ) COMMENT = '草稿片段表，随草稿整份替换而整体重建';
 
+CREATE TABLE IF NOT EXISTS playout_draft_segment_companion (
+    id            BIGINT      NOT NULL AUTO_INCREMENT COMMENT '伴随轨自增 ID',
+    segment_id    VARCHAR(64) NOT NULL COMMENT '所属草稿片段 ID',
+    channel_id    VARCHAR(64) NOT NULL COMMENT '所属频道 ID，随草稿整份替换级联清理',
+    business_day  DATE        NOT NULL COMMENT '所属业务日，Asia/Shanghai 日历日',
+    asset_id      VARCHAR(64) NOT NULL COMMENT '伴随素材 ID，与主片段同 UTC 毫秒起止，源长度须足够',
+    grant_id      BIGINT      NOT NULL COMMENT '指定的伴随授权 ID，须属于该频道与素材、未撤销且完整覆盖片段区间',
+    seq_no        INT         NOT NULL COMMENT '伴随轨顺序，从 0 开始；顺序有意义，同片段内素材不得重复',
+    created_at_ms BIGINT      NOT NULL COMMENT '创建时间，UTC 纪元毫秒',
+    PRIMARY KEY (id),
+    KEY idx_draft_companion (channel_id, business_day)
+) COMMENT = '草稿片段伴随轨表，随草稿整份替换而整体重建，每片段最多 2 条不同素材';
+
 CREATE TABLE IF NOT EXISTS playout_publication (
     id                BIGINT      NOT NULL AUTO_INCREMENT COMMENT '发布快照自增 ID',
     channel_id        VARCHAR(64) NOT NULL COMMENT '频道 ID',
@@ -71,6 +84,19 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
     PRIMARY KEY (id),
     KEY idx_pub_segment (publication_id)
 ) COMMENT = '发布快照片段表，只读';
+
+CREATE TABLE IF NOT EXISTS playout_publication_segment_companion (
+    id             BIGINT      NOT NULL AUTO_INCREMENT COMMENT '快照伴随轨自增 ID',
+    publication_id BIGINT      NOT NULL COMMENT '所属发布快照 ID',
+    segment_id     VARCHAR(64) NOT NULL COMMENT '来源草稿片段 ID',
+    asset_id       VARCHAR(64) NOT NULL COMMENT '伴随素材 ID，发布时冻结，之后不按当前状态重算',
+    grant_id       BIGINT      NOT NULL COMMENT '发布时冻结的伴随授权 ID，播出查询据此实时判定撤销状态',
+    seq_no         INT         NOT NULL COMMENT '伴随轨顺序，从 0 开始，与草稿一致',
+    start_ms       BIGINT      NOT NULL COMMENT '伴随区间开始（含），UTC 纪元毫秒，与主片段一致，发布时冻结',
+    end_ms         BIGINT      NOT NULL COMMENT '伴随区间结束（不含），UTC 纪元毫秒，与主片段一致，发布时冻结',
+    PRIMARY KEY (id),
+    KEY idx_pub_companion (publication_id)
+) COMMENT = '发布快照伴随轨表，只读，授权撤销不改写历史快照';
 
 CREATE TABLE IF NOT EXISTS playout_request (
     request_id    VARCHAR(64)  NOT NULL COMMENT '幂等请求 ID，客户端生成',
