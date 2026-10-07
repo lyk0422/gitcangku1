@@ -1,12 +1,14 @@
 package com.example.starter.water;
 
 import com.example.starter.water.dto.Dtos.AllocationResponse;
+import com.example.starter.water.dto.Dtos.CanalGraphResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CommandRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
+import com.example.starter.water.dto.Dtos.ReviseCanalGraphRequest;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferRequest;
@@ -34,26 +36,28 @@ public class WaterController {
         this.service = service;
     }
 
-    /** 创建供水窗口。 */
+    /** 创建供水窗口（可携带渠网登记成为渠网窗口）。 */
     @PostMapping("/windows")
     public WindowResponse createWindow(@RequestBody CreateWindowRequest request) {
         return service.createWindow(request.commandKey(), request.windowKey(), request.channelId(),
-                request.startUtc(), request.endUtc(), request.plannedVolume());
+                request.startUtc(), request.endUtc(), request.plannedVolume(), request.canalGraph());
     }
 
-    /** 提交配水申请。 */
+    /** 提交配水申请（渠网窗口须携带 path 与 flowRate）。 */
     @PostMapping("/allocations")
     public AllocationResponse submitAllocation(@RequestBody SubmitAllocationRequest request,
                                                @RequestHeader("X-Actor-Id") String actor) {
         return service.submitAllocation(request.commandKey(), request.allocationKey(), request.windowId(),
-                request.userId(), request.amount(), actor);
+                request.userId(), request.amount(), request.path(), request.flowRate(), actor);
     }
 
-    /** 批准配水申请。 */
+    /** 批准配水申请（渠网窗口要求非空 X-Actor-Id）。 */
     @PostMapping("/allocations/{allocationKey}/approve")
     public AllocationResponse approveAllocation(@PathVariable String allocationKey,
-                                                @RequestBody CommandRequest request) {
-        return service.approveAllocation(request.commandKey(), allocationKey);
+                                                @RequestBody CommandRequest request,
+                                                @RequestHeader(value = "X-Actor-Id", required = false)
+                                                String actor) {
+        return service.approveAllocation(request.commandKey(), allocationKey, actor);
     }
 
     /** 取消配水申请（仅申请人本人）。 */
@@ -102,5 +106,20 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 查询渠网图（节点全集、边全集、各段已批准流量、图版本）。 */
+    @GetMapping("/windows/{windowId}/canal-graph")
+    public CanalGraphResponse getCanalGraph(@PathVariable long windowId) {
+        return service.getCanalGraph(windowId);
+    }
+
+    /** 渠网图修订（容量/增删渠段），携带 expectedGraphVersion 与非空操作者。 */
+    @PostMapping("/windows/{windowId}/canal-graph/revisions")
+    public CanalGraphResponse reviseCanalGraph(@PathVariable long windowId,
+                                               @RequestBody ReviseCanalGraphRequest request,
+                                               @RequestHeader("X-Actor-Id") String actor) {
+        return service.reviseCanalGraph(request.requestId(), windowId, request.expectedGraphVersion(),
+                request.updates(), request.add(), request.remove(), actor);
     }
 }

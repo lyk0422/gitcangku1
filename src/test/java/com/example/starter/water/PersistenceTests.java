@@ -12,6 +12,7 @@ import org.springframework.jdbc.datasource.init.ScriptUtils;
 
 import java.math.BigDecimal;
 import java.sql.Connection;
+import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -115,5 +116,50 @@ class PersistenceTests {
         assertEquals(new BigDecimal("3.000"), cancelled.amount());
         assertEquals(0, cancelled.heldAmount().compareTo(BigDecimal.ZERO));
         assertEquals(0, repo.sumApprovedAmount(windowId).compareTo(BigDecimal.ZERO));
+    }
+
+    @Test
+    void canalGraphAndPathAreReadableFromNewConnection() throws Exception {
+        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
+        SimpleDriverDataSource first = new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "");
+        try (Connection connection = first.getConnection()) {
+            ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
+        }
+        WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
+        long windowId = repo1.insertWindow("wk-canal", "ch-canal", 1L, 2L, new BigDecimal("100"), 1L);
+        repo1.insertCanalGraph(windowId, 3, 2L);
+        repo1.insertCanalNode(windowId, "A");
+        repo1.insertCanalNode(windowId, "B");
+        repo1.insertCanalNode(windowId, "C");
+        repo1.insertCanalEdge(windowId, "A", "B", new BigDecimal("10.000"));
+        repo1.insertCanalEdge(windowId, "B", "C", new BigDecimal("10.000"));
+        repo1.insertAllocation("ak-canal", windowId, "user-1", new BigDecimal("10.000"), 4L, "alice", 3L);
+        AllocationRow allocation = repo1.findAllocationByKey("ak-canal");
+        repo1.insertAllocationPath(allocation.id(), 1, "A", "B");
+        repo1.insertAllocationPath(allocation.id(), 2, "B", "C");
+        repo1.updateAllocationStatus(allocation.id(), "APPROVED", 4L);
+
+        // 全新连接与仓储实例读取：图、路径快照与流量汇总保持一致
+        WaterRepository repo2 = new WaterRepository(
+                new JdbcTemplate(new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "")));
+        assertNotNull(repo2.findCanalGraph(windowId));
+        assertEquals(1, repo2.findCanalGraph(windowId).version());
+        assertEquals(List.of("A", "B", "C"), repo2.listCanalNodes(windowId));
+        assertEquals(2, repo2.listCanalEdges(windowId).size());
+        AllocationRow reloaded = repo2.findAllocationByKey("ak-canal");
+        assertEquals(4L, reloaded.flowRate());
+        assertEquals(2, repo2.listAllocationPath(reloaded.id()).size());
+        assertEquals("B", repo2.listAllocationPath(reloaded.id()).get(1).fromNode());
+        assertEquals(4L, repo2.sumApprovedFlowOnEdge(windowId, "A", "B"));
+        assertEquals(4L, repo2.sumApprovedFlowOnEdge(windowId, "B", "C"));
+        assertEquals(2, repo2.listApprovedPathEdges(windowId).size());
+        // 取消后持有额度归零，流量贡献与边并集随之释放，路径快照保留
+        repo2.updateAllocationStatus(reloaded.id(), "CANCELLED", 5L);
+        assertEquals(0L, repo2.sumApprovedFlowOnEdge(windowId, "A", "B"));
+        assertEquals(0, repo2.listApprovedPathEdges(windowId).size());
+        assertEquals(2, repo2.listAllocationPath(reloaded.id()).size());
+        // 图修订递增版本
+        repo2.updateCanalGraphVersion(windowId, 2, 6L);
+        assertEquals(2, repo2.findCanalGraph(windowId).version());
     }
 }

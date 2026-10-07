@@ -25,9 +25,9 @@ public class WaterRepository {
                             BigDecimal plannedVolume, long createdNanos) {
     }
 
-    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度。 */
+    /** 配水申请行；amount 为不可改写的原申请水量，heldAmount 为当前持有额度，flowRate 仅渠网申请非空。 */
     public record AllocationRow(long id, String allocationKey, long windowId, String userId, BigDecimal amount,
-                                BigDecimal heldAmount, String requester, String status,
+                                BigDecimal heldAmount, Long flowRate, String requester, String status,
                                 long createdNanos, long updatedNanos) {
     }
 
@@ -46,6 +46,23 @@ public class WaterRepository {
                              long createdNanos) {
     }
 
+    /** 渠网图元信息行。 */
+    public record CanalGraphRow(long windowId, int version, int nodeCount, long createdNanos,
+                                long updatedNanos) {
+    }
+
+    /** 有向渠段行。 */
+    public record CanalEdgeRow(long id, long windowId, String fromNode, String toNode, BigDecimal capacity) {
+    }
+
+    /** 申请路径渠段行，seq 从 1 开始有序。 */
+    public record PathSegmentRow(int seq, String fromNode, String toNode) {
+    }
+
+    /** 有向边引用（已批准路径边并集用）。 */
+    public record EdgeRef(String fromNode, String toNode) {
+    }
+
     private static final RowMapper<WindowRow> WINDOW_MAPPER = (rs, n) -> new WindowRow(
             rs.getLong("id"), rs.getString("window_key"), rs.getString("channel_id"),
             rs.getLong("start_nanos"), rs.getLong("end_nanos"),
@@ -54,11 +71,12 @@ public class WaterRepository {
     private static final RowMapper<AllocationRow> ALLOCATION_MAPPER = (rs, n) -> new AllocationRow(
             rs.getLong("id"), rs.getString("allocation_key"), rs.getLong("window_id"),
             rs.getString("user_id"), rs.getBigDecimal("amount"), rs.getBigDecimal("held_amount"),
+            (Long) rs.getObject("flow_rate"),
             rs.getString("requester"), rs.getString("status"),
             rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
 
     private static final String ALLOCATION_SELECT =
-            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, requester, status,"
+            "SELECT id, allocation_key, window_id, user_id, amount, held_amount, flow_rate, requester, status,"
                     + " created_nanos, updated_nanos";
 
     private static final RowMapper<TransferRow> TRANSFER_MAPPER = (rs, n) -> new TransferRow(
@@ -74,6 +92,20 @@ public class WaterRepository {
     private static final RowMapper<CommandRow> COMMAND_MAPPER = (rs, n) -> new CommandRow(
             rs.getString("command_key"), rs.getString("operation"), rs.getString("params"),
             rs.getString("response"), rs.getLong("created_nanos"));
+
+    private static final RowMapper<CanalGraphRow> CANAL_GRAPH_MAPPER = (rs, n) -> new CanalGraphRow(
+            rs.getLong("window_id"), rs.getInt("version"), rs.getInt("node_count"),
+            rs.getLong("created_nanos"), rs.getLong("updated_nanos"));
+
+    private static final RowMapper<CanalEdgeRow> CANAL_EDGE_MAPPER = (rs, n) -> new CanalEdgeRow(
+            rs.getLong("id"), rs.getLong("window_id"), rs.getString("from_node"),
+            rs.getString("to_node"), rs.getBigDecimal("capacity"));
+
+    private static final RowMapper<PathSegmentRow> PATH_SEGMENT_MAPPER = (rs, n) -> new PathSegmentRow(
+            rs.getInt("seq"), rs.getString("from_node"), rs.getString("to_node"));
+
+    private static final RowMapper<EdgeRef> EDGE_REF_MAPPER = (rs, n) -> new EdgeRef(
+            rs.getString("from_node"), rs.getString("to_node"));
 
     private final JdbcTemplate jdbc;
 
@@ -133,18 +165,29 @@ public class WaterRepository {
     /** 插入申请（初始 REQUESTED）并返回主键。 */
     public long insertAllocation(String allocationKey, long windowId, String userId, BigDecimal amount,
                                  String requester, long nowNanos) {
+        return insertAllocation(allocationKey, windowId, userId, amount, null, requester, nowNanos);
+    }
+
+    /** 插入申请（初始 REQUESTED，可带渠网流量）并返回主键。 */
+    public long insertAllocation(String allocationKey, long windowId, String userId, BigDecimal amount,
+                                 Long flowRate, String requester, long nowNanos) {
         KeyHolder keys = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, held_amount, requester, status, created_nanos, updated_nanos)"
-                            + " VALUES (?, ?, ?, ?, 0, ?, 'REQUESTED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
+                    "INSERT INTO allocation (allocation_key, window_id, user_id, amount, held_amount, flow_rate, requester, status, created_nanos, updated_nanos)"
+                            + " VALUES (?, ?, ?, ?, 0, ?, ?, 'REQUESTED', ?, ?)", Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, allocationKey);
             ps.setLong(2, windowId);
             ps.setString(3, userId);
             ps.setBigDecimal(4, amount);
-            ps.setString(5, requester);
-            ps.setLong(6, nowNanos);
+            if (flowRate == null) {
+                ps.setNull(5, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(5, flowRate);
+            }
+            ps.setString(6, requester);
             ps.setLong(7, nowNanos);
+            ps.setLong(8, nowNanos);
             return ps;
         }, keys);
         return Objects.requireNonNull(keys.getKey()).longValue();
@@ -303,5 +346,112 @@ public class WaterRepository {
     /** 写回命令首次成功响应。 */
     public void updateCommandResponse(String commandKey, String response) {
         jdbc.update("UPDATE command_log SET response = ? WHERE command_key = ?", response, commandKey);
+    }
+
+    // ------------------------------------------------------------------
+    // 有向渠网门禁
+    // ------------------------------------------------------------------
+
+    /** 登记渠网图元信息（版本 1）。 */
+    public void insertCanalGraph(long windowId, int nodeCount, long nowNanos) {
+        jdbc.update("INSERT INTO canal_graph (window_id, version, node_count, created_nanos, updated_nanos)"
+                + " VALUES (?, 1, ?, ?, ?)", windowId, nodeCount, nowNanos, nowNanos);
+    }
+
+    /** 按窗口查询渠网图元信息，普通窗口返回 null。 */
+    public CanalGraphRow findCanalGraph(long windowId) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT window_id, version, node_count, created_nanos, updated_nanos"
+                            + " FROM canal_graph WHERE window_id = ?", CANAL_GRAPH_MAPPER, windowId);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 图修订后递增版本并记录修订时间。 */
+    public void updateCanalGraphVersion(long windowId, int version, long updatedNanos) {
+        jdbc.update("UPDATE canal_graph SET version = ?, updated_nanos = ? WHERE window_id = ?",
+                version, updatedNanos, windowId);
+    }
+
+    /** 登记渠网节点。 */
+    public void insertCanalNode(long windowId, String nodeName) {
+        jdbc.update("INSERT INTO canal_node (window_id, node_name) VALUES (?, ?)", windowId, nodeName);
+    }
+
+    /** 窗口全部节点名，按名称升序（冻结节点全集）。 */
+    public List<String> listCanalNodes(long windowId) {
+        return jdbc.queryForList("SELECT node_name FROM canal_node WHERE window_id = ? ORDER BY node_name",
+                String.class, windowId);
+    }
+
+    /** 登记有向渠段。 */
+    public void insertCanalEdge(long windowId, String fromNode, String toNode, BigDecimal capacity) {
+        jdbc.update("INSERT INTO canal_edge (window_id, from_node, to_node, capacity) VALUES (?, ?, ?, ?)",
+                windowId, fromNode, toNode, capacity);
+    }
+
+    /** 按起终点查询渠段，不存在返回 null。 */
+    public CanalEdgeRow findCanalEdge(long windowId, String fromNode, String toNode) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT id, window_id, from_node, to_node, capacity FROM canal_edge"
+                            + " WHERE window_id = ? AND from_node = ? AND to_node = ?",
+                    CANAL_EDGE_MAPPER, windowId, fromNode, toNode);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        }
+    }
+
+    /** 窗口当前全部渠段，按 (from,to) 升序。 */
+    public List<CanalEdgeRow> listCanalEdges(long windowId) {
+        return jdbc.query("SELECT id, window_id, from_node, to_node, capacity FROM canal_edge"
+                + " WHERE window_id = ? ORDER BY from_node, to_node", CANAL_EDGE_MAPPER, windowId);
+    }
+
+    /** 修订渠段容量。 */
+    public void updateCanalEdgeCapacity(long id, BigDecimal capacity) {
+        jdbc.update("UPDATE canal_edge SET capacity = ? WHERE id = ?", capacity, id);
+    }
+
+    /** 从图中删除渠段（调用方保证无已批准流量贡献）。 */
+    public void deleteCanalEdge(long id) {
+        jdbc.update("DELETE FROM canal_edge WHERE id = ?", id);
+    }
+
+    /** 冻结申请路径快照（有序渠段）。 */
+    public void insertAllocationPath(long allocationId, int seq, String fromNode, String toNode) {
+        jdbc.update("INSERT INTO allocation_path (allocation_id, seq, from_node, to_node) VALUES (?, ?, ?, ?)",
+                allocationId, seq, fromNode, toNode);
+    }
+
+    /** 申请路径快照，按 seq 升序；普通窗口申请返回空列表。 */
+    public List<PathSegmentRow> listAllocationPath(long allocationId) {
+        return jdbc.query("SELECT seq, from_node, to_node FROM allocation_path WHERE allocation_id = ?"
+                + " ORDER BY seq", PATH_SEGMENT_MAPPER, allocationId);
+    }
+
+    /**
+     * 渠段当前已批准流量贡献之和：状态 APPROVED 且持有额度大于 0 的申请，其路径命中该渠段时计入申报流量。
+     * 取消（CANCELLED）与全部转出（持有额度归零）的申请不再计入。
+     */
+    public long sumApprovedFlowOnEdge(long windowId, String fromNode, String toNode) {
+        Long sum = jdbc.queryForObject(
+                "SELECT COALESCE(SUM(a.flow_rate), 0) FROM allocation a"
+                        + " JOIN allocation_path p ON p.allocation_id = a.id"
+                        + " WHERE a.window_id = ? AND a.status = 'APPROVED' AND a.held_amount > 0"
+                        + " AND p.from_node = ? AND p.to_node = ?",
+                Long.class, windowId, fromNode, toNode);
+        return sum == null ? 0L : sum;
+    }
+
+    /** 窗口全部已批准路径（持有额度大于 0）的边并集，用于合成环检测。 */
+    public List<EdgeRef> listApprovedPathEdges(long windowId) {
+        return jdbc.query(
+                "SELECT DISTINCT p.from_node, p.to_node FROM allocation a"
+                        + " JOIN allocation_path p ON p.allocation_id = a.id"
+                        + " WHERE a.window_id = ? AND a.status = 'APPROVED' AND a.held_amount > 0",
+                EDGE_REF_MAPPER, windowId);
     }
 }

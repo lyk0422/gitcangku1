@@ -40,4 +40,8 @@ public class ApiException extends RuntimeException {
     public static ApiException quotaExceeded(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "QUOTA_EXCEEDED", message);
     }
+
+    public static ApiException flowExceeded(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "FLOW_CAPACITY_EXCEEDED", message);
+    }
 }
