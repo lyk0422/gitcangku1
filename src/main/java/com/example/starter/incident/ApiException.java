@@ -52,8 +52,18 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.CONFLICT, "CONFLICT", message, details);
     }
 
+    /** 403：身份越权（如签到非本人、撤销非当前指挥人）。 */
+    public static ApiException forbidden(String message) {
+        return new ApiException(HttpStatus.FORBIDDEN, "FORBIDDEN", message, null);
+    }
+
     /** 422：非法状态流转。 */
     public static ApiException illegalTransition(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "ILLEGAL_TRANSITION", message, null);
+    }
+
+    /** 422：双人监护在场凭证缺失、已过期或为旧代次。 */
+    public static ApiException presenceInvalid(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "PRESENCE_INVALID", message, null);
     }
 }

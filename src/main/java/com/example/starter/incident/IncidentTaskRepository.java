@@ -44,6 +44,10 @@ public class IncidentTaskRepository {
     private static IncidentTask mapTask(ResultSet rs) throws SQLException {
         Timestamp doneAt = rs.getTimestamp("done_at");
         Timestamp cancelledAt = rs.getTimestamp("cancelled_at");
+        Timestamp doneExecIssued = rs.getTimestamp("done_executor_issued_at");
+        Timestamp doneExecExpires = rs.getTimestamp("done_executor_expires_at");
+        Timestamp doneGuardIssued = rs.getTimestamp("done_guardian_issued_at");
+        Timestamp doneGuardExpires = rs.getTimestamp("done_guardian_expires_at");
         return new IncidentTask(
                 rs.getLong("id"), rs.getLong("incident_id"), rs.getString("task_key"),
                 rs.getString("group_code"), rs.getString("title"),
@@ -52,6 +56,13 @@ public class IncidentTaskRepository {
                 doneAt == null ? null : doneAt.toInstant(),
                 rs.getString("cancelled_by"),
                 cancelledAt == null ? null : cancelledAt.toInstant(),
+                rs.getInt("version"),
+                rs.getString("supervision_executor"),
+                rs.getString("supervision_guardian"),
+                doneExecIssued == null ? null : doneExecIssued.toInstant(),
+                doneExecExpires == null ? null : doneExecExpires.toInstant(),
+                doneGuardIssued == null ? null : doneGuardIssued.toInstant(),
+                doneGuardExpires == null ? null : doneGuardExpires.toInstant(),
                 rs.getTimestamp("created_at").toInstant(),
                 rs.getTimestamp("updated_at").toInstant());
     }
@@ -71,7 +82,10 @@ public class IncidentTaskRepository {
             var ps = con.prepareStatement(
                     "INSERT INTO incident_tasks (incident_id, task_key, group_code, title, status,"
                             + " created_by, done_by, done_at, cancelled_by, cancelled_at,"
-                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            + " version, supervision_executor, supervision_guardian,"
+                            + " done_executor_issued_at, done_executor_expires_at,"
+                            + " done_guardian_issued_at, done_guardian_expires_at,"
+                            + " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setLong(1, task.incidentId());
             ps.setString(2, task.taskKey());
@@ -83,8 +97,19 @@ public class IncidentTaskRepository {
             ps.setTimestamp(8, task.doneAt() == null ? null : Timestamp.from(task.doneAt()));
             ps.setString(9, task.cancelledBy());
             ps.setTimestamp(10, task.cancelledAt() == null ? null : Timestamp.from(task.cancelledAt()));
-            ps.setTimestamp(11, Timestamp.from(task.createdAt()));
-            ps.setTimestamp(12, Timestamp.from(task.updatedAt()));
+            ps.setInt(11, task.version());
+            ps.setString(12, task.supervisionExecutor());
+            ps.setString(13, task.supervisionGuardian());
+            ps.setTimestamp(14, task.doneExecutorIssuedAt() == null
+                    ? null : Timestamp.from(task.doneExecutorIssuedAt()));
+            ps.setTimestamp(15, task.doneExecutorExpiresAt() == null
+                    ? null : Timestamp.from(task.doneExecutorExpiresAt()));
+            ps.setTimestamp(16, task.doneGuardianIssuedAt() == null
+                    ? null : Timestamp.from(task.doneGuardianIssuedAt()));
+            ps.setTimestamp(17, task.doneGuardianExpiresAt() == null
+                    ? null : Timestamp.from(task.doneGuardianExpiresAt()));
+            ps.setTimestamp(18, Timestamp.from(task.createdAt()));
+            ps.setTimestamp(19, Timestamp.from(task.updatedAt()));
             return ps;
         }, keys);
         return keys.getKey().longValue();
@@ -163,6 +188,31 @@ public class IncidentTaskRepository {
         }
         jdbc.queryForObject("SELECT id FROM task_graph_lock WHERE id = ? FOR UPDATE",
                 Long.class, GRAPH_LOCK_ID);
+    }
+
+    /**
+     * 启用双人监护：固定执行人与监护人（两者必须不同），任务版本 +1。
+     */
+    public void enableSupervision(long id, String executor, String guardian, int newVersion, Instant at) {
+        jdbc.update("UPDATE incident_tasks SET supervision_executor = ?, supervision_guardian = ?,"
+                        + " version = ?, updated_at = ? WHERE id = ?",
+                executor, guardian, newVersion, Timestamp.from(at), id);
+    }
+
+    /**
+     * 双人监护任务完成：置 DONE 并冻结双方当前代次凭证的签发与到期 UTC 时刻。
+     */
+    public void markDoneSupervised(long id, String actor, Instant at,
+                                   Instant executorIssuedAt, Instant executorExpiresAt,
+                                   Instant guardianIssuedAt, Instant guardianExpiresAt) {
+        jdbc.update("UPDATE incident_tasks SET status = 'DONE', done_by = ?, done_at = ?,"
+                        + " done_executor_issued_at = ?, done_executor_expires_at = ?,"
+                        + " done_guardian_issued_at = ?, done_guardian_expires_at = ?,"
+                        + " updated_at = ? WHERE id = ?",
+                actor, Timestamp.from(at),
+                Timestamp.from(executorIssuedAt), Timestamp.from(executorExpiresAt),
+                Timestamp.from(guardianIssuedAt), Timestamp.from(guardianExpiresAt),
+                Timestamp.from(at), id);
     }
 
     /**

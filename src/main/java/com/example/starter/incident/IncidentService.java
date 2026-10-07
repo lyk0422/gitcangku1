@@ -17,10 +17,14 @@ import java.util.function.Supplier;
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.PresenceCheckInRequest;
+import com.example.starter.incident.dto.Requests.PresenceRevokeRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
+import com.example.starter.incident.dto.Requests.SupervisionEnableRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
+import com.example.starter.incident.dto.Requests.TaskCompleteRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
@@ -30,6 +34,7 @@ import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.PresenceCredentialView;
 import com.example.starter.incident.dto.Responses.StatusChangeView;
 import com.example.starter.incident.dto.Responses.TaskBlockerView;
 import com.example.starter.incident.dto.Responses.TaskView;
@@ -58,6 +63,9 @@ public class IncidentService {
     private static final Map<String, Long> CONTAINMENT_MINUTES = Map.of(
             "S1", 5L, "S2", 15L, "S3", 60L, "S4", 240L);
 
+    /** 双人监护在场凭证有效期（秒），区间左闭右开。 */
+    private static final long PRESENCE_TTL_SECONDS = 60L;
+
     /** 每事件处置任务上限。 */
     private static final int MAX_TASKS_PER_INCIDENT = 20;
 
@@ -71,16 +79,19 @@ public class IncidentService {
     private final IncidentRepository incidents;
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
+    private final PresenceCredentialRepository presenceCredentials;
     private final CommandKeyRepository commandKeys;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
-                           IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           IncidentTaskRepository tasks, PresenceCredentialRepository presenceCredentials,
+                           CommandKeyRepository commandKeys,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
+        this.presenceCredentials = presenceCredentials;
         this.commandKeys = commandKeys;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -453,6 +464,7 @@ public class IncidentService {
                     Instant now = now();
                     long taskId = tasks.insert(new IncidentTask(0L, incident.id(), taskKey,
                             groupCode, title, TaskStatus.OPEN, actor, null, null, null, null,
+                            1, null, null, null, null, null, null,
                             now, now));
                     for (Incident blocker : blockers) {
                         tasks.insertBlocker(taskId, blocker.id(), now);
@@ -465,13 +477,30 @@ public class IncidentService {
      * 完成任务：仅当前指挥人；仅 OPEN 可完成；全部阻塞事件进入
      * CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表。
      * DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
+     * 双人监护任务须改用携带双方当前代次的 TaskCompleteRequest 重载。
      */
     @Transactional
     public TaskView completeTask(String incidentKey, String taskKey, String actor,
                                  TaskActionRequest req) {
+        return completeTask(incidentKey, taskKey, actor,
+                new TaskCompleteRequest(req.commandKey(), null, null, null));
+    }
+
+    /**
+     * 完成任务（双人监护扩展）：双人监护任务必须显式引用执行人与监护人的当前凭证代次；
+     * 完成时两份凭证均须有效（未撤销、当前时刻在 [签发, 签发+60秒) 内、代次为本人最新代次），
+     * 缺失、已过期或旧代均 422 且任务不变；全部满足才转 DONE 并冻结双方签发、到期时刻。
+     * expectedVersion 非空时须等于任务当前版本，否则 409。
+     */
+    @Transactional
+    public TaskView completeTask(String incidentKey, String taskKey, String actor,
+                                 TaskCompleteRequest req) {
         String commandKey = requireText(req.commandKey(), "commandKey");
         Incident incident = lockIncident(incidentKey);
-        return runIdempotent(commandKey, "task_complete", hash(incidentKey, taskKey, actor),
+        return runIdempotent(commandKey, "task_complete",
+                hash(incidentKey, taskKey, actor, String.valueOf(req.executorGeneration()),
+                        String.valueOf(req.guardianGeneration()),
+                        String.valueOf(req.expectedVersion())),
                 TaskView.class, () -> {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
@@ -480,14 +509,194 @@ public class IncidentService {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能完成");
                     }
+                    requireExpectedVersion(task, req.expectedVersion());
                     List<String> unresolved = unresolvedBlockers(task.id());
                     if (!unresolved.isEmpty()) {
                         throw ApiException.conflict("存在未解除阻塞的事件: "
                                 + String.join(",", unresolved), List.copyOf(unresolved));
                     }
-                    tasks.markDone(task.id(), actor, now());
+                    Instant now = now();
+                    if (!task.supervisionEnabled()) {
+                        tasks.markDone(task.id(), actor, now);
+                        return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                    }
+                    PresenceCredential executor = requireValidPresence(task,
+                            PresenceCredential.ROLE_EXECUTOR, req.executorGeneration(), now);
+                    PresenceCredential guardian = requireValidPresence(task,
+                            PresenceCredential.ROLE_GUARDIAN, req.guardianGeneration(), now);
+                    tasks.markDoneSupervised(task.id(), actor, now,
+                            executor.issuedAt(), executor.expiresAt(),
+                            guardian.issuedAt(), guardian.expiresAt());
                     return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
                 });
+    }
+
+    /**
+     * 启用双人监护：仅当前指挥人（权限先于幂等重放校验）；任务须 OPEN 且未启用；
+     * 固定两个不同的操作者，任务版本 +1。expectedVersion 非空时须等于任务当前版本。
+     */
+    @Transactional
+    public TaskView enableSupervision(String incidentKey, String taskKey, String actor,
+                                      SupervisionEnableRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        String executor = requireText(req.executor(), "executor");
+        String guardian = requireText(req.guardian(), "guardian");
+        if (executor.equals(guardian)) {
+            throw ApiException.badRequest("执行人与监护人必须不同");
+        }
+        Incident incident = lockIncident(incidentKey);
+        requireCommander(incident, actor);
+        return runIdempotent(commandKey, "supervision_enable",
+                hash(incidentKey, taskKey, actor, executor, guardian,
+                        String.valueOf(req.expectedVersion())),
+                TaskView.class, () -> {
+                    IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                            .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    if (task.status() != TaskStatus.OPEN) {
+                        throw ApiException.conflict(
+                                "任务已处于终态 " + task.status() + "，不能启用双人监护");
+                    }
+                    if (task.supervisionEnabled()) {
+                        throw ApiException.conflict("任务已启用双人监护，不能重复启用");
+                    }
+                    requireExpectedVersion(task, req.expectedVersion());
+                    tasks.enableSupervision(task.id(), executor, guardian,
+                            task.version() + 1, now());
+                    return toTaskView(tasks.findByKey(incident.id(), taskKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 在场签到：仅任务固定的执行人或监护人本人可签到（越权 403，权限先于幂等重放校验）；
+     * 仅 OPEN 任务可签到（DONE/CANCELLED 422）；签到得到服务器 UTC 后 60 秒有效凭证，
+     * 区间左闭右开；重新签到推进本人代次并使前代失效。expectedVersion 非空时须等于任务当前版本。
+     */
+    @Transactional
+    public PresenceCredentialView checkInPresence(String incidentKey, String taskKey, String actor,
+                                                  PresenceCheckInRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        Incident incident = lockIncident(incidentKey);
+        IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+        if (!task.supervisionEnabled()) {
+            throw ApiException.conflict("任务未启用双人监护，不能签到");
+        }
+        String role = presenceRole(task, actor);
+        return runIdempotent(commandKey, "presence_checkin",
+                hash(incidentKey, taskKey, actor, role, String.valueOf(req.expectedVersion())),
+                PresenceCredentialView.class, () -> {
+                    if (task.status() != TaskStatus.OPEN) {
+                        throw ApiException.illegalTransition(
+                                "任务已处于终态 " + task.status() + "，禁止新签到");
+                    }
+                    requireExpectedVersion(task, req.expectedVersion());
+                    Instant now = now();
+                    int generation = presenceCredentials.findLatest(task.id(), role)
+                            .map(PresenceCredential::generation).orElse(0) + 1;
+                    String operator = PresenceCredential.ROLE_EXECUTOR.equals(role)
+                            ? task.supervisionExecutor() : task.supervisionGuardian();
+                    long id = presenceCredentials.insert(new PresenceCredential(0L, task.id(),
+                            role, operator, generation, now,
+                            now.plus(PRESENCE_TTL_SECONDS, ChronoUnit.SECONDS), null, now));
+                    return toPresenceView(presenceCredentials.findLatest(task.id(), role)
+                            .orElseThrow());
+                });
+    }
+
+    /**
+     * 撤销在场凭证：仅当前指挥人可撤销（越权 403，权限先于幂等重放校验）；
+     * 仅 OPEN 任务可撤销（DONE/CANCELLED 422）；撤销指定操作者当前最新代次凭证，
+     * 无有效凭证可撤销时 409。expectedVersion 非空时须等于任务当前版本。
+     */
+    @Transactional
+    public PresenceCredentialView revokePresence(String incidentKey, String taskKey, String actor,
+                                                 PresenceRevokeRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        String operator = requireText(req.operator(), "operator");
+        Incident incident = lockIncident(incidentKey);
+        if (incident.commander() == null || !incident.commander().equals(actor)) {
+            throw ApiException.forbidden("只有当前指挥人 "
+                    + (incident.commander() == null ? "(无)" : incident.commander()) + " 能撤销在场凭证");
+        }
+        IncidentTask task = tasks.findByKey(incident.id(), taskKey)
+                .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+        if (!task.supervisionEnabled()) {
+            throw ApiException.conflict("任务未启用双人监护，没有可撤销的凭证");
+        }
+        String role = presenceRole(task, operator);
+        return runIdempotent(commandKey, "presence_revoke",
+                hash(incidentKey, taskKey, actor, operator, role,
+                        String.valueOf(req.expectedVersion())),
+                PresenceCredentialView.class, () -> {
+                    if (task.status() != TaskStatus.OPEN) {
+                        throw ApiException.illegalTransition(
+                                "任务已处于终态 " + task.status() + "，不能撤销凭证");
+                    }
+                    requireExpectedVersion(task, req.expectedVersion());
+                    PresenceCredential latest = presenceCredentials.findLatest(task.id(), role)
+                            .orElseThrow(() -> ApiException.conflict(
+                                    "操作者 " + operator + " 尚无签到凭证，不能撤销"));
+                    if (latest.revokedAt() != null) {
+                        throw ApiException.conflict(
+                                "操作者 " + operator + " 的当前代次凭证已被撤销");
+                    }
+                    presenceCredentials.revoke(latest.id(), now());
+                    return toPresenceView(presenceCredentials.findLatest(task.id(), role)
+                            .orElseThrow());
+                });
+    }
+
+    /**
+     * 解析操作者在双人监护中的在场角色：必须等于任务固定的执行人或监护人，否则 403。
+     */
+    private static String presenceRole(IncidentTask task, String operator) {
+        if (operator.equals(task.supervisionExecutor())) {
+            return PresenceCredential.ROLE_EXECUTOR;
+        }
+        if (operator.equals(task.supervisionGuardian())) {
+            return PresenceCredential.ROLE_GUARDIAN;
+        }
+        throw ApiException.forbidden("操作者 " + operator + " 不是该任务固定的执行人或监护人");
+    }
+
+    /**
+     * 核对双人监护任务完成时引用的凭证代次：代次缺失、不存在、非本人最新代次（旧代）、
+     * 已撤销或当前时刻不在 [签发, 到期) 内均 422，任务不变。
+     */
+    private PresenceCredential requireValidPresence(IncidentTask task, String role,
+                                                    Integer generation, Instant now) {
+        String roleName = PresenceCredential.ROLE_EXECUTOR.equals(role) ? "执行人" : "监护人";
+        if (generation == null) {
+            throw ApiException.presenceInvalid("缺少" + roleName + "在场凭证代次");
+        }
+        PresenceCredential referenced = presenceCredentials
+                .findByGeneration(task.id(), role, generation)
+                .orElseThrow(() -> ApiException.presenceInvalid(
+                        roleName + "在场凭证代次不存在: " + generation));
+        int latestGeneration = presenceCredentials.findLatest(task.id(), role)
+                .map(PresenceCredential::generation).orElse(0);
+        if (referenced.generation() != latestGeneration) {
+            throw ApiException.presenceInvalid(
+                    roleName + "在场凭证代次已失效（旧代 " + referenced.generation()
+                            + "，当前代 " + latestGeneration + "）");
+        }
+        if (referenced.revokedAt() != null) {
+            throw ApiException.presenceInvalid(roleName + "在场凭证已被撤销");
+        }
+        if (!referenced.validAt(now)) {
+            throw ApiException.presenceInvalid(roleName + "在场凭证已过期");
+        }
+        return referenced;
+    }
+
+    /**
+     * 期望版本校验：非空时须等于任务当前版本，否则 409。
+     */
+    private static void requireExpectedVersion(IncidentTask task, Integer expectedVersion) {
+        if (expectedVersion != null && expectedVersion != task.version()) {
+            throw ApiException.conflict("期望版本 " + expectedVersion
+                    + " 与任务当前版本 " + task.version() + " 不一致");
+        }
     }
 
     /**
@@ -641,7 +850,16 @@ public class IncidentService {
                 .toList();
         return new TaskView(task.taskKey(), task.groupCode(), task.title(), task.status().name(),
                 blockers, task.createdBy(), task.createdAt(), task.doneBy(), task.doneAt(),
-                task.cancelledBy(), task.cancelledAt());
+                task.cancelledBy(), task.cancelledAt(), task.version(),
+                task.supervisionExecutor(), task.supervisionGuardian(),
+                task.doneExecutorIssuedAt(), task.doneExecutorExpiresAt(),
+                task.doneGuardianIssuedAt(), task.doneGuardianExpiresAt());
+    }
+
+    private static PresenceCredentialView toPresenceView(PresenceCredential credential) {
+        return new PresenceCredentialView(credential.role(), credential.operator(),
+                credential.generation(), credential.issuedAt(), credential.expiresAt(),
+                credential.revokedAt());
     }
 
     private static TransferView toTransferView(IncidentTransfer transfer) {

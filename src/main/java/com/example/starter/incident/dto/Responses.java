@@ -64,11 +64,25 @@ public final class Responses {
 
     /**
      * 处置任务视图：blockers 按阻塞事件键排序；doneBy/doneAt 仅 DONE 有值，
-     * cancelledBy/cancelledAt 仅 CANCELLED 有值。
+     * cancelledBy/cancelledAt 仅 CANCELLED 有值。version 创建为 1，启用双人监护后为 2；
+     * supervisionExecutor/supervisionGuardian 仅启用监护后有值；
+     * doneXxxIssuedAt/doneXxxExpiresAt 为完成时冻结的双方凭证签发与到期 UTC 时刻，
+     * 仅双人监护任务 DONE 有值。
      */
     public record TaskView(String taskKey, String groupCode, String title, String status,
                            List<TaskBlockerView> blockers, String createdBy, Instant createdAt,
-                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt) {
+                           String doneBy, Instant doneAt, String cancelledBy, Instant cancelledAt,
+                           int version, String supervisionExecutor, String supervisionGuardian,
+                           Instant doneExecutorIssuedAt, Instant doneExecutorExpiresAt,
+                           Instant doneGuardianIssuedAt, Instant doneGuardianExpiresAt) {
+    }
+
+    /**
+     * 在场凭证视图：generation 为本人当前代次；有效期 [issuedAt, expiresAt) 左闭右开，
+     * 签发后 60 秒；revokedAt 仅被撤销后有值。
+     */
+    public record PresenceCredentialView(String role, String operator, int generation,
+                                         Instant issuedAt, Instant expiresAt, Instant revokedAt) {
     }
 
     /** 按事件分组的任务列表视图：tasks 按创建顺序返回。 */

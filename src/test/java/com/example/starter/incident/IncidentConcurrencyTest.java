@@ -45,6 +45,7 @@ class IncidentConcurrencyTest {
         jdbc.update("DELETE FROM incident_status_history");
         jdbc.update("DELETE FROM incident_transfers");
         jdbc.update("DELETE FROM incident_actions");
+        jdbc.update("DELETE FROM task_presence_credentials");
         jdbc.update("DELETE FROM incident_task_blockers");
         jdbc.update("DELETE FROM incident_tasks");
         jdbc.update("DELETE FROM incidents");

@@ -83,9 +83,29 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     done_at TIMESTAMP(6) NULL,
     cancelled_by VARCHAR(128) NULL,
     cancelled_at TIMESTAMP(6) NULL,
+    version INT NOT NULL DEFAULT 1,
+    supervision_executor VARCHAR(128) NULL,
+    supervision_guardian VARCHAR(128) NULL,
+    done_executor_issued_at TIMESTAMP(6) NULL,
+    done_executor_expires_at TIMESTAMP(6) NULL,
+    done_guardian_issued_at TIMESTAMP(6) NULL,
+    done_guardian_expires_at TIMESTAMP(6) NULL,
     created_at TIMESTAMP(6) NOT NULL,
     updated_at TIMESTAMP(6) NOT NULL,
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
+);
+
+CREATE TABLE IF NOT EXISTS task_presence_credentials (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT NOT NULL,
+    role VARCHAR(16) NOT NULL,
+    operator VARCHAR(128) NOT NULL,
+    generation INT NOT NULL,
+    issued_at TIMESTAMP(6) NOT NULL,
+    expires_at TIMESTAMP(6) NOT NULL,
+    revoked_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_presence_generation UNIQUE (task_id, role, generation)
 );
 
 CREATE TABLE IF NOT EXISTS incident_task_blockers (

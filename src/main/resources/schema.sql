@@ -84,10 +84,30 @@ CREATE TABLE IF NOT EXISTS incident_tasks (
     done_at TIMESTAMP(6) NULL COMMENT '完成 UTC 时间；仅 DONE 有值，否则为空',
     cancelled_by VARCHAR(128) NULL COMMENT '取消人（操作时的当前指挥人）；仅 CANCELLED 有值，否则为空',
     cancelled_at TIMESTAMP(6) NULL COMMENT '取消 UTC 时间；仅 CANCELLED 有值，否则为空',
+    version INT NOT NULL DEFAULT 1 COMMENT '任务版本：创建时为 1，启用双人监护后递增为 2；写操作可携带期望版本做并发校验',
+    supervision_executor VARCHAR(128) NULL COMMENT '双人监护执行人标识；仅启用监护后有值，否则为空',
+    supervision_guardian VARCHAR(128) NULL COMMENT '双人监护监护人标识，必须与执行人不同；仅启用监护后有值，否则为空',
+    done_executor_issued_at TIMESTAMP(6) NULL COMMENT '完成时冻结的执行人凭证签发 UTC；仅双人监护任务 DONE 有值，否则为空',
+    done_executor_expires_at TIMESTAMP(6) NULL COMMENT '完成时冻结的执行人凭证到期 UTC（有效期左闭右开区间右端）；仅双人监护任务 DONE 有值，否则为空',
+    done_guardian_issued_at TIMESTAMP(6) NULL COMMENT '完成时冻结的监护人凭证签发 UTC；仅双人监护任务 DONE 有值，否则为空',
+    done_guardian_expires_at TIMESTAMP(6) NULL COMMENT '完成时冻结的监护人凭证到期 UTC（有效期左闭右开区间右端）；仅双人监护任务 DONE 有值，否则为空',
     created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
     updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
     CONSTRAINT uk_task_key UNIQUE (incident_id, task_key)
 ) COMMENT='事件处置任务表';
+
+CREATE TABLE IF NOT EXISTS task_presence_credentials (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    task_id BIGINT NOT NULL COMMENT '所属任务 id，关联 incident_tasks.id',
+    role VARCHAR(16) NOT NULL COMMENT '在场角色：EXECUTOR 执行人 / GUARDIAN 监护人',
+    operator VARCHAR(128) NOT NULL COMMENT '在场操作者标识（签到本人）',
+    generation INT NOT NULL COMMENT '凭证代次：每人从 1 开始，重新签到推进 +1 并使前代失效',
+    issued_at TIMESTAMP(6) NOT NULL COMMENT '签发 UTC 时刻（服务端时钟）',
+    expires_at TIMESTAMP(6) NOT NULL COMMENT '到期 UTC 时刻：签发后 60 秒，有效期为 [issued_at, expires_at) 左闭右开',
+    revoked_at TIMESTAMP(6) NULL COMMENT '撤销 UTC 时刻；仅被当前指挥人撤销后有值，否则为空',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    CONSTRAINT uk_presence_generation UNIQUE (task_id, role, generation)
+) COMMENT='双人监护限时在场凭证表';
 
 CREATE TABLE IF NOT EXISTS incident_task_blockers (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',

@@ -55,4 +55,34 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 双人监护任务完成请求：executorGeneration/guardianGeneration 为双方当前凭证代次，
+     * 双人监护任务必填，缺失、过期或旧代均 422；expectedVersion 非空时须等于任务当前版本。
+     */
+    public record TaskCompleteRequest(String commandKey, Integer executorGeneration,
+                                      Integer guardianGeneration, Integer expectedVersion) {
+    }
+
+    /**
+     * 启用双人监护请求：executor/guardian 为两个不同的固定操作者；
+     * expectedVersion 非空时须等于任务当前版本（创建后为 1）。
+     */
+    public record SupervisionEnableRequest(String commandKey, String executor, String guardian,
+                                           Integer expectedVersion) {
+    }
+
+    /**
+     * 在场签到请求：操作人由 X-Actor-Id 指定且须为任务固定的执行人或监护人本人；
+     * expectedVersion 非空时须等于任务当前版本。
+     */
+    public record PresenceCheckInRequest(String commandKey, Integer expectedVersion) {
+    }
+
+    /**
+     * 凭证撤销请求：operator 为被撤销的在场操作者；操作人由 X-Actor-Id 指定且须为当前指挥人；
+     * expectedVersion 非空时须等于任务当前版本。
+     */
+    public record PresenceRevokeRequest(String commandKey, String operator, Integer expectedVersion) {
+    }
 }

@@ -3,10 +3,14 @@ package com.example.starter.incident;
 import com.example.starter.incident.dto.Requests.ActionRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
+import com.example.starter.incident.dto.Requests.PresenceCheckInRequest;
+import com.example.starter.incident.dto.Requests.PresenceRevokeRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
 import com.example.starter.incident.dto.Requests.StatusRequest;
+import com.example.starter.incident.dto.Requests.SupervisionEnableRequest;
 import com.example.starter.incident.dto.Requests.TakeoverRequest;
 import com.example.starter.incident.dto.Requests.TaskActionRequest;
+import com.example.starter.incident.dto.Requests.TaskCompleteRequest;
 import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
@@ -16,6 +20,7 @@ import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
+import com.example.starter.incident.dto.Responses.PresenceCredentialView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import org.springframework.http.HttpStatus;
@@ -170,13 +175,46 @@ public class IncidentController {
     }
 
     /**
-     * 完成任务（仅当前指挥人；全部阻塞解除后才可完成）。
+     * 完成任务（仅当前指挥人；全部阻塞解除后才可完成；
+     * 双人监护任务须显式引用双方当前凭证代次，缺失/过期/旧代 422）。
      */
     @PostMapping("/{incidentKey}/tasks/{taskKey}/complete")
     public TaskView completeTask(@PathVariable String incidentKey, @PathVariable String taskKey,
                                  @RequestHeader("X-Actor-Id") String actor,
-                                 @RequestBody TaskActionRequest req) {
+                                 @RequestBody TaskCompleteRequest req) {
         return service.completeTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 启用双人监护（仅当前指挥人；固定两个不同操作者，任务版本 +1）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/supervision")
+    public TaskView enableSupervision(@PathVariable String incidentKey, @PathVariable String taskKey,
+                                      @RequestHeader("X-Actor-Id") String actor,
+                                      @RequestBody SupervisionEnableRequest req) {
+        return service.enableSupervision(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 在场签到（仅任务固定的执行人或监护人本人；得到服务器 UTC 后 60 秒有效凭证）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/presence/check-in")
+    public PresenceCredentialView checkInPresence(@PathVariable String incidentKey,
+                                                  @PathVariable String taskKey,
+                                                  @RequestHeader("X-Actor-Id") String actor,
+                                                  @RequestBody PresenceCheckInRequest req) {
+        return service.checkInPresence(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 撤销在场凭证（仅当前指挥人）。
+     */
+    @PostMapping("/{incidentKey}/tasks/{taskKey}/presence/revoke")
+    public PresenceCredentialView revokePresence(@PathVariable String incidentKey,
+                                                 @PathVariable String taskKey,
+                                                 @RequestHeader("X-Actor-Id") String actor,
+                                                 @RequestBody PresenceRevokeRequest req) {
+        return service.revokePresence(incidentKey, taskKey, actor, req);
     }
 
     /**
