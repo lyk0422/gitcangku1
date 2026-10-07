@@ -1,7 +1,9 @@
 package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
+import com.example.starter.water.WaterRepository.BasinPairRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.ExecutionRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import org.junit.jupiter.api.Test;
@@ -115,5 +117,63 @@ class PersistenceTests {
         assertEquals(new BigDecimal("3.000"), cancelled.amount());
         assertEquals(0, cancelled.heldAmount().compareTo(BigDecimal.ZERO));
         assertEquals(0, repo.sumApprovedAmount(windowId).compareTo(BigDecimal.ZERO));
+    }
+
+    @Test
+    void basinVolumesAndExecutionsAreReadableFromNewConnection() throws Exception {
+        String url = String.format(URL_TEMPLATE, UUID.randomUUID().toString().substring(0, 8));
+
+        // 第一次“运行”：建表，登记双池（面积 10/10，上 30、下 10），批准申请并合成执行 5
+        SimpleDriverDataSource first = new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "");
+        try (Connection connection = first.getConnection()) {
+            ScriptUtils.executeSqlScript(connection, new ClassPathResource("schema.sql"));
+        }
+        WaterRepository repo1 = new WaterRepository(new JdbcTemplate(first));
+        long windowId = repo1.insertWindow("wk-basin", "ch-basin", 1_000L, 2_000L,
+                new BigDecimal("100.000"), 1L);
+        repo1.insertBasinPair(windowId, 10L, 10L, new BigDecimal("30.000"), new BigDecimal("10.000"),
+                new BigDecimal("10.000"), new BigDecimal("40.000"),
+                new BigDecimal("5.000"), new BigDecimal("30.000"), 2L);
+        repo1.insertAllocation("ak-exec", windowId, "user-1", new BigDecimal("30.000"), "alice", 3L);
+        AllocationRow allocation = repo1.findAllocationByKey("ak-exec");
+        repo1.updateAllocationStatus(allocation.id(), "APPROVED", 4L);
+        // 执行 5：上池 25、下池 15，冻结前后体积与水位展示值
+        BasinPairRow basins = repo1.findBasinPairByWindowId(windowId);
+        repo1.updateBasinVolumes(basins.id(), new BigDecimal("25.000"), new BigDecimal("15.000"), 5L);
+        repo1.addExecutedAmount(allocation.id(), new BigDecimal("5.000"), 5L);
+        repo1.insertExecution("ek-persist", "ak-exec", windowId, new BigDecimal("5.000"),
+                new BigDecimal("30.000"), new BigDecimal("25.000"),
+                new BigDecimal("10.000"), new BigDecimal("15.000"),
+                new BigDecimal("3"), new BigDecimal("2.5"), new BigDecimal("1"), new BigDecimal("1.5"),
+                "alice", 5L);
+
+        // 第二次读取：全新连接与仓储实例，同一 JVM 内数据仍在
+        WaterRepository repo2 = new WaterRepository(
+                new JdbcTemplate(new SimpleDriverDataSource(new org.h2.Driver(), url, "sa", "")));
+        BasinPairRow basins2 = repo2.findBasinPairByWindowId(windowId);
+        assertNotNull(basins2);
+        assertEquals(10L, basins2.upperAreaM2());
+        assertEquals(new BigDecimal("25.000"), basins2.upperVolumeM3());
+        assertEquals(new BigDecimal("15.000"), basins2.lowerVolumeM3());
+        assertEquals(new BigDecimal("10.000"), basins2.upperMinM3());
+        assertEquals(new BigDecimal("30.000"), basins2.lowerMaxM3());
+
+        AllocationRow allocation2 = repo2.findAllocationByKey("ak-exec");
+        assertEquals("APPROVED", allocation2.status());
+        assertEquals(new BigDecimal("5.000"), allocation2.executedAmount());
+        assertEquals(new BigDecimal("25.000"), allocation2.heldAmount());
+
+        ExecutionRow execution = repo2.findExecutionByKey("ek-persist");
+        assertNotNull(execution);
+        assertEquals("ak-exec", execution.allocationKey());
+        assertEquals(new BigDecimal("5.000"), execution.volumeM3());
+        assertEquals(new BigDecimal("30.000"), execution.upperBeforeM3());
+        assertEquals(new BigDecimal("25.000"), execution.upperAfterM3());
+        assertEquals(new BigDecimal("10.000"), execution.lowerBeforeM3());
+        assertEquals(new BigDecimal("15.000"), execution.lowerAfterM3());
+        assertEquals(0, execution.upperLevelBeforeM().compareTo(new BigDecimal("3")));
+        assertEquals(0, execution.lowerLevelAfterM().compareTo(new BigDecimal("1.5")));
+        assertEquals("alice", execution.actor());
+        assertEquals(1, repo2.listExecutionsByAllocation("ak-exec").size());
     }
 }

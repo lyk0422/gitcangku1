@@ -1,11 +1,17 @@
 package com.example.starter.water;
 
 import com.example.starter.water.dto.Dtos.AllocationResponse;
+import com.example.starter.water.dto.Dtos.BasinPairResponse;
+import com.example.starter.water.dto.Dtos.BasinWindowResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CommandRequest;
+import com.example.starter.water.dto.Dtos.CreateBasinWindowRequest;
 import com.example.starter.water.dto.Dtos.CreateWindowRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentRequest;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.ExecuteGateRequest;
+import com.example.starter.water.dto.Dtos.ExecutionListResponse;
+import com.example.starter.water.dto.Dtos.ExecutionResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.SubmitAllocationRequest;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
@@ -102,5 +108,39 @@ public class WaterController {
     @GetMapping("/windows/{windowId}/history")
     public HistoryResponse getHistory(@PathVariable long windowId) {
         return service.getHistory(windowId);
+    }
+
+    /** 创建双池供水窗口（登记上下池面积、初始体积与体积上下界）。 */
+    @PostMapping("/basin-windows")
+    public BasinWindowResponse createBasinWindow(@RequestBody CreateBasinWindowRequest request,
+                                                 @RequestHeader("X-Actor-Id") String actor) {
+        return service.createBasinWindow(request.commandKey(), request.windowKey(), request.channelId(),
+                request.startUtc(), request.endUtc(), request.plannedVolume(),
+                request.upperAreaM2(), request.lowerAreaM2(),
+                request.upperInitialVolumeM3(), request.lowerInitialVolumeM3(),
+                request.upperMinVolumeM3(), request.upperMaxVolumeM3(),
+                request.lowerMinVolumeM3(), request.lowerMaxVolumeM3(),
+                request.expectedVersion(), actor);
+    }
+
+    /** 合成闸门执行：对 APPROVED 申请输水，满足双池水位与体积门禁。 */
+    @PostMapping("/allocations/{allocationKey}/executions")
+    public ExecutionResponse execute(@PathVariable String allocationKey,
+                                     @RequestBody ExecuteGateRequest request,
+                                     @RequestHeader("X-Actor-Id") String actor) {
+        return service.executeAllocation(request.commandKey(), allocationKey, request.executionKey(),
+                request.volume(), request.expectedVersion(), actor);
+    }
+
+    /** 查询申请执行明细与剩余可执行量。 */
+    @GetMapping("/allocations/{allocationKey}/executions")
+    public ExecutionListResponse getExecutions(@PathVariable String allocationKey) {
+        return service.getExecutions(allocationKey);
+    }
+
+    /** 查询窗口双池当前体积与水位展示值。 */
+    @GetMapping("/windows/{windowId}/basins")
+    public BasinPairResponse getBasins(@PathVariable long windowId) {
+        return service.getBasins(windowId);
     }
 }

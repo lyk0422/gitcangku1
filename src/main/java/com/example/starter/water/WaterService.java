@@ -1,13 +1,19 @@
 package com.example.starter.water;
 
 import com.example.starter.water.WaterRepository.AllocationRow;
+import com.example.starter.water.WaterRepository.BasinPairRow;
 import com.example.starter.water.WaterRepository.CommandRow;
 import com.example.starter.water.WaterRepository.CurtailmentRow;
+import com.example.starter.water.WaterRepository.ExecutionRow;
 import com.example.starter.water.WaterRepository.TransferRow;
 import com.example.starter.water.WaterRepository.WindowRow;
 import com.example.starter.water.dto.Dtos.AllocationResponse;
+import com.example.starter.water.dto.Dtos.BasinPairResponse;
+import com.example.starter.water.dto.Dtos.BasinWindowResponse;
 import com.example.starter.water.dto.Dtos.CapacityResponse;
 import com.example.starter.water.dto.Dtos.CurtailmentResponse;
+import com.example.starter.water.dto.Dtos.ExecutionListResponse;
+import com.example.starter.water.dto.Dtos.ExecutionResponse;
 import com.example.starter.water.dto.Dtos.HistoryResponse;
 import com.example.starter.water.dto.Dtos.TransferListResponse;
 import com.example.starter.water.dto.Dtos.TransferResponse;
@@ -19,6 +25,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.List;
@@ -43,7 +50,10 @@ public class WaterService {
 
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
     private static final Pattern AMOUNT_PATTERN = Pattern.compile("\\d{1,16}(\\.\\d{1,3})?");
+    private static final Pattern INTEGER_PATTERN = Pattern.compile("\\d{1,16}");
     private static final Pattern KEY_PATTERN = Pattern.compile("[\\w.\\-:]{1,128}");
+    /** 水位差门禁上限，单位米。 */
+    private static final BigDecimal MAX_LEVEL_DIFF_M = new BigDecimal("2");
 
     private final WaterRepository repository;
     private final TransactionTemplate tx;
@@ -316,6 +326,163 @@ public class WaterService {
     }
 
     // ------------------------------------------------------------------
+    // 双池窗口与闸门执行
+    // ------------------------------------------------------------------
+
+    /**
+     * 创建双池供水窗口：在普通窗口之上登记上下池（固定正整数面积、初始体积与体积上下界）。
+     * 初始体积必须在各自上下界内；水位 = 体积 / 面积。
+     */
+    public BasinWindowResponse createBasinWindow(String commandKey, String windowKey, String channelId,
+                                                 String startUtc, String endUtc, String plannedVolume,
+                                                 Long upperAreaM2, Long lowerAreaM2,
+                                                 String upperInit, String lowerInit,
+                                                 String upperMin, String upperMax,
+                                                 String lowerMin, String lowerMax,
+                                                 String expectedVersion, String actor) {
+        requireKey("commandKey", commandKey);
+        requireKey("windowKey", windowKey);
+        requireKey("channelId", channelId);
+        requireKey("X-Actor-Id", actor);
+        long startNanos = parseInstant("startUtc", startUtc);
+        long endNanos = parseInstant("endUtc", endUtc);
+        if (startNanos >= endNanos) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", "startUtc 必须早于 endUtc");
+        }
+        BigDecimal planned = parseAmount("plannedVolume", plannedVolume);
+        long upperArea = requirePositiveArea("upperAreaM2", upperAreaM2);
+        long lowerArea = requirePositiveArea("lowerAreaM2", lowerAreaM2);
+        BigDecimal upperInitVol = parseVolume("upperInitialVolumeM3", upperInit);
+        BigDecimal lowerInitVol = parseVolume("lowerInitialVolumeM3", lowerInit);
+        BigDecimal upperMinVol = parseVolume("upperMinVolumeM3", upperMin);
+        BigDecimal upperMaxVol = parseVolume("upperMaxVolumeM3", upperMax);
+        BigDecimal lowerMinVol = parseVolume("lowerMinVolumeM3", lowerMin);
+        BigDecimal lowerMaxVol = parseVolume("lowerMaxVolumeM3", lowerMax);
+        requireBounds("upper", upperMinVol, upperMaxVol, upperInitVol);
+        requireBounds("lower", lowerMinVol, lowerMaxVol, lowerInitVol);
+        String params = "BASIN_WINDOW_CREATE|" + windowKey + "|" + channelId + "|" + startNanos + "|" + endNanos
+                + "|" + planned.toPlainString() + "|" + upperArea + "|" + lowerArea
+                + "|" + upperInitVol.toPlainString() + "|" + lowerInitVol.toPlainString()
+                + "|" + upperMinVol.toPlainString() + "|" + upperMaxVol.toPlainString()
+                + "|" + lowerMinVol.toPlainString() + "|" + lowerMaxVol.toPlainString()
+                + "|" + actor + "|" + (expectedVersion == null ? "" : expectedVersion);
+        return runCommand("BASIN_WINDOW_CREATE", commandKey, params, BasinWindowResponse.class, () -> {
+            if (repository.existsOverlappingWindow(channelId, startNanos, endNanos)) {
+                throw ApiException.conflict("WINDOW_OVERLAP", "同一渠道存在时间重叠的供水窗口");
+            }
+            long now = nowNanos();
+            long id = repository.insertWindow(windowKey, channelId, startNanos, endNanos, planned, now);
+            repository.insertBasinPair(id, upperArea, lowerArea, upperInitVol, lowerInitVol,
+                    upperMinVol, upperMaxVol, lowerMinVol, lowerMaxVol, now);
+            WindowRow window = repository.findWindowById(id);
+            BasinPairRow basins = repository.findBasinPairByWindowId(id);
+            return new BasinWindowResponse(toWindowResponse(window, null), toBasinPairResponse(basins));
+        });
+    }
+
+    /**
+     * 合成闸门执行：对当前 APPROVED 申请输水 V（正整数立方米），从上池扣 V、下池加 V。
+     * 执行前后两池水位差均不得超过 2 米（精确算术，显示舍入不参与门禁），体积均须在界内；
+     * 累计执行不得超过批准量（持有额度）。任一条件失败 422，双池与执行账均不变；
+     * 成功后在同事务冻结双池前后体积与水位展示值并记账，不可取消返还。
+     */
+    public ExecutionResponse executeAllocation(String commandKey, String allocationKey, String executionKey,
+                                               String volume, String expectedVersion, String actor) {
+        requireKey("commandKey", commandKey);
+        requireKey("allocationKey", allocationKey);
+        requireKey("executionKey", executionKey);
+        requireKey("X-Actor-Id", actor);
+        BigDecimal qty = parsePositiveInteger("volume", volume);
+        String params = "GATE_EXECUTE|" + allocationKey + "|" + executionKey + "|" + qty.toPlainString()
+                + "|" + actor + "|" + (expectedVersion == null ? "" : expectedVersion);
+        return runCommand("GATE_EXECUTE", commandKey, params, ExecutionResponse.class, () -> {
+            if (repository.findExecutionByKey(executionKey) != null) {
+                throw ApiException.conflict("EXECUTION_KEY_REUSED", "executionKey 已被使用: " + executionKey);
+            }
+            AllocationRow allocation = repository.findAllocationByKey(allocationKey);
+            if (allocation == null) {
+                throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+            }
+            WindowRow window = lockWindowOf(allocation);
+            // 窗口锁内重读申请并锁定双池行，与取消/转让/其他执行按事务提交顺序共同裁决
+            allocation = repository.lockAllocationByKey(allocationKey);
+            BasinPairRow basins = repository.lockBasinPairByWindowId(window.id());
+            if (basins == null) {
+                throw ApiException.unprocessable("BASIN_NOT_CONFIGURED",
+                        "普通窗口不启用双池规则，不能执行输水: " + allocationKey);
+            }
+            if (!STATUS_APPROVED.equals(allocation.status())) {
+                throw ApiException.unprocessable("EXECUTION_NOT_APPROVED",
+                        "只有 APPROVED 状态的申请可以执行输水，当前状态: " + allocation.status());
+            }
+            if (allocation.heldAmount().compareTo(qty) < 0) {
+                throw ApiException.unprocessable("EXECUTION_EXCEEDS_QUOTA",
+                        "累计执行将超过批准量，剩余可执行 " + fmt(allocation.heldAmount())
+                                + "，本次请求 " + fmt(qty));
+            }
+            if (!levelDiffWithinLimit(basins.upperVolumeM3(), basins.upperAreaM2(),
+                    basins.lowerVolumeM3(), basins.lowerAreaM2())) {
+                throw ApiException.unprocessable("LEVEL_DIFF_EXCEEDED", "执行前两池水位差已超过 2 米，禁止输水");
+            }
+            BigDecimal upperAfter = basins.upperVolumeM3().subtract(qty);
+            BigDecimal lowerAfter = basins.lowerVolumeM3().add(qty);
+            if (upperAfter.compareTo(basins.upperMinM3()) < 0 || upperAfter.compareTo(basins.upperMaxM3()) > 0
+                    || lowerAfter.compareTo(basins.lowerMinM3()) < 0
+                    || lowerAfter.compareTo(basins.lowerMaxM3()) > 0) {
+                throw ApiException.unprocessable("VOLUME_OUT_OF_BOUNDS",
+                        "执行后体积越界：上池 [" + fmt(basins.upperMinM3()) + ", " + fmt(basins.upperMaxM3())
+                                + "] 得 " + fmt(upperAfter) + "，下池 [" + fmt(basins.lowerMinM3()) + ", "
+                                + fmt(basins.lowerMaxM3()) + "] 得 " + fmt(lowerAfter));
+            }
+            if (!levelDiffWithinLimit(upperAfter, basins.upperAreaM2(), lowerAfter, basins.lowerAreaM2())) {
+                throw ApiException.unprocessable("LEVEL_DIFF_EXCEEDED", "执行后两池水位差将超过 2 米，禁止输水");
+            }
+            long now = nowNanos();
+            repository.updateBasinVolumes(basins.id(), upperAfter, lowerAfter, now);
+            repository.addExecutedAmount(allocation.id(), qty, now);
+            try {
+                repository.insertExecution(executionKey, allocationKey, window.id(), qty,
+                        basins.upperVolumeM3(), upperAfter, basins.lowerVolumeM3(), lowerAfter,
+                        levelDisplay(basins.upperVolumeM3(), basins.upperAreaM2()),
+                        levelDisplay(upperAfter, basins.upperAreaM2()),
+                        levelDisplay(basins.lowerVolumeM3(), basins.lowerAreaM2()),
+                        levelDisplay(lowerAfter, basins.lowerAreaM2()), actor, now);
+            } catch (DuplicateKeyException e) {
+                // 并发复用同一 executionKey（换 requestId）：事务回滚，双池与执行账无变化
+                throw ApiException.conflict("EXECUTION_KEY_REUSED", "executionKey 已被使用: " + executionKey);
+            }
+            AllocationRow updated = repository.findAllocationByKey(allocationKey);
+            return toExecutionResponse(repository.findExecutionByKey(executionKey), updated);
+        });
+    }
+
+    /** 查询申请的执行明细与剩余可执行量（APPROVED 时等于持有额度，其余状态为 0）。 */
+    public ExecutionListResponse getExecutions(String allocationKey) {
+        AllocationRow allocation = repository.findAllocationByKey(allocationKey);
+        if (allocation == null) {
+            throw ApiException.notFound("ALLOCATION_NOT_FOUND", "配水申请不存在: " + allocationKey);
+        }
+        List<ExecutionResponse> executions = repository.listExecutionsByAllocation(allocationKey).stream()
+                .map(row -> toExecutionResponse(row, allocation)).toList();
+        String remaining = STATUS_APPROVED.equals(allocation.status())
+                ? fmt(allocation.heldAmount()) : "0";
+        return new ExecutionListResponse(allocationKey, allocation.windowId(), fmt(allocation.executedAmount()),
+                remaining, executions);
+    }
+
+    /** 查询窗口双池当前体积与水位展示值；普通窗口无双池返回 404。 */
+    public BasinPairResponse getBasins(long windowId) {
+        if (repository.findWindowById(windowId) == null) {
+            throw ApiException.notFound("WINDOW_NOT_FOUND", "供水窗口不存在: " + windowId);
+        }
+        BasinPairRow basins = repository.findBasinPairByWindowId(windowId);
+        if (basins == null) {
+            throw ApiException.notFound("BASIN_NOT_FOUND", "窗口未登记双池: " + windowId);
+        }
+        return toBasinPairResponse(basins);
+    }
+
+    // ------------------------------------------------------------------
     // 幂等命令框架
     // ------------------------------------------------------------------
 
@@ -369,6 +536,65 @@ public class WaterService {
         return active != null ? active.volume() : window.plannedVolume();
     }
 
+    /**
+     * 水位差门禁：|上池体积/上池面积 - 下池体积/下池面积| <= 2 米。
+     * 交叉相乘后比较，全程 BigDecimal 精确算术，不做除法舍入。
+     */
+    static boolean levelDiffWithinLimit(BigDecimal upperVolume, long upperArea,
+                                        BigDecimal lowerVolume, long lowerArea) {
+        BigDecimal lhs = upperVolume.multiply(BigDecimal.valueOf(lowerArea))
+                .subtract(lowerVolume.multiply(BigDecimal.valueOf(upperArea))).abs();
+        BigDecimal rhs = MAX_LEVEL_DIFF_M.multiply(BigDecimal.valueOf(upperArea))
+                .multiply(BigDecimal.valueOf(lowerArea));
+        return lhs.compareTo(rhs) <= 0;
+    }
+
+    /** 水位展示值：体积/面积，最多 15 位小数 HALF_UP 舍入；仅用于显示，不参与水位门禁。 */
+    static BigDecimal levelDisplay(BigDecimal volume, long area) {
+        return volume.divide(BigDecimal.valueOf(area), 15, RoundingMode.HALF_UP);
+    }
+
+    private BasinPairResponse toBasinPairResponse(BasinPairRow row) {
+        BigDecimal upperLevel = levelDisplay(row.upperVolumeM3(), row.upperAreaM2());
+        BigDecimal lowerLevel = levelDisplay(row.lowerVolumeM3(), row.lowerAreaM2());
+        return new BasinPairResponse(row.windowId(), row.upperAreaM2(), row.lowerAreaM2(),
+                fmt(row.upperVolumeM3()), fmt(row.lowerVolumeM3()),
+                fmt(row.upperMinM3()), fmt(row.upperMaxM3()),
+                fmt(row.lowerMinM3()), fmt(row.lowerMaxM3()),
+                fmt(upperLevel), fmt(lowerLevel), fmt(upperLevel.subtract(lowerLevel).abs()),
+                toIso(row.updatedNanos()));
+    }
+
+    private ExecutionResponse toExecutionResponse(ExecutionRow row, AllocationRow allocation) {
+        String remaining = STATUS_APPROVED.equals(allocation.status())
+                ? fmt(allocation.heldAmount()) : "0";
+        return new ExecutionResponse(row.executionKey(), row.allocationKey(), row.windowId(),
+                fmt(row.volumeM3()), fmt(row.upperBeforeM3()), fmt(row.upperAfterM3()),
+                fmt(row.lowerBeforeM3()), fmt(row.lowerAfterM3()),
+                fmt(row.upperLevelBeforeM()), fmt(row.upperLevelAfterM()),
+                fmt(row.lowerLevelBeforeM()), fmt(row.lowerLevelAfterM()),
+                fmt(allocation.executedAmount()), remaining, row.actor(), toIso(row.createdNanos()));
+    }
+
+    private static long requirePositiveArea(String field, Long value) {
+        if (value == null || value <= 0) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 必须为正整数（平方米）");
+        }
+        return value;
+    }
+
+    private static void requireBounds(String pool, BigDecimal min, BigDecimal max, BigDecimal initial) {
+        if (min.compareTo(max) > 0) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    pool + " 池体积下界不能大于上界: " + fmt(min) + " > " + fmt(max));
+        }
+        if (initial.compareTo(min) < 0 || initial.compareTo(max) > 0) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    pool + " 池初始体积 " + fmt(initial) + " 不在上下界 [" + fmt(min) + ", "
+                            + fmt(max) + "] 内");
+        }
+    }
+
     private WindowResponse toWindowResponse(WindowRow row, CurtailmentRow active) {
         BigDecimal available = active != null ? active.volume() : row.plannedVolume();
         return new WindowResponse(row.id(), row.windowKey(), row.channelId(), toIso(row.startNanos()),
@@ -378,7 +604,7 @@ public class WaterService {
 
     private AllocationResponse toAllocationResponse(AllocationRow row) {
         return new AllocationResponse(row.allocationKey(), row.windowId(), row.userId(), fmt(row.amount()),
-                fmt(row.heldAmount()), row.requester(), row.status(),
+                fmt(row.heldAmount()), fmt(row.executedAmount()), row.requester(), row.status(),
                 toIso(row.createdNanos()), toIso(row.updatedNanos()));
     }
 
@@ -431,6 +657,36 @@ public class WaterService {
         if (!AMOUNT_PATTERN.matcher(trimmed).matches()) {
             throw ApiException.badRequest("INVALID_ARGUMENT",
                     field + " 必须为大于 0 的十进制字符串，最多 3 位小数: " + value);
+        }
+        BigDecimal amount = new BigDecimal(trimmed);
+        if (amount.signum() <= 0) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 必须大于 0");
+        }
+        return amount;
+    }
+
+    /** 解析体积：十进制字符串，非负，最多 3 位小数（用于双池初始体积与上下界）。 */
+    static BigDecimal parseVolume(String field, String value) {
+        if (value == null || value.isBlank()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 不能为空");
+        }
+        String trimmed = value.trim();
+        if (!AMOUNT_PATTERN.matcher(trimmed).matches()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    field + " 必须为非负十进制字符串，最多 3 位小数: " + value);
+        }
+        return new BigDecimal(trimmed);
+    }
+
+    /** 解析执行水量：正整数字符串（立方米）。 */
+    static BigDecimal parsePositiveInteger(String field, String value) {
+        if (value == null || value.isBlank()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT", field + " 不能为空");
+        }
+        String trimmed = value.trim();
+        if (!INTEGER_PATTERN.matcher(trimmed).matches()) {
+            throw ApiException.badRequest("INVALID_ARGUMENT",
+                    field + " 必须为正整数字符串（立方米）: " + value);
         }
         BigDecimal amount = new BigDecimal(trimmed);
         if (amount.signum() <= 0) {
