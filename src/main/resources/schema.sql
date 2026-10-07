@@ -60,12 +60,50 @@ CREATE TABLE IF NOT EXISTS loan_record (
     KEY idx_loan_borrower_status (borrower_id, status)
 );
 
+-- 证物介质：数字证物的存储介质副本。初始登记即为 ACTIVE（当前读取来源）；
+-- 迁移产生的新副本先为 UNVERIFIED，见证验证通过后 VERIFIED，切换后旧副本 RETIRED。
+-- 摘要登记后不可变；RETIRED 仅保留历史元数据，不作为当前读取来源，不要求删除磁盘文件。
+CREATE TABLE IF NOT EXISTS evidence_media (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    media_no VARCHAR(64) NOT NULL COMMENT '介质编号，同一证物内唯一',
+    sha256 VARCHAR(64) NOT NULL COMMENT '介质合成内容的 SHA-256 摘要（64 位小写十六进制），登记后不可变',
+    status VARCHAR(20) NOT NULL COMMENT '介质状态：ACTIVE 当前读取来源 / UNVERIFIED 待验证 / VERIFIED 已验证待切换 / RETIRED 已作废',
+    version INT NOT NULL COMMENT '介质版本号，创建为 1，每次状态变更递增',
+    created_by VARCHAR(64) NOT NULL COMMENT '登记该介质的操作人',
+    created_at DATETIME(6) NOT NULL COMMENT '登记时间，Asia/Shanghai',
+    retired_at DATETIME(6) NULL COMMENT '作废时间，Asia/Shanghai；NULL 表示未作废',
+    CONSTRAINT uk_media_evidence_no UNIQUE (evidence_key, media_no),
+    KEY idx_media_evidence (evidence_key)
+);
+
+-- 介质迁移：每件证物至多一条待完成迁移（PENDING_VERIFY/PENDING_SWITCH），由证物行锁保证。
+-- 创建时固定源介质版本与新介质号；切换与取消按事务提交顺序生效，决定后状态不可再变。
+CREATE TABLE IF NOT EXISTS media_migration (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    migration_key VARCHAR(64) NOT NULL COMMENT '迁移业务键，全局唯一',
+    evidence_key VARCHAR(64) NOT NULL COMMENT '关联证物业务键',
+    source_media_id BIGINT NOT NULL COMMENT '固定源介质主键（创建迁移时的 ACTIVE 介质）',
+    source_media_no VARCHAR(64) NOT NULL COMMENT '固定源介质编号',
+    source_version INT NOT NULL COMMENT '创建迁移时固定的源介质版本号',
+    target_media_id BIGINT NOT NULL COMMENT '新介质主键',
+    target_media_no VARCHAR(64) NOT NULL COMMENT '新介质编号',
+    status VARCHAR(20) NOT NULL COMMENT '迁移状态：PENDING_VERIFY 待验证 / PENDING_SWITCH 已验证待切换 / SWITCHED 已切换 / CANCELLED 已取消',
+    witness_id VARCHAR(64) NULL COMMENT '验证通过的非保管人见证者；NULL 表示尚未验证；切换后冻结不可变',
+    version INT NOT NULL COMMENT '迁移版本号，创建为 1，每次状态流转递增；写操作须携带期望版本',
+    created_by VARCHAR(64) NOT NULL COMMENT '创建迁移的保管人',
+    created_at DATETIME(6) NOT NULL COMMENT '迁移创建时间，Asia/Shanghai',
+    decided_at DATETIME(6) NULL COMMENT '切换或取消时间，Asia/Shanghai；NULL 表示迁移未完结',
+    CONSTRAINT uk_migration_key UNIQUE (migration_key),
+    KEY idx_migration_evidence (evidence_key)
+);
+
 -- 幂等命令日志：command_key 全局唯一；同键同参重放返回首次结果，同键改参返回 409。
 CREATE TABLE IF NOT EXISTS command_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     command_key VARCHAR(64) NOT NULL COMMENT '幂等命令键，全局唯一',
     actor_id VARCHAR(64) NOT NULL COMMENT '发起操作人',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：INTAKE/TRANSFER_INITIATE/TRANSFER_ACCEPT/TRANSFER_CANCEL/SEAL_INSPECTION/LOAN_BORROW/LOAN_RETURN/MEDIA_REGISTER/MIGRATION_CREATE/MIGRATION_VERIFY/MIGRATION_SWITCH/MIGRATION_CANCEL',
     request_hash VARCHAR(64) NOT NULL COMMENT '请求参数规范化后的 SHA-256，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行的 HTTP 状态码',
     response_body TEXT NOT NULL COMMENT '首次执行的响应体 JSON，重放时原样返回',
