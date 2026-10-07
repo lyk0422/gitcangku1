@@ -7,8 +7,10 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
 import com.example.starter.maintenance.api.ApiException;
+import com.example.starter.maintenance.api.dto.AddCycleRequest;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.CycleResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -33,13 +35,18 @@ public class EquipmentService {
     }
 
     public EquipmentResponse register(RegisterEquipmentRequest req) {
-        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes();
+        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes()
+                + "|" + req.fatigueThreshold() + "|" + req.baselineStressMpa();
         return recoverDuplicateKey(req.requestId(), "REGISTER_EQUIPMENT", fingerprint,
                 EquipmentResponse.class, () -> txService.register(req));
     }
 
     public ReadingResponse addReading(String equipmentId, AddReadingRequest req) {
         return txService.addReading(equipmentId, req);
+    }
+
+    public CycleResponse addCycle(String equipmentId, AddCycleRequest req) {
+        return txService.addCycle(equipmentId, req);
     }
 
     public ReadingResponse reviseReading(String equipmentId, String readingId, ReviseReadingRequest req) {
@@ -64,6 +71,10 @@ public class EquipmentService {
 
     public List<MaintenanceResponse> listMaintenances(String equipmentId) {
         return txService.listMaintenances(equipmentId);
+    }
+
+    public List<CycleResponse> listCycles(String equipmentId) {
+        return txService.listCycles(equipmentId);
     }
 
     /**

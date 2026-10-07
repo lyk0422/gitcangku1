@@ -13,8 +13,10 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.example.starter.maintenance.api.dto.AddCycleRequest;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.CycleResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -61,6 +63,14 @@ public class EquipmentController {
         return service.reviseReading(equipmentId, readingId, req);
     }
 
+    /** 新增闭合应力循环：仅完整闭合循环写损伤；缺回落、时刻越界、区间重叠均 422，不写半循环。 */
+    @PostMapping("/{equipmentId}/cycles")
+    @ResponseStatus(HttpStatus.CREATED)
+    public CycleResponse addCycle(@PathVariable String equipmentId,
+                                  @Valid @RequestBody AddCycleRequest req) {
+        return service.addCycle(equipmentId, req);
+    }
+
     /** 完成保养：以现存读数及其当前修订号为锚点，锚点时间须晚于上次保养锚点。 */
     @PostMapping("/{equipmentId}/maintenances")
     @ResponseStatus(HttpStatus.CREATED)
@@ -92,5 +102,11 @@ public class EquipmentController {
     @GetMapping("/{equipmentId}/maintenances")
     public List<MaintenanceResponse> listMaintenances(@PathVariable String equipmentId) {
         return service.listMaintenances(equipmentId);
+    }
+
+    /** 应力循环账本（按升峰时刻升序，只增不改）。 */
+    @GetMapping("/{equipmentId}/cycles")
+    public List<CycleResponse> listCycles(@PathVariable String equipmentId) {
+        return service.listCycles(equipmentId);
     }
 }

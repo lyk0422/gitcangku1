@@ -15,6 +15,7 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import com.example.starter.maintenance.domain.Equipment;
+import com.example.starter.maintenance.domain.FatigueCycle;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
 
@@ -41,6 +42,8 @@ public class EquipmentRepository {
     private static final RowMapper<Equipment> EQUIPMENT_MAPPER = (rs, rowNum) -> new Equipment(
             rs.getString("equipment_id"),
             rs.getLong("maintenance_period_minutes"),
+            rs.getObject("fatigue_threshold", Long.class),
+            rs.getObject("baseline_stress_mpa", Long.class),
             rs.getLong("version"));
 
     private static final RowMapper<Reading> READING_MAPPER = (rs, rowNum) -> new Reading(
@@ -59,17 +62,39 @@ public class EquipmentRepository {
             rs.getLong("anchor_cumulative_minutes"),
             readInstant(rs, "completed_at"));
 
+    private static final RowMapper<FatigueCycle> CYCLE_MAPPER = (rs, rowNum) -> new FatigueCycle(
+            rs.getString("equipment_id"),
+            rs.getString("cycle_id"),
+            rs.getString("from_reading_id"),
+            rs.getInt("from_revision_no"),
+            rs.getString("to_reading_id"),
+            rs.getInt("to_revision_no"),
+            readInstant(rs, "peak_at"),
+            readInstant(rs, "return_at"),
+            rs.getLong("peak_stress_mpa"),
+            rs.getLong("return_stress_mpa"),
+            rs.getLong("damage"),
+            rs.getString("operator_name"));
+
+    private static final String CYCLE_COLUMNS = "equipment_id, cycle_id, from_reading_id, from_revision_no,"
+            + " to_reading_id, to_revision_no, peak_at, return_at, peak_stress_mpa, return_stress_mpa,"
+            + " damage, operator_name";
+
     // ---------- 设备 ----------
 
-    public void insertEquipment(String equipmentId, long maintenancePeriodMinutes, Instant createdAt) {
-        jdbc.update("INSERT INTO equipment (equipment_id, maintenance_period_minutes, version, created_at)"
-                        + " VALUES (?, ?, 1, ?)",
-                equipmentId, maintenancePeriodMinutes, utc(createdAt));
+    public void insertEquipment(String equipmentId, long maintenancePeriodMinutes,
+                                Long fatigueThreshold, Long baselineStressMpa, Instant createdAt) {
+        jdbc.update("INSERT INTO equipment (equipment_id, maintenance_period_minutes,"
+                        + " fatigue_threshold, baseline_stress_mpa, version, created_at)"
+                        + " VALUES (?, ?, ?, ?, 1, ?)",
+                equipmentId, maintenancePeriodMinutes, fatigueThreshold, baselineStressMpa,
+                utc(createdAt));
     }
 
     public Optional<Equipment> findEquipment(String equipmentId) {
         List<Equipment> rows = jdbc.query(
-                "SELECT equipment_id, maintenance_period_minutes, version FROM equipment WHERE equipment_id = ?",
+                "SELECT equipment_id, maintenance_period_minutes, fatigue_threshold,"
+                        + " baseline_stress_mpa, version FROM equipment WHERE equipment_id = ?",
                 EQUIPMENT_MAPPER, equipmentId);
         return rows.stream().findFirst();
     }
@@ -77,7 +102,8 @@ public class EquipmentRepository {
     /** 悲观行锁：同一设备的写操作串行化，保证版本校验与业务变更原子。 */
     public Optional<Equipment> findEquipmentForUpdate(String equipmentId) {
         List<Equipment> rows = jdbc.query(
-                "SELECT equipment_id, maintenance_period_minutes, version FROM equipment"
+                "SELECT equipment_id, maintenance_period_minutes, fatigue_threshold,"
+                        + " baseline_stress_mpa, version FROM equipment"
                         + " WHERE equipment_id = ? FOR UPDATE",
                 EQUIPMENT_MAPPER, equipmentId);
         return rows.stream().findFirst();
@@ -231,6 +257,71 @@ public class EquipmentRepository {
         Integer count = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM maintenance WHERE equipment_id = ? AND reading_id = ?",
                 Integer.class, equipmentId, readingId);
+        return count != null && count > 0;
+    }
+
+    // ---------- 应力循环 ----------
+
+    public void insertCycle(FatigueCycle cycle, String requestId, Instant createdAt) {
+        jdbc.update("INSERT INTO fatigue_cycle (equipment_id, cycle_id, from_reading_id, from_revision_no,"
+                        + " to_reading_id, to_revision_no, peak_at, return_at, peak_stress_mpa,"
+                        + " return_stress_mpa, damage, operator_name, request_id, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                cycle.equipmentId(), cycle.cycleId(), cycle.fromReadingId(), cycle.fromRevisionNo(),
+                cycle.toReadingId(), cycle.toRevisionNo(), utc(cycle.peakAt()), utc(cycle.returnAt()),
+                cycle.peakStressMpa(), cycle.returnStressMpa(), cycle.damage(), cycle.operator(),
+                requestId, utc(createdAt));
+    }
+
+    public Optional<FatigueCycle> findCycle(String equipmentId, String cycleId) {
+        List<FatigueCycle> rows = jdbc.query(
+                "SELECT " + CYCLE_COLUMNS + " FROM fatigue_cycle"
+                        + " WHERE equipment_id = ? AND cycle_id = ?",
+                CYCLE_MAPPER, equipmentId, cycleId);
+        return rows.stream().findFirst();
+    }
+
+    /** 设备全部循环，按升峰时刻升序（账本只增不改）。 */
+    public List<FatigueCycle> listCycles(String equipmentId) {
+        return jdbc.query(
+                "SELECT " + CYCLE_COLUMNS + " FROM fatigue_cycle WHERE equipment_id = ?"
+                        + " ORDER BY peak_at ASC, cycle_id ASC",
+                CYCLE_MAPPER, equipmentId);
+    }
+
+    /** 是否存在与新循环区间 [peakAt, returnAt] 重叠（严格相交，端点相接不算）的已有循环。 */
+    public boolean existsOverlappingCycle(String equipmentId, Instant peakAt, Instant returnAt) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM fatigue_cycle WHERE equipment_id = ?"
+                        + " AND peak_at < ? AND return_at > ?",
+                Integer.class, equipmentId, utc(returnAt), utc(peakAt));
+        return count != null && count > 0;
+    }
+
+    /** 是否存在严格包含锚点时刻的循环（跨锚点循环不允许拆分到两轮）。 */
+    public boolean existsCycleSpanning(String equipmentId, Instant anchorSampledAt) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM fatigue_cycle WHERE equipment_id = ?"
+                        + " AND peak_at < ? AND return_at > ?",
+                Integer.class, equipmentId, utc(anchorSampledAt), utc(anchorSampledAt));
+        return count != null && count > 0;
+    }
+
+    /** 是否存在落在新区间内部的保养锚点（新循环不得跨越已有锚点）。 */
+    public boolean existsAnchorStrictlyBetween(String equipmentId, Instant peakAt, Instant returnAt) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM maintenance WHERE equipment_id = ?"
+                        + " AND anchor_sampled_at > ? AND anchor_sampled_at < ?",
+                Integer.class, equipmentId, utc(peakAt), utc(returnAt));
+        return count != null && count > 0;
+    }
+
+    /** 该读数是否已被任意循环引用（引用后不可修订）。 */
+    public boolean existsCycleReferencingReading(String equipmentId, String readingId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM fatigue_cycle WHERE equipment_id = ?"
+                        + " AND (from_reading_id = ? OR to_reading_id = ?)",
+                Integer.class, equipmentId, readingId, readingId);
         return count != null && count > 0;
     }
 

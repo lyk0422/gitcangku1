@@ -5,13 +5,17 @@
 CREATE TABLE IF NOT EXISTS equipment (
     equipment_id VARCHAR(64) NOT NULL PRIMARY KEY,
     maintenance_period_minutes BIGINT NOT NULL,
+    fatigue_threshold BIGINT,
+    baseline_stress_mpa BIGINT,
     version BIGINT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
 COMMENT ON TABLE equipment IS '设备主表：每台设备一行';
 COMMENT ON COLUMN equipment.equipment_id IS '设备唯一标识（客户端提供）';
 COMMENT ON COLUMN equipment.maintenance_period_minutes IS '保养周期（分钟），正整数，登记后不可修改';
-COMMENT ON COLUMN equipment.version IS '设备版本号，初始 1；新增读数/修订/完成保养均校验 expectedVersion 并加一';
+COMMENT ON COLUMN equipment.fatigue_threshold IS '疲劳阈值（正整数）：本轮累计损伤达到即 DUE；NULL 表示未启用疲劳门禁';
+COMMENT ON COLUMN equipment.baseline_stress_mpa IS '基准应力（兆帕），非负整数；循环回落值须等于该值；NULL 表示未配置，不能写入循环';
+COMMENT ON COLUMN equipment.version IS '设备版本号，初始 1；新增读数/修订/循环写入/完成保养均校验 expectedVersion 并加一';
 COMMENT ON COLUMN equipment.created_at IS '登记时刻（UTC）';
 
 -- 工时读数当前值表：reading_id 设备内唯一，同设备同一采样时刻仅一条。
@@ -75,6 +79,41 @@ COMMENT ON COLUMN maintenance.anchor_cumulative_minutes IS '锚点读数在保�
 COMMENT ON COLUMN maintenance.request_id IS '完成保养请求的 requestId';
 COMMENT ON COLUMN maintenance.completed_at IS '保养完成登记时刻（UTC）';
 
+-- 闭合应力循环账本：仅完整闭合循环（升峰后回落到基准）写损伤，不连接真实传感器。
+CREATE TABLE IF NOT EXISTS fatigue_cycle (
+    equipment_id VARCHAR(64) NOT NULL,
+    cycle_id VARCHAR(64) NOT NULL,
+    from_reading_id VARCHAR(64) NOT NULL,
+    from_revision_no INT NOT NULL,
+    to_reading_id VARCHAR(64) NOT NULL,
+    to_revision_no INT NOT NULL,
+    peak_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    return_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    peak_stress_mpa BIGINT NOT NULL,
+    return_stress_mpa BIGINT NOT NULL,
+    damage BIGINT NOT NULL,
+    operator_name VARCHAR(128) NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    PRIMARY KEY (equipment_id, cycle_id)
+);
+CREATE INDEX IF NOT EXISTS idx_fatigue_cycle_time ON fatigue_cycle (equipment_id, peak_at, return_at);
+COMMENT ON TABLE fatigue_cycle IS '闭合应力循环账本：循环区间 [peak_at, return_at] 不得重叠，不得跨越保养锚点';
+COMMENT ON COLUMN fatigue_cycle.equipment_id IS '所属设备标识';
+COMMENT ON COLUMN fatigue_cycle.cycle_id IS '循环标识，设备内唯一';
+COMMENT ON COLUMN fatigue_cycle.from_reading_id IS '起始引用工时读数标识（引用后该读数不可修订）';
+COMMENT ON COLUMN fatigue_cycle.from_revision_no IS '起始引用读数在写入时的修订号（快照）';
+COMMENT ON COLUMN fatigue_cycle.to_reading_id IS '结束引用工时读数标识（引用后该读数不可修订）';
+COMMENT ON COLUMN fatigue_cycle.to_revision_no IS '结束引用读数在写入时的修订号（快照）';
+COMMENT ON COLUMN fatigue_cycle.peak_at IS '升峰采样时刻（UTC），须不早于起始读数时刻且严格早于回落时刻';
+COMMENT ON COLUMN fatigue_cycle.return_at IS '回落采样时刻（UTC），须不晚于结束读数时刻';
+COMMENT ON COLUMN fatigue_cycle.peak_stress_mpa IS '峰值应力（兆帕），须大于基准应力';
+COMMENT ON COLUMN fatigue_cycle.return_stress_mpa IS '回落应力（兆帕），须等于基准应力（闭合）';
+COMMENT ON COLUMN fatigue_cycle.damage IS '本循环损伤 = (峰值应力 - 基准应力)^3，精确整数，不超长整型';
+COMMENT ON COLUMN fatigue_cycle.operator_name IS '操作者（非空）';
+COMMENT ON COLUMN fatigue_cycle.request_id IS '写入请求的 requestId';
+COMMENT ON COLUMN fatigue_cycle.created_at IS '循环登记时刻（UTC）';
+
 -- 幂等去重表：requestId 全局唯一；仅成功结果占键，失败回滚不占键。
 CREATE TABLE IF NOT EXISTS idempotency_request (
     request_id VARCHAR(128) NOT NULL PRIMARY KEY,
@@ -85,7 +124,7 @@ CREATE TABLE IF NOT EXISTS idempotency_request (
 );
 COMMENT ON TABLE idempotency_request IS '写操作幂等去重：同键同参重放原成功结果，同键异参返回 409';
 COMMENT ON COLUMN idempotency_request.request_id IS '全局唯一请求标识';
-COMMENT ON COLUMN idempotency_request.operation IS '操作类型（登记设备/新增读数/修订/完成保养）';
+COMMENT ON COLUMN idempotency_request.operation IS '操作类型（登记设备/新增读数/修订/循环写入/完成保养）';
 COMMENT ON COLUMN idempotency_request.request_fingerprint IS '业务参数指纹（不含 requestId），用于同键异参判定';
 COMMENT ON COLUMN idempotency_request.response_body IS '原成功响应报文（JSON），重放时原样返回';
 COMMENT ON COLUMN idempotency_request.created_at IS '首次成功处理时刻（UTC）';

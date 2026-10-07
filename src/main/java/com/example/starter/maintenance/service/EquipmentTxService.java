@@ -1,5 +1,6 @@
 package com.example.starter.maintenance.service;
 
+import java.math.BigInteger;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
@@ -9,8 +10,10 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.example.starter.maintenance.api.ApiException;
+import com.example.starter.maintenance.api.dto.AddCycleRequest;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.CycleResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -19,6 +22,7 @@ import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
 import com.example.starter.maintenance.domain.Equipment;
+import com.example.starter.maintenance.domain.FatigueCycle;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
 import com.example.starter.maintenance.store.EquipmentRepository;
@@ -44,14 +48,17 @@ public class EquipmentTxService {
 
     @Transactional
     public EquipmentResponse register(RegisterEquipmentRequest req) {
-        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes();
+        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes()
+                + "|" + req.fatigueThreshold() + "|" + req.baselineStressMpa();
         return idempotency.execute(req.requestId(), "REGISTER_EQUIPMENT", fingerprint,
                 EquipmentResponse.class, () -> {
                     if (repository.findEquipment(req.equipmentId()).isPresent()) {
                         throw ApiException.conflict("EQUIPMENT_EXISTS", "设备已存在：" + req.equipmentId());
                     }
-                    repository.insertEquipment(req.equipmentId(), req.maintenancePeriodMinutes(), clock.instant());
-                    return new EquipmentResponse(req.equipmentId(), req.maintenancePeriodMinutes(), 1L);
+                    repository.insertEquipment(req.equipmentId(), req.maintenancePeriodMinutes(),
+                            req.fatigueThreshold(), req.baselineStressMpa(), clock.instant());
+                    return new EquipmentResponse(req.equipmentId(), req.maintenancePeriodMinutes(),
+                            req.fatigueThreshold(), req.baselineStressMpa(), 1L);
                 });
     }
 
@@ -103,6 +110,10 @@ public class EquipmentTxService {
                         throw ApiException.conflict("READING_ANCHORED",
                                 "读数已作为历史保养锚点，不可修订：" + readingId);
                     }
+                    if (repository.existsCycleReferencingReading(equipmentId, readingId)) {
+                        throw ApiException.conflict("READING_CYCLE_REFERENCED",
+                                "读数已被应力循环引用，不可修订：" + readingId);
+                    }
                     checkMonotonic(equipmentId, reading.sampledAt(), req.cumulativeMinutes());
                     int newRevisionNo = reading.revisionNo() + 1;
                     Instant now = clock.instant();
@@ -139,6 +150,10 @@ public class EquipmentTxService {
                         throw ApiException.unprocessable("ANCHOR_TIME_NOT_LATER",
                                 "保养锚点时间必须晚于上次保养锚点时间");
                     }
+                    if (repository.existsCycleSpanning(equipmentId, anchor.sampledAt())) {
+                        throw ApiException.unprocessable("CYCLE_SPANS_ANCHOR",
+                                "存在跨越锚点的完整循环，不能把一个损伤拆进两轮");
+                    }
                     Instant now = clock.instant();
                     long maintenanceId = repository.insertMaintenance(equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
@@ -147,6 +162,77 @@ public class EquipmentTxService {
                     return new MaintenanceResponse(maintenanceId, equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
                             now, equipment.version() + 1);
+                });
+    }
+
+    // ---------- 新增闭合应力循环 ----------
+
+    @Transactional
+    public CycleResponse addCycle(String equipmentId, AddCycleRequest req) {
+        Equipment equipment = lockEquipment(equipmentId);
+        String fingerprint = equipmentId + "|" + req.cycleId() + "|" + req.fromReadingId() + "|"
+                + req.fromRevisionNo() + "|" + req.toReadingId() + "|" + req.toRevisionNo() + "|"
+                + req.peakAt() + "|" + req.returnAt() + "|" + req.peakStressMpa() + "|"
+                + req.returnStressMpa() + "|" + req.operator() + "|" + req.expectedVersion();
+        return idempotency.execute(req.requestId(), "ADD_CYCLE", fingerprint,
+                CycleResponse.class, () -> {
+                    checkVersion(equipment, req.expectedVersion());
+                    Long baseline = equipment.baselineStressMpa();
+                    if (baseline == null) {
+                        throw ApiException.unprocessable("FATIGUE_NOT_CONFIGURED",
+                                "设备未配置基准应力，不能写入应力循环：" + equipmentId);
+                    }
+                    if (repository.findCycle(equipmentId, req.cycleId()).isPresent()) {
+                        throw ApiException.conflict("CYCLE_EXISTS", "循环已存在：" + req.cycleId());
+                    }
+                    Reading from = repository.findReading(equipmentId, req.fromReadingId())
+                            .orElseThrow(() -> ApiException.notFound("READING_NOT_FOUND",
+                                    "起始引用读数不存在：" + req.fromReadingId()));
+                    Reading to = repository.findReading(equipmentId, req.toReadingId())
+                            .orElseThrow(() -> ApiException.notFound("READING_NOT_FOUND",
+                                    "结束引用读数不存在：" + req.toReadingId()));
+                    if (from.revisionNo() != req.fromRevisionNo()
+                            || to.revisionNo() != req.toRevisionNo()) {
+                        throw ApiException.conflict("READING_REVISION_CONFLICT",
+                                "引用读数修订号与当前修订号不一致：起始期望 " + req.fromRevisionNo()
+                                        + "（当前 " + from.revisionNo() + "），结束期望 "
+                                        + req.toRevisionNo() + "（当前 " + to.revisionNo() + "）");
+                    }
+                    if (!req.peakAt().isBefore(req.returnAt())
+                            || req.peakAt().isBefore(from.sampledAt())
+                            || req.returnAt().isAfter(to.sampledAt())) {
+                        throw ApiException.unprocessable("CYCLE_OUT_OF_BOUNDS",
+                                "循环采样时刻须递增且落在引用读数时刻之间");
+                    }
+                    if (req.peakStressMpa() <= baseline) {
+                        throw ApiException.unprocessable("CYCLE_PEAK_NOT_ABOVE_BASELINE",
+                                "峰值应力须大于基准应力（" + baseline + " 兆帕）");
+                    }
+                    if (req.returnStressMpa() != baseline.longValue()) {
+                        throw ApiException.unprocessable("CYCLE_NOT_CLOSED",
+                                "回落应力须等于基准应力（" + baseline + " 兆帕），未闭合的半循环不写入");
+                    }
+                    if (repository.existsOverlappingCycle(equipmentId, req.peakAt(), req.returnAt())) {
+                        throw ApiException.unprocessable("CYCLE_OVERLAP",
+                                "循环区间与已有循环重叠");
+                    }
+                    if (repository.existsAnchorStrictlyBetween(equipmentId, req.peakAt(), req.returnAt())) {
+                        throw ApiException.unprocessable("CYCLE_SPANS_ANCHOR",
+                                "循环区间跨越历史保养锚点，损伤无法归入单一轮次");
+                    }
+                    long damage = computeDamage(req.peakStressMpa() - baseline);
+                    Instant now = clock.instant();
+                    repository.insertCycle(new FatigueCycle(equipmentId, req.cycleId(),
+                            req.fromReadingId(), req.fromRevisionNo(),
+                            req.toReadingId(), req.toRevisionNo(),
+                            req.peakAt(), req.returnAt(), req.peakStressMpa(),
+                            req.returnStressMpa(), damage, req.operator()), req.requestId(), now);
+                    repository.incrementVersion(equipmentId);
+                    return new CycleResponse(equipmentId, req.cycleId(),
+                            req.fromReadingId(), req.fromRevisionNo(),
+                            req.toReadingId(), req.toRevisionNo(),
+                            req.peakAt(), req.returnAt(), req.peakStressMpa(),
+                            req.returnStressMpa(), damage, req.operator(), equipment.version() + 1);
                 });
     }
 
@@ -161,11 +247,25 @@ public class EquipmentTxService {
         long latestCumulative = latest.map(Reading::cumulativeMinutes).orElse(0L);
         long anchorCumulative = last.map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
         long runMinutes = latestCumulative - anchorCumulative;
-        String status = runMinutes >= equipment.maintenancePeriodMinutes() ? "DUE" : "OK";
+        Instant anchorAt = last.map(MaintenanceRecord::anchorSampledAt).orElse(null);
+        BigInteger currentDamage = BigInteger.ZERO;
+        BigInteger historicalDamage = BigInteger.ZERO;
+        for (FatigueCycle cycle : repository.listCycles(equipmentId)) {
+            if (anchorAt != null && !cycle.returnAt().isAfter(anchorAt)) {
+                historicalDamage = historicalDamage.add(BigInteger.valueOf(cycle.damage()));
+            } else {
+                currentDamage = currentDamage.add(BigInteger.valueOf(cycle.damage()));
+            }
+        }
+        boolean hoursDue = runMinutes >= equipment.maintenancePeriodMinutes();
+        boolean fatigueDue = equipment.fatigueThreshold() != null
+                && currentDamage.compareTo(BigInteger.valueOf(equipment.fatigueThreshold())) >= 0;
+        String status = (hoursDue || fatigueDue) ? "DUE" : "OK";
         return new StatusResponse(equipmentId, equipment.version(), equipment.maintenancePeriodMinutes(),
+                equipment.fatigueThreshold(), equipment.baselineStressMpa(),
                 latest.map(Reading::sampledAt).orElse(null), latestCumulative,
                 last.map(MaintenanceRecord::anchorSampledAt).orElse(null), anchorCumulative,
-                runMinutes, status);
+                runMinutes, clampToLong(currentDamage), clampToLong(historicalDamage), status);
     }
 
     @Transactional(readOnly = true)
@@ -201,6 +301,19 @@ public class EquipmentTxService {
                 .toList();
     }
 
+    @Transactional(readOnly = true)
+    public List<CycleResponse> listCycles(String equipmentId) {
+        Equipment equipment = repository.findEquipment(equipmentId)
+                .orElseThrow(() -> equipmentNotFound(equipmentId));
+        return repository.listCycles(equipmentId).stream()
+                .map(cycle -> new CycleResponse(equipmentId, cycle.cycleId(),
+                        cycle.fromReadingId(), cycle.fromRevisionNo(),
+                        cycle.toReadingId(), cycle.toRevisionNo(),
+                        cycle.peakAt(), cycle.returnAt(), cycle.peakStressMpa(),
+                        cycle.returnStressMpa(), cycle.damage(), cycle.operator(), equipment.version()))
+                .toList();
+    }
+
     // ---------- 内部规则 ----------
 
     private Equipment lockEquipment(String equipmentId) {
@@ -217,6 +330,21 @@ public class EquipmentTxService {
             throw ApiException.conflict("VERSION_CONFLICT",
                     "设备版本冲突：期望 " + expectedVersion + "，当前 " + equipment.version());
         }
+    }
+
+    /** 循环损伤 = 幅值的三次方，精确整数；超出 long 范围拒绝（400）。 */
+    private long computeDamage(long amplitude) {
+        BigInteger value = BigInteger.valueOf(amplitude).pow(3);
+        if (value.compareTo(BigInteger.valueOf(Long.MAX_VALUE)) > 0) {
+            throw ApiException.badRequest("DAMAGE_OVERFLOW",
+                    "循环损伤超出长整型范围，拒绝写入");
+        }
+        return value.longValue();
+    }
+
+    /** 损伤求和上限截断为 long 最大值（达到该值必然已超任何合法阈值）。 */
+    private long clampToLong(BigInteger value) {
+        return value.min(BigInteger.valueOf(Long.MAX_VALUE)).longValue();
     }
 
     /** 单调性校验：新值须同时不早于前相邻读数、不晚于后相邻读数（按采样时刻排序）。 */
