@@ -72,6 +72,29 @@ public final class Rows {
     }
 
     /**
+     * 跨段引用边：源段声明的当前最新有向引用图中的一条边。
+     *
+     * @param sourceSegmentId 引用方源段 ID
+     * @param targetSegmentId 被引用目标源段 ID，同文档且不是自身
+     */
+    public record SegmentReferenceRow(String sourceSegmentId, String targetSegmentId) {
+    }
+
+    /**
+     * 译文引用绑定：译文提交时为每条出边固化的目标源版本与同语言译稿版本。
+     *
+     * @param segmentId                 引用方段落 ID
+     * @param language                  引用方译稿语言码，小写；只允许引用目标段同语言译稿
+     * @param targetSegmentId           被引用目标源段 ID
+     * @param targetSourceVersion       钉住的目标段源文版本，发布时须等于目标段当前源文版本
+     * @param targetTranslationVersion  钉住的目标段同语言译稿版本，目标译稿不存在则提交 422，
+     *                                  发布时须仍为目标段当前译稿版本
+     */
+    public record TranslationReferenceRow(String segmentId, String language, String targetSegmentId,
+                                          int targetSourceVersion, int targetTranslationVersion) {
+    }
+
+    /**
      * 写操作幂等去重记录：全局唯一 requestId，仅记录成功结果，与业务变更原子提交。
      *
      * @param requestId      全局唯一请求 ID

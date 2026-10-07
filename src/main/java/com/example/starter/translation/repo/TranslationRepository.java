@@ -3,8 +3,10 @@ package com.example.starter.translation.repo;
 import com.example.starter.translation.domain.Rows.ApprovalRow;
 import com.example.starter.translation.domain.Rows.DocumentRow;
 import com.example.starter.translation.domain.Rows.RequestLogRow;
+import com.example.starter.translation.domain.Rows.SegmentReferenceRow;
 import com.example.starter.translation.domain.Rows.SegmentRow;
 import com.example.starter.translation.domain.Rows.TermRuleRow;
+import com.example.starter.translation.domain.Rows.TranslationReferenceRow;
 import com.example.starter.translation.domain.Rows.TranslationRow;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
@@ -172,6 +174,12 @@ public class TranslationRepository {
                 APPROVAL_MAPPER, documentId);
     }
 
+    /** 删除某段某语言的批准：源段引用集合变化时失效本段旧批准。 */
+    public void deleteApproval(long documentId, String segmentId, String language) {
+        jdbc.update("DELETE FROM approval WHERE document_id = ? AND segment_id = ? AND language = ?",
+                documentId, segmentId, language);
+    }
+
     /** 插入或覆盖批准（按主键段落+语言唯一）。 */
     public void upsertApproval(long documentId, ApprovalRow row) {
         int updated = jdbc.update(
@@ -240,5 +248,62 @@ public class TranslationRepository {
     public void insertRequestLog(String requestId, String requestHash, int responseStatus, String responseBody) {
         jdbc.update("INSERT INTO request_log (request_id, request_hash, response_status, response_body) "
                 + "VALUES (?, ?, ?, ?)", requestId, requestHash, responseStatus, responseBody);
+    }
+
+    private static final RowMapper<SegmentReferenceRow> SEGMENT_REFERENCE_MAPPER = (rs, n) ->
+            new SegmentReferenceRow(rs.getString("source_segment_id"), rs.getString("target_segment_id"));
+
+    private static final RowMapper<TranslationReferenceRow> TRANSLATION_REFERENCE_MAPPER = (rs, n) ->
+            new TranslationReferenceRow(rs.getString("segment_id"), rs.getString("language"),
+                    rs.getString("target_segment_id"), rs.getInt("target_source_version"),
+                    rs.getInt("target_translation_version"));
+
+    /** 查询文档当前引用图的全部有向边，按源段、目标段排序保证稳定。 */
+    public List<SegmentReferenceRow> listReferenceEdges(long documentId) {
+        return jdbc.query(
+                "SELECT source_segment_id, target_segment_id FROM segment_reference "
+                        + "WHERE document_id = ? ORDER BY source_segment_id, target_segment_id",
+                SEGMENT_REFERENCE_MAPPER, documentId);
+    }
+
+    /** 查询某源段当前声明的全部引用目标段号。 */
+    public List<String> listOutgoingTargets(long documentId, String sourceSegmentId) {
+        return jdbc.queryForList(
+                "SELECT target_segment_id FROM segment_reference "
+                        + "WHERE document_id = ? AND source_segment_id = ? ORDER BY target_segment_id",
+                String.class, documentId, sourceSegmentId);
+    }
+
+    /** 整组替换某源段的引用边：先删后插，与外层业务同一事务，校验失败整体回滚不留部分边。 */
+    public void replaceReferences(long documentId, String sourceSegmentId, List<String> targetSegmentIds) {
+        jdbc.update("DELETE FROM segment_reference WHERE document_id = ? AND source_segment_id = ?",
+                documentId, sourceSegmentId);
+        for (String targetSegmentId : targetSegmentIds) {
+            jdbc.update("INSERT INTO segment_reference (document_id, source_segment_id, target_segment_id) "
+                    + "VALUES (?, ?, ?)", documentId, sourceSegmentId, targetSegmentId);
+        }
+    }
+
+    /** 查询文档内全部译稿的引用版本绑定，用于发布时整图一致性校验与快照冻结。 */
+    public List<TranslationReferenceRow> listAllTranslationReferences(long documentId) {
+        return jdbc.query(
+                "SELECT segment_id, language, target_segment_id, target_source_version, "
+                        + "target_translation_version FROM translation_reference "
+                        + "WHERE document_id = ? ORDER BY segment_id, language, target_segment_id",
+                TRANSLATION_REFERENCE_MAPPER, documentId);
+    }
+
+    /** 整组替换某条译稿的引用版本绑定：重新提交时随译文同一事务覆盖。 */
+    public void replaceTranslationReferences(long documentId, String segmentId, String language,
+                                             List<TranslationReferenceRow> rows) {
+        jdbc.update("DELETE FROM translation_reference "
+                        + "WHERE document_id = ? AND segment_id = ? AND language = ?",
+                documentId, segmentId, language);
+        for (TranslationReferenceRow row : rows) {
+            jdbc.update("INSERT INTO translation_reference (document_id, segment_id, language, target_segment_id, "
+                            + "target_source_version, target_translation_version) VALUES (?, ?, ?, ?, ?, ?)",
+                    documentId, segmentId, language, row.targetSegmentId(),
+                    row.targetSourceVersion(), row.targetTranslationVersion());
+        }
     }
 }

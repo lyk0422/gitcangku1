@@ -111,6 +111,39 @@ COMMENT ON COLUMN term_rule.source_term IS '源文术语，Unicode 原文、区�
 COMMENT ON COLUMN term_rule.language IS '目标语言码，小写';
 COMMENT ON COLUMN term_rule.required_translation IS '该术语在目标语言中的必译文本，非空';
 
+-- 跨段引用：源段声明的有向引用边（当前最新引用图）与译文提交时固化的引用目标版本。
+CREATE TABLE IF NOT EXISTS segment_reference (
+    document_id BIGINT NOT NULL,
+    source_segment_id VARCHAR(64) NOT NULL,
+    target_segment_id VARCHAR(64) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, source_segment_id, target_segment_id)
+);
+COMMENT ON TABLE segment_reference IS '跨段引用边：源段声明的当前最新有向引用图，每源段至多 5 条出边，同文档内且不成环';
+COMMENT ON COLUMN segment_reference.document_id IS '所属文档 ID';
+COMMENT ON COLUMN segment_reference.source_segment_id IS '引用方源段 ID';
+COMMENT ON COLUMN segment_reference.target_segment_id IS '被引用目标源段 ID，必须与引用方同文档且不能是自身';
+COMMENT ON COLUMN segment_reference.created_at IS '边创建时间，数据库默认时区';
+
+CREATE TABLE IF NOT EXISTS translation_reference (
+    document_id BIGINT NOT NULL,
+    segment_id VARCHAR(64) NOT NULL,
+    language VARCHAR(16) NOT NULL,
+    target_segment_id VARCHAR(64) NOT NULL,
+    target_source_version INT NOT NULL,
+    target_translation_version INT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, segment_id, language, target_segment_id)
+);
+COMMENT ON TABLE translation_reference IS '译文引用绑定：译文提交时按引用语言固化每条引用的目标源版本与同语言译稿版本，发布时须仍为当前版本';
+COMMENT ON COLUMN translation_reference.document_id IS '所属文档 ID';
+COMMENT ON COLUMN translation_reference.segment_id IS '引用方段落 ID';
+COMMENT ON COLUMN translation_reference.language IS '引用方译稿语言码，小写；只允许引用目标段的同语言译稿';
+COMMENT ON COLUMN translation_reference.target_segment_id IS '被引用目标源段 ID';
+COMMENT ON COLUMN translation_reference.target_source_version IS '提交时钉住的目标段源文版本；发布时须等于目标段当前源文版本';
+COMMENT ON COLUMN translation_reference.target_translation_version IS '提交时钉住的目标段同语言译稿版本；目标译稿不存在则提交 422，发布时须仍为当前译稿版本';
+COMMENT ON COLUMN translation_reference.updated_at IS '最近绑定时间，数据库默认时区';
+
 CREATE TABLE IF NOT EXISTS request_log (
     request_id VARCHAR(128) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,

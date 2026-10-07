@@ -45,11 +45,35 @@ public final class ApiDtos {
             @NotBlank(message = "sourceText 不能为空") String sourceText) {
     }
 
-    /** 译文提交请求；作者取 X-Actor-Id 请求头。 */
+    /**
+     * 译文提交携带的单条跨段引用版本绑定：目标段当前源版本与同语言当前译稿版本。
+     * 必须与源段当前声明的引用边逐条对应，不能缺项、多项或指向另一语言。
+     */
+    public record ReferenceInput(
+            @NotBlank(message = "targetSegmentId 不能为空") @Size(max = 64) String targetSegmentId,
+            @Positive(message = "targetSourceVersion 必须为正数") int targetSourceVersion,
+            @Positive(message = "targetTranslationVersion 必须为正数") int targetTranslationVersion) {
+    }
+
+    /** 引用编辑目标：仅含目标段号；整组替换源段引用集合，至多 5 个且互不相同。 */
+    public record ReferenceTargetInput(
+            @NotBlank(message = "targetSegmentId 不能为空") @Size(max = 64) String targetSegmentId) {
+    }
+
+    /** 源段引用集合修改请求：整组替换，携带期望草稿版本做乐观校验。 */
+    public record UpdateReferencesRequest(
+            @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
+            @Positive(message = "expectedDraftVersion 必须为正数") int expectedDraftVersion,
+            @NotNull(message = "references 不能为空") @Size(max = 5, message = "每段至多引用 5 个目标段")
+            List<@Valid ReferenceTargetInput> references) {
+    }
+
+    /** 译文提交请求；作者取 X-Actor-Id 请求头；references 为逐条引用版本绑定，无引用时为空数组或省略。 */
     public record SubmitTranslationRequest(
             @NotBlank(message = "requestId 不能为空") @Size(max = 128) String requestId,
             @NotBlank(message = "content 不能为空") String content,
-            @Positive(message = "sourceVersion 必须为正数") int sourceVersion) {
+            @Positive(message = "sourceVersion 必须为正数") int sourceVersion,
+            List<@Valid ReferenceInput> references) {
     }
 
     /** 译文批准请求；审核人取 X-Actor-Id 请求头。 */
@@ -89,10 +113,19 @@ public final class ApiDtos {
     public record SegmentResponse(long documentId, String segmentId, int sourceVersion, int draftVersion) {
     }
 
+    /** 引用版本绑定视图。 */
+    public record ReferenceView(String targetSegmentId, int targetSourceVersion, int targetTranslationVersion) {
+    }
+
+    /** 源段引用集合修改响应：推进后的源文版本、草稿版本与整组目标段号。 */
+    public record ReferencesResponse(long documentId, String segmentId, int sourceVersion, int draftVersion,
+                                     List<String> targetSegmentIds) {
+    }
+
     /** 译文提交响应。 */
     public record TranslationResponse(long documentId, String segmentId, String language,
                                       int translationVersion, int sourceVersion, int termVersion,
-                                      int draftVersion) {
+                                      int draftVersion, List<ReferenceView> references) {
     }
 
     /** 译文批准响应。 */

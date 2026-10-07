@@ -36,7 +36,9 @@ public abstract class AbstractIntegrationTest {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM approval");
+        jdbc.update("DELETE FROM translation_reference");
         jdbc.update("DELETE FROM translation");
+        jdbc.update("DELETE FROM segment_reference");
         jdbc.update("DELETE FROM segment");
         jdbc.update("DELETE FROM release_snapshot");
         jdbc.update("DELETE FROM term_rule");
@@ -106,6 +108,26 @@ public abstract class AbstractIntegrationTest {
                 + "\",\"sourceVersion\":" + sourceVersion + "}";
         return putJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language,
                 body, actorId);
+    }
+
+    /** 提交携带逐引用版本绑定的译文；referencesJson 形如 [{"targetSegmentId":"B",...}]。 */
+    protected ApiResult submitTranslationWithRefs(long documentId, String segmentId, String language,
+                                                  String actorId, String content, int sourceVersion,
+                                                  String referencesJson, String requestId) throws Exception {
+        String body = "{\"requestId\":\"" + requestId + "\",\"content\":\"" + content
+                + "\",\"sourceVersion\":" + sourceVersion + ",\"references\":" + referencesJson + "}";
+        return putJson("/api/documents/" + documentId + "/segments/" + segmentId + "/translations/" + language,
+                body, actorId);
+    }
+
+    /** 整组替换源段引用集合；操作者固定为 ref-editor 并纳入幂等摘要。 */
+    protected ApiResult updateReferences(long documentId, String segmentId, int expectedDraftVersion,
+                                         String targetIdsJson, String requestId) throws Exception {
+        String refs = targetIdsJson == null ? "[]" : targetIdsJson;
+        String body = "{\"requestId\":\"" + requestId + "\",\"expectedDraftVersion\":" + expectedDraftVersion
+                + ",\"references\":" + refs + "}";
+        return putJson("/api/documents/" + documentId + "/segments/" + segmentId + "/references",
+                body, "ref-editor");
     }
 
     protected ApiResult approve(long documentId, String segmentId, String language, String actorId,

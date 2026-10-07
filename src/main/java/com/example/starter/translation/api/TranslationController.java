@@ -66,7 +66,18 @@ public class TranslationController {
                 .toResponseEntity();
     }
 
-    /** 译文提交：作者取 X-Actor-Id，所依据源文版本必须匹配当前源文版本。 */
+    /** 修改源段跨段引用集合：整组替换出边，推进源版与草稿版并失效本段批准；期望版本不符或成环 409。 */
+    @PutMapping("/{documentId}/segments/{segmentId}/references")
+    public ResponseEntity<String> updateReferences(@PathVariable long documentId, @PathVariable String segmentId,
+                                                   @RequestHeader("X-Actor-Id") String actorId,
+                                                   @Valid @RequestBody ApiDtos.UpdateReferencesRequest request) {
+        String operation = "PUT /api/documents/" + documentId + "/segments/" + segmentId + "/references";
+        return writeExecutor.execute(request.requestId(), hash(operation, actorId, request),
+                () -> WriteResult.of(200,
+                        translationService.updateReferences(documentId, segmentId, request))).toResponseEntity();
+    }
+
+    /** 译文提交：作者取 X-Actor-Id，所依据源文版本必须匹配当前源文版本；引用须逐条携带目标当前源/译稿版本。 */
     @PutMapping("/{documentId}/segments/{segmentId}/translations/{language}")
     public ResponseEntity<String> submitTranslation(@PathVariable long documentId, @PathVariable String segmentId,
                                                     @PathVariable String language,
