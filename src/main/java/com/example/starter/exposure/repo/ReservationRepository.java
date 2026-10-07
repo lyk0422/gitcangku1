@@ -31,14 +31,15 @@ public class ReservationRepository {
             ReservationStatus.valueOf(rs.getString("status")),
             rs.getLong("created_at_utc"),
             rs.getLong("expires_at_utc"),
-            (Long) rs.getObject("terminal_at_utc"));
+            (Long) rs.getObject("terminal_at_utc"),
+            rs.getString("pool_id"));
 
     private static final String COLUMNS =
             "reservation_id, campaign_id, visitor_id, utc_date, status, "
-                    + "created_at_utc, expires_at_utc, terminal_at_utc";
+                    + "created_at_utc, expires_at_utc, terminal_at_utc, pool_id";
 
     public void insert(Reservation reservation) {
-        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 reservation.reservationId(),
                 reservation.campaignId(),
                 reservation.visitorId(),
@@ -46,7 +47,8 @@ public class ReservationRepository {
                 reservation.status().name(),
                 reservation.createdAtUtc(),
                 reservation.expiresAtUtc(),
-                reservation.terminalAtUtc());
+                reservation.terminalAtUtc(),
+                reservation.poolId());
     }
 
     public Optional<Reservation> findById(String reservationId) {

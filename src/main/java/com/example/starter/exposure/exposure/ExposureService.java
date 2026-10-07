@@ -3,9 +3,13 @@ package com.example.starter.exposure.exposure;
 import com.example.starter.exposure.web.ApplyExposureRequest;
 import com.example.starter.exposure.web.CampaignResponse;
 import com.example.starter.exposure.web.CreateCampaignRequest;
+import com.example.starter.exposure.web.CreatePoolRequest;
+import com.example.starter.exposure.web.PoolResponse;
 import com.example.starter.exposure.web.QuotaResponse;
 import com.example.starter.exposure.web.ReservationActionRequest;
 import com.example.starter.exposure.web.ReservationResponse;
+import com.example.starter.exposure.web.SelectExposureRequest;
+import com.example.starter.exposure.web.SelectExposureResponse;
 
 import java.time.LocalDate;
 
@@ -25,4 +29,10 @@ public interface ExposureService {
     ReservationResponse getReservation(String reservationId);
 
     QuotaResponse queryQuota(String campaignId, String visitorId, LocalDate utcDate);
+
+    PoolResponse createPool(CreatePoolRequest request);
+
+    SelectExposureResponse selectFromPool(String poolId, SelectExposureRequest request);
+
+    PoolResponse getPool(String poolId);
 }

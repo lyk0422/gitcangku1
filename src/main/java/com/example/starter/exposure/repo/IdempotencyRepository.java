@@ -66,4 +66,13 @@ public class IdempotencyRepository {
                 record.responseJson(),
                 createdAtUtc);
     }
+
+    /** 回填成功响应（与占位插入同事务，提交前对其他事务不可见）。 */
+    public void updateResponse(String requestId, String responseJson) {
+        int rows = jdbc.update("UPDATE idempotency_record SET response_json = ? WHERE request_id = ?",
+                responseJson, requestId);
+        if (rows != 1) {
+            throw new IllegalStateException("idempotency record missing for " + requestId);
+        }
+    }
 }

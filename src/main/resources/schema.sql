@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS quota_visitor_ledger (
 );
 
 -- 曝光预占单：utc_date 固定为申请时刻的 UTC 日期，expires_at_utc 为到期时刻（epoch 毫秒）
+-- pool_id 为来源轮转池编号；普通曝光预占为 NULL，池选择产生的预占非空
 CREATE TABLE IF NOT EXISTS exposure_reservation (
     reservation_id  VARCHAR(64) NOT NULL,
     campaign_id     VARCHAR(64) NOT NULL,
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS exposure_reservation (
     created_at_utc  BIGINT      NOT NULL,
     expires_at_utc  BIGINT      NOT NULL,
     terminal_at_utc BIGINT,
+    pool_id         VARCHAR(64),
     PRIMARY KEY (reservation_id)
 );
 CREATE INDEX IF NOT EXISTS idx_reservation_campaign_day
@@ -53,4 +55,34 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
     response_json       CLOB,
     created_at_utc      BIGINT       NOT NULL,
     PRIMARY KEY (request_id)
+);
+
+-- 缺额轮转池：成员与权重创建后固定；version 为池配置版本（当前恒为 1，用于期望版本校验）；
+-- pending_reservation_id 为 RESERVED 期间阻塞下一轮选择的预占单，无待决选择时为 NULL
+CREATE TABLE IF NOT EXISTS rotation_pool (
+    pool_id                VARCHAR(64) NOT NULL,
+    version                INT         NOT NULL,
+    pending_reservation_id VARCHAR(64),
+    created_at_utc         BIGINT      NOT NULL,
+    PRIMARY KEY (pool_id)
+);
+
+-- 轮转池成员：weight 为正整数权重（1~10）；committed_deficit 为已正式提交的缺额，
+-- 仅在池选择预占被 CONFIRMED 时推进，取消/到期不推进；跨 UTC 日不清零，单位次
+CREATE TABLE IF NOT EXISTS rotation_pool_member (
+    pool_id           VARCHAR(64) NOT NULL,
+    campaign_id       VARCHAR(64) NOT NULL,
+    weight            INT         NOT NULL,
+    committed_deficit BIGINT      NOT NULL DEFAULT 0,
+    PRIMARY KEY (pool_id, campaign_id),
+    CHECK (weight >= 1 AND weight <= 10)
+);
+
+-- 池选择的临时缺额：选择成功时与预占原子保存，CONFIRMED 时并入 committed_deficit，
+-- 取消/到期时整池丢弃；无待决选择时本表对应池无行
+CREATE TABLE IF NOT EXISTS rotation_pool_pending_deficit (
+    pool_id         VARCHAR(64) NOT NULL,
+    campaign_id     VARCHAR(64) NOT NULL,
+    pending_deficit BIGINT      NOT NULL,
+    PRIMARY KEY (pool_id, campaign_id)
 );

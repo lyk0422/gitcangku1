@@ -3,18 +3,25 @@ package com.example.starter.exposure.exposure;
 import com.example.starter.exposure.domain.Campaign;
 import com.example.starter.exposure.domain.Reservation;
 import com.example.starter.exposure.domain.ReservationStatus;
+import com.example.starter.exposure.domain.RotationPool;
+import com.example.starter.exposure.domain.RotationPoolMember;
 import com.example.starter.exposure.repo.CampaignRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository.IdempotencyRecord;
 import com.example.starter.exposure.repo.LedgerRepository;
 import com.example.starter.exposure.repo.ReservationRepository;
+import com.example.starter.exposure.repo.RotationPoolRepository;
 import com.example.starter.exposure.web.ApiException;
 import com.example.starter.exposure.web.ApplyExposureRequest;
 import com.example.starter.exposure.web.CampaignResponse;
 import com.example.starter.exposure.web.CreateCampaignRequest;
+import com.example.starter.exposure.web.CreatePoolRequest;
+import com.example.starter.exposure.web.PoolResponse;
 import com.example.starter.exposure.web.QuotaResponse;
 import com.example.starter.exposure.web.ReservationActionRequest;
 import com.example.starter.exposure.web.ReservationResponse;
+import com.example.starter.exposure.web.SelectExposureRequest;
+import com.example.starter.exposure.web.SelectExposureResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
@@ -23,7 +30,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 import java.time.LocalDate;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -39,6 +48,9 @@ public class ExposureServiceImpl implements ExposureService {
 
     static final int RESERVATION_TTL_MILLIS = 60_000;
 
+    /** 池配置版本：成员与权重创建后固定，当前恒为 1。 */
+    static final int POOL_CONFIG_VERSION = 1;
+
     /** 并发同键竞争时等待胜出事务提交的最大时长。 */
     private static final long IDEMPOTENT_WAIT_MILLIS = 10_000L;
 
@@ -47,6 +59,7 @@ public class ExposureServiceImpl implements ExposureService {
     private final ReservationRepository reservationRepository;
     private final LedgerRepository ledgerRepository;
     private final IdempotencyRepository idempotencyRepository;
+    private final RotationPoolRepository rotationPoolRepository;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate txTemplate;
 
@@ -55,6 +68,7 @@ public class ExposureServiceImpl implements ExposureService {
                                ReservationRepository reservationRepository,
                                LedgerRepository ledgerRepository,
                                IdempotencyRepository idempotencyRepository,
+                               RotationPoolRepository rotationPoolRepository,
                                ObjectMapper objectMapper,
                                TransactionTemplate txTemplate) {
         this.clock = clock;
@@ -62,6 +76,7 @@ public class ExposureServiceImpl implements ExposureService {
         this.reservationRepository = reservationRepository;
         this.ledgerRepository = ledgerRepository;
         this.idempotencyRepository = idempotencyRepository;
+        this.rotationPoolRepository = rotationPoolRepository;
         this.objectMapper = objectMapper;
         this.txTemplate = txTemplate;
     }
@@ -129,10 +144,70 @@ public class ExposureServiceImpl implements ExposureService {
                             ReservationStatus.RESERVED,
                             now,
                             now + RESERVATION_TTL_MILLIS,
+                            null,
                             null);
                     reservationRepository.insert(reservation);
                     return ReservationResponse.from(reservation);
                 });
+    }
+
+    @Override
+    public PoolResponse createPool(CreatePoolRequest request) {
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("members", canonicalMembers(request));
+        String fingerprint = structuredFingerprint(Operation.CREATE_POOL, request.poolId(),
+                request.operator(), params);
+        return runIdempotent(request.requestId(), Operation.CREATE_POOL, fingerprint,
+                PoolResponse.class, () -> {
+                    if (rotationPoolRepository.findPoolById(request.poolId()).isPresent()) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "pool already exists: " + request.poolId());
+                    }
+                    // 成员公告号必须互不重复且公告已存在
+                    Map<String, Integer> weightByCampaign = new LinkedHashMap<>();
+                    for (CreatePoolRequest.PoolMemberRequest member : request.members()) {
+                        if (weightByCampaign.putIfAbsent(member.campaignId(), member.weight()) != null) {
+                            throw new ApiException(HttpStatus.BAD_REQUEST,
+                                    "duplicate member campaign: " + member.campaignId());
+                        }
+                        requireCampaign(member.campaignId());
+                    }
+                    RotationPool pool = new RotationPool(
+                            request.poolId(), POOL_CONFIG_VERSION, null, clock.millis());
+                    try {
+                        rotationPoolRepository.insertPool(pool);
+                    } catch (DuplicateKeyException duplicatePool) {
+                        // 并发创建同一 poolId：明确返回 409，而非误报幂等键冲突
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "pool already exists: " + request.poolId());
+                    }
+                    List<RotationPoolMember> members = weightByCampaign.entrySet().stream()
+                            .map(e -> new RotationPoolMember(request.poolId(), e.getKey(), e.getValue(), 0L))
+                            .sorted(java.util.Comparator.comparing(RotationPoolMember::campaignId))
+                            .toList();
+                    members.forEach(rotationPoolRepository::insertMember);
+                    return PoolResponse.from(pool, members);
+                });
+    }
+
+    @Override
+    public SelectExposureResponse selectFromPool(String poolId, SelectExposureRequest request) {
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("visitorId", request.visitorId());
+        params.put("expectedVersion", request.expectedVersion());
+        String fingerprint = structuredFingerprint(Operation.SELECT, poolId,
+                request.operator(), params);
+        return runIdempotent(request.requestId(), Operation.SELECT, fingerprint,
+                SelectExposureResponse.class, () -> doSelect(poolId, request));
+    }
+
+    @Override
+    public PoolResponse getPool(String poolId) {
+        return txTemplate.execute(status -> {
+            RotationPool pool = lockPool(poolId);
+            pool = settlePoolPending(pool, clock.millis());
+            return PoolResponse.from(pool, rotationPoolRepository.listMembers(poolId));
+        });
     }
 
     @Override
@@ -196,12 +271,15 @@ public class ExposureServiceImpl implements ExposureService {
         CREATE_CAMPAIGN,
         APPLY,
         CONFIRM,
-        CANCEL
+        CANCEL,
+        CREATE_POOL,
+        SELECT
     }
 
     /**
      * 在事务内执行业务并维护幂等记录；业务变更与去重结果原子提交。
-     * 并发同键插入冲突时等待胜出事务提交后重放其结果。
+     * 先插入占位记录再执行业务：并发同键在唯一键上串行等待，胜出事务提交后
+     * 其余事务插入冲突，等待重放其结果；业务失败整体回滚，不占键。
      */
     private <T> T runIdempotent(String requestId, Operation operation, String fingerprint,
                                 Class<T> responseType, Supplier<T> action) {
@@ -223,13 +301,15 @@ public class ExposureServiceImpl implements ExposureService {
                             throw new IllegalStateException("failed to replay idempotent response", e);
                         }
                     }
-                    T result = action.get();
+                    // 占位插入：并发同键在此阻塞至胜出事务提交/回滚
                     idempotencyRepository.insert(new IdempotencyRecord(
-                            requestId, operation.name(), fingerprint, writeJson(result)), clock.millis());
+                            requestId, operation.name(), fingerprint, null), clock.millis());
+                    T result = action.get();
+                    idempotencyRepository.updateResponse(requestId, writeJson(result));
                     return result;
                 });
             } catch (DuplicateKeyException duplicate) {
-                // 同键并发事务抢先插入（可能尚未提交），等待后重放
+                // 同键并发事务已提交占位记录，等待后重放其结果
                 if (System.currentTimeMillis() >= deadline) {
                     throw new ApiException(HttpStatus.CONFLICT,
                             "concurrent idempotency key conflict: " + requestId);
@@ -246,11 +326,20 @@ public class ExposureServiceImpl implements ExposureService {
 
     /**
      * 确认/取消状态机。调用前已持幂等键；行锁 + CAS 保证并发只有一个终态。
+     * 池预占额外维护缺额：确认时提交临时缺额，取消时丢弃；固定加锁顺序
+     * 池 -&gt; 预占单 -&gt; 总账 -&gt; 访客账，与池选择一致，避免死锁。
      *
      * @param isConfirm true=确认，false=取消
      */
     private ReservationResponse transition(String reservationId, boolean isConfirm) {
         long now = clock.millis();
+        // 预读来源池（poolId 创建后不变），先持池锁再锁预占单
+        String poolId = reservationRepository.findById(reservationId)
+                .map(Reservation::poolId)
+                .orElse(null);
+        if (poolId != null) {
+            rotationPoolRepository.lockPoolById(poolId);
+        }
         Reservation current = reservationRepository.lockById(reservationId)
                 .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
                         "reservation not found: " + reservationId));
@@ -266,6 +355,11 @@ public class ExposureServiceImpl implements ExposureService {
                         reservationId, ReservationStatus.RESERVED, ReservationStatus.CONFIRMED, now)) {
                     throw new ApiException(HttpStatus.CONFLICT, "reservation state changed concurrently");
                 }
+                if (poolId != null) {
+                    // 缺额只在 CONFIRMED 时正式提交
+                    rotationPoolRepository.commitPendingDeficits(poolId);
+                    rotationPoolRepository.clearPendingReservation(poolId);
+                }
             } else {
                 if (!reservationRepository.compareAndSetStatus(
                         reservationId, ReservationStatus.RESERVED, ReservationStatus.CANCELLED, now)) {
@@ -275,6 +369,11 @@ public class ExposureServiceImpl implements ExposureService {
                 ledgerRepository.releaseTotal(current.campaignId(), current.utcDate().toLocalDate());
                 ledgerRepository.releaseVisitor(
                         current.campaignId(), current.visitorId(), current.utcDate().toLocalDate());
+                if (poolId != null) {
+                    // 取消丢弃临时缺额，已提交缺额不变，下一次重选同一位置
+                    rotationPoolRepository.discardPendingDeficits(poolId);
+                    rotationPoolRepository.clearPendingReservation(poolId);
+                }
             }
         } else if (current.status() == ReservationStatus.CONFIRMED
                 || current.status() == ReservationStatus.CANCELLED
@@ -339,6 +438,162 @@ public class ExposureServiceImpl implements ExposureService {
         return reservationRepository.findById(reservationId)
                 .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
                         "reservation not found: " + reservationId));
+    }
+
+    /**
+     * 缺额轮转选择（调用方已持幂等键，本方法在事务内执行）。
+     *
+     * <p>流程：持池行锁串行化同池选择 → 结算待决预占 → 校验期望版本 → 结算成员公告
+     * 过期预占 → 按公告号顺序锁定两级账目 → 全部成员缺额加权重得临时缺额 →
+     * 在当日额度足够的成员中取缺额最大者（同分取公告号字典序小者）→
+     * 选中者减全池权重之和 → 原子占用额度、创建 60 秒预占并保存新缺额。
+     * 全部不可选抛 429，临时增加随事务回滚不保存。</p>
+     */
+    private SelectExposureResponse doSelect(String poolId, SelectExposureRequest request) {
+        long now = clock.millis();
+        LocalDate utcDate = LocalDate.now(clock);
+        RotationPool pool = settlePoolPending(lockPool(poolId), now);
+        if (request.expectedVersion() != pool.version()) {
+            throw new ApiException(HttpStatus.CONFLICT,
+                    "pool version mismatch for " + poolId + ": expected "
+                            + request.expectedVersion() + ", actual " + pool.version());
+        }
+        if (pool.pendingReservationId() != null) {
+            // RESERVED 期间池禁止另一轮转选择
+            throw new ApiException(HttpStatus.CONFLICT,
+                    "pool " + poolId + " has a pending selection: " + pool.pendingReservationId());
+        }
+
+        List<RotationPoolMember> members = rotationPoolRepository.lockMembers(poolId);
+        // 先结算各成员公告的过期预占，再按公告号顺序锁定两级账目（与 apply 的账目加锁顺序一致）
+        for (RotationPoolMember member : members) {
+            settleExpired(member.campaignId(), now);
+        }
+        Map<String, Campaign> campaigns = new LinkedHashMap<>();
+        Map<String, Integer> usedTotals = new LinkedHashMap<>();
+        Map<String, Integer> usedVisitors = new LinkedHashMap<>();
+        for (RotationPoolMember member : members) {
+            String campaignId = member.campaignId();
+            campaigns.put(campaignId, requireCampaign(campaignId));
+            ledgerRepository.ensureTotalRow(campaignId, utcDate);
+            ledgerRepository.ensureVisitorRow(campaignId, request.visitorId(), utcDate);
+            usedTotals.put(campaignId, ledgerRepository.lockUsedTotal(campaignId, utcDate));
+            usedVisitors.put(campaignId,
+                    ledgerRepository.lockUsedVisitor(campaignId, request.visitorId(), utcDate));
+        }
+
+        // 精确整数缺额轮转：先全员加权重，再仅在有额度的成员中取最大者
+        long totalWeight = members.stream().mapToLong(RotationPoolMember::weight).sum();
+        Map<String, Long> tempDeficits = new LinkedHashMap<>();
+        String winner = null;
+        long winnerTemp = Long.MIN_VALUE;
+        for (RotationPoolMember member : members) {
+            String campaignId = member.campaignId();
+            long temp = member.committedDeficit() + member.weight();
+            tempDeficits.put(campaignId, temp);
+            Campaign campaign = campaigns.get(campaignId);
+            boolean eligible = usedTotals.get(campaignId) + 1 <= campaign.dailyTotalCap()
+                    && usedVisitors.get(campaignId) + 1 <= campaign.perVisitorDailyCap();
+            // 成员按公告号升序遍历，严格大于才替换 → 同分取字典序小者
+            if (eligible && (winner == null || temp > winnerTemp)) {
+                winner = campaignId;
+                winnerTemp = temp;
+            }
+        }
+        if (winner == null) {
+            throw new ApiException(HttpStatus.TOO_MANY_REQUESTS,
+                    "no eligible member in pool " + poolId + " for visitor " + request.visitorId());
+        }
+        // 选中者减所有权重之和
+        tempDeficits.compute(winner, (campaignId, temp) -> temp - totalWeight);
+
+        // 行锁已持有，占用选中公告两级额度
+        ledgerRepository.addTotal(winner, utcDate, 1);
+        ledgerRepository.addVisitor(winner, request.visitorId(), utcDate, 1);
+
+        String reservationId = UUID.randomUUID().toString().replace("-", "");
+        Reservation reservation = new Reservation(
+                reservationId,
+                winner,
+                request.visitorId(),
+                java.sql.Date.valueOf(utcDate),
+                ReservationStatus.RESERVED,
+                now,
+                now + RESERVATION_TTL_MILLIS,
+                null,
+                poolId);
+        reservationRepository.insert(reservation);
+        // 与预占原子保存新缺额（临时缺额，CONFIRMED 才正式提交）
+        rotationPoolRepository.replacePendingDeficits(poolId, tempDeficits);
+        rotationPoolRepository.updatePendingReservation(poolId, reservationId);
+
+        return new SelectExposureResponse(
+                poolId, pool.version(), request.visitorId(), winner,
+                ReservationResponse.from(reservation), tempDeficits, now);
+    }
+
+    /**
+     * 结算池的待决选择（调用方已持池行锁）：待决预占仍 RESERVED 且未到期则保持阻塞；
+     * 已到期则结算过期并丢弃临时缺额；已 CONFIRMED 则补提交缺额；已 CANCELLED/EXPIRED
+     * 则丢弃临时缺额。返回清理后的池状态。
+     */
+    private RotationPool settlePoolPending(RotationPool pool, long now) {
+        String pendingId = pool.pendingReservationId();
+        if (pendingId == null) {
+            return pool;
+        }
+        var pendingOpt = reservationRepository.lockById(pendingId);
+        if (pendingOpt.isEmpty()) {
+            // 数据不一致：清理待决引用，避免永久阻塞
+            rotationPoolRepository.discardPendingDeficits(pool.poolId());
+            rotationPoolRepository.clearPendingReservation(pool.poolId());
+            return lockPool(pool.poolId());
+        }
+        Reservation pending = pendingOpt.get();
+        if (pending.status() == ReservationStatus.RESERVED) {
+            if (now < pending.expiresAtUtc()) {
+                return pool;
+            }
+            // 到期：转 EXPIRED 并释放两级额度，丢弃临时缺额
+            expireIfDue(pending, now);
+            rotationPoolRepository.discardPendingDeficits(pool.poolId());
+        } else if (pending.status() == ReservationStatus.CONFIRMED) {
+            // 确认时缺额已随确认事务提交；此处为兜底（如历史遗留），幂等
+            rotationPoolRepository.commitPendingDeficits(pool.poolId());
+        } else {
+            // CANCELLED / EXPIRED：丢弃临时缺额，已提交缺额不变
+            rotationPoolRepository.discardPendingDeficits(pool.poolId());
+        }
+        rotationPoolRepository.clearPendingReservation(pool.poolId());
+        return lockPool(pool.poolId());
+    }
+
+    private RotationPool lockPool(String poolId) {
+        return rotationPoolRepository.lockPoolById(poolId)
+                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                        "pool not found: " + poolId));
+    }
+
+    /**
+     * 结构化指纹：操作、资源、操作者与全参数以 JSON 编码，字段无碰撞；
+     * 数值按值比较、文本原样。成员列表按公告号排序，与请求中的书写顺序无关。
+     */
+    private String structuredFingerprint(Operation operation, String resource,
+                                         String operator, Object params) {
+        Map<String, Object> fingerprint = new LinkedHashMap<>();
+        fingerprint.put("operation", operation.name());
+        fingerprint.put("resource", resource);
+        fingerprint.put("operator", operator);
+        fingerprint.put("params", params);
+        return writeJson(fingerprint);
+    }
+
+    /** 池成员参数规范化：按公告号排序的 [公告号, 权重] 列表。 */
+    private List<List<Object>> canonicalMembers(CreatePoolRequest request) {
+        return request.members().stream()
+                .map(m -> List.<Object>of(m.campaignId(), m.weight()))
+                .sorted(java.util.Comparator.comparing(a -> (String) a.get(0)))
+                .toList();
     }
 
     private String writeJson(Object value) {
