@@ -1,6 +1,8 @@
 spring:
   datasource:
-    url: jdbc:h2:mem:consent-test;MODE=MySQL;DB_CLOSE_DELAY=-1
+    # 独立命名的 H2 内存库（MySQL 兼容模式）；不加 DB_CLOSE_DELAY，
+    # 连接池随测试上下文关闭后数据库即释放，退出 JVM 即丢数据
+    url: jdbc:h2:mem:consent-test;MODE=MySQL
     driver-class-name: org.h2.Driver
     username: sa
     password: ""

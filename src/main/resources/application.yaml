@@ -4,11 +4,16 @@ spring:
   config:
     import: "optional:configtree:/run/secrets/"
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
+    # 本地入口默认使用 H2 内存库（MySQL 兼容模式），退出 JVM 即丢数据；
+    # 需要外部数据库时通过 DB_URL / DB_DRIVER / DB_USER / DB_PASSWORD 覆盖
+    url: ${DB_URL:jdbc:h2:mem:consent-local;MODE=MySQL;DB_CLOSE_DELAY=-1}
+    driver-class-name: ${DB_DRIVER:org.h2.Driver}
+    username: ${DB_USER:sa}
+    password: ${DB_PASSWORD:}
   sql:
     init:
       mode: always
+      data-locations: classpath:data-local.sql
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1
@@ -31,6 +36,6 @@ management:
     web:
       exposure:
         include: health
-  endpoint:
-    health:
-      show-details: never
+    endpoint:
+      health:
+        show-details: never

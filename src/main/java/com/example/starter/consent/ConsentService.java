@@ -1,5 +1,10 @@
 package com.example.starter.consent;
 
+import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.Optional;
 
 import org.springframework.dao.DuplicateKeyException;
@@ -19,8 +24,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * 授权域服务：实现授权、写入、撤回与查询的业务规则及幂等语义。
  *
  * <p>幂等规则：成功结果与业务变更同事务保存；同一 requestId 相同参数重试返回原结果，
- * 参数变更返回 409；失败请求不占用 requestId。写入重放不得绕过授权状态：
- * 即使 requestId 命中幂等记录，只要所属代次已撤回，仍返回 410。
+ * 参数变更返回 409；失败请求不占用 requestId。指纹为结构化身份（操作、资源、全参数及
+ * 期望版本）：十进制参数按值规范化，文本参数逐字节原样参与；载荷以 SHA-256 摘要参与比对，
+ * 指纹不残留原文。授权有效性先于含值重放：即使 requestId 命中幂等记录，只要所属代次
+ * 已撤回，仍返回 410，不能恢复旧文本。
+ *
+ * <p>撤回成功时为该主体用途代次建立唯一的旧代载荷清除任务（PENDING），由 ERASER 角色
+ * 通过清除执行入口分批物理清除。
  */
 @Service
 public class ConsentService {
@@ -30,6 +40,7 @@ public class ConsentService {
     static final String CODE_REQUEST_ID_CONFLICT = "REQUEST_ID_CONFLICT";
     static final String CODE_RECORD_PAYLOAD_CONFLICT = "RECORD_PAYLOAD_CONFLICT";
     static final String CODE_GRANT_ALREADY_REVOKED = "GRANT_ALREADY_REVOKED";
+    static final String CODE_GRANT_EPOCH_MISMATCH = "GRANT_EPOCH_MISMATCH";
     static final String CODE_CONSENT_REVOKED = "CONSENT_REVOKED";
 
     private static final String OP_GRANT = "GRANT";
@@ -38,13 +49,16 @@ public class ConsentService {
 
     private final ConsentRepository consentRepository;
     private final IdempotencyRepository idempotencyRepository;
+    private final ErasureRepository erasureRepository;
     private final ObjectMapper objectMapper;
 
     public ConsentService(ConsentRepository consentRepository,
                           IdempotencyRepository idempotencyRepository,
+                          ErasureRepository erasureRepository,
                           ObjectMapper objectMapper) {
         this.consentRepository = consentRepository;
         this.idempotencyRepository = idempotencyRepository;
+        this.erasureRepository = erasureRepository;
         this.objectMapper = objectMapper;
     }
 
@@ -76,33 +90,46 @@ public class ConsentService {
                                 .orElseThrow(() -> concurrent);
                 response = new GrantResponse(committed.subjectKey(), committed.purpose(),
                         committed.epoch(), committed.status());
-                storeSuccess(request.requestId(), OP_GRANT, fingerprint, response);
+                storeSuccess(request.requestId(), OP_GRANT, fingerprint, response,
+                        response.subjectKey(), response.purpose(), response.epoch(), null);
                 return response;
             }
             response = new GrantResponse(request.subjectKey(), request.purpose(), nextEpoch, GrantStatus.ACTIVE);
         }
-        storeSuccess(request.requestId(), OP_GRANT, fingerprint, response);
+        storeSuccess(request.requestId(), OP_GRANT, fingerprint, response,
+                response.subjectKey(), response.purpose(), response.epoch(), null);
         return response;
     }
 
     /**
-     * 写入：仅当前有效代次可写；同代同 recordKey 同 payload 去重返回原记录，不同 payload 返回 409。
+     * 写入：仅当前有效代次可写，且期望版本须与当前有效代次一致；
+     * 同代同 recordKey 同 payload 去重返回原记录，不同 payload 返回 409。
      */
     @Transactional
     public RecordResponse write(RecordWriteRequest request) {
         String fingerprint = OP_WRITE + "|" + request.subjectKey() + "|" + request.purpose()
-                + "|" + request.recordKey() + "|" + request.payload();
-        Optional<IdempotencyRow> replayed = checkReplay(request.requestId(), fingerprint);
-        if (replayed.isPresent()) {
-            RecordResponse snapshot = readSnapshot(replayed.get().responseBody(), RecordResponse.class);
-            requireGrantActive(snapshot.subjectKey(), snapshot.purpose(), snapshot.epoch());
-            return snapshot;
+                + "|" + request.recordKey() + "|" + digest(request.payload())
+                + "|" + request.operator() + "|" + canonicalDecimal(request.expectedEpoch());
+        Optional<IdempotencyRow> row = idempotencyRepository.find(request.requestId());
+        if (row.isPresent()) {
+            IdempotencyRow committed = row.get();
+            if (OP_WRITE.equals(committed.operation()) && committed.epoch() != null) {
+                // 授权有效性先于含值重放：所属代次已撤回时旧写重放直接 410，不能恢复旧文本
+                requireGrantActive(committed.subjectKey(), committed.purpose(), committed.epoch());
+            }
+            if (!committed.paramsFingerprint().equals(fingerprint)) {
+                throw ApiException.conflict(CODE_REQUEST_ID_CONFLICT, "同一 requestId 参数不一致");
+            }
+            return readSnapshot(committed.responseBody(), RecordResponse.class);
         }
 
         ConsentRepository.GrantRow latest = consentRepository
                 .findLatestGrant(request.subjectKey(), request.purpose())
                 .orElseThrow(() -> ApiException.notFound(CODE_GRANT_NOT_FOUND, "授权不存在"));
         requireGrantActive(latest.subjectKey(), latest.purpose(), latest.epoch());
+        if (request.expectedEpoch() != latest.epoch()) {
+            throw ApiException.conflict(CODE_GRANT_EPOCH_MISMATCH, "期望代次与当前有效代次不一致");
+        }
 
         Optional<ConsentRepository.RecordRow> existing = consentRepository.findRecord(
                 request.subjectKey(), request.purpose(), latest.epoch(), request.recordKey());
@@ -111,7 +138,8 @@ public class ConsentService {
                 throw ApiException.conflict(CODE_RECORD_PAYLOAD_CONFLICT, "相同 recordKey 已存在不同内容");
             }
             RecordResponse response = toResponse(existing.get());
-            storeSuccess(request.requestId(), OP_WRITE, fingerprint, response);
+            storeSuccess(request.requestId(), OP_WRITE, fingerprint, response,
+                    response.subjectKey(), response.purpose(), response.epoch(), response.recordKey());
             return response;
         }
 
@@ -119,7 +147,7 @@ public class ConsentService {
             consentRepository.insertRecord(request.subjectKey(), request.purpose(), latest.epoch(),
                     request.recordKey(), request.payload(), request.requestId());
         } catch (DuplicateKeyException concurrent) {
-            // 并发写入同一 recordKey：以已提交的记录为准
+            // 并发写入同一 recordKey：以已提交的记录为准，不泄漏唯一键异常
             ConsentRepository.RecordRow committed = consentRepository.findRecord(
                             request.subjectKey(), request.purpose(), latest.epoch(), request.recordKey())
                     .orElseThrow(() -> concurrent);
@@ -127,18 +155,21 @@ public class ConsentService {
                 throw ApiException.conflict(CODE_RECORD_PAYLOAD_CONFLICT, "相同 recordKey 已存在不同内容");
             }
             RecordResponse response = toResponse(committed);
-            storeSuccess(request.requestId(), OP_WRITE, fingerprint, response);
+            storeSuccess(request.requestId(), OP_WRITE, fingerprint, response,
+                    response.subjectKey(), response.purpose(), response.epoch(), response.recordKey());
             return response;
         }
 
         RecordResponse response = new RecordResponse(request.subjectKey(), request.purpose(),
                 latest.epoch(), request.recordKey(), request.payload());
-        storeSuccess(request.requestId(), OP_WRITE, fingerprint, response);
+        storeSuccess(request.requestId(), OP_WRITE, fingerprint, response,
+                response.subjectKey(), response.purpose(), response.epoch(), response.recordKey());
         return response;
     }
 
     /**
      * 撤回：指定代次只允许从有效变为已撤回；撤回提交后旧代查询立即返回 410，写入被拒绝。
+     * 撤回成功同事务建立唯一的旧代载荷清除任务（PENDING）。
      */
     @Transactional
     public GrantResponse revoke(RevokeRequest request) {
@@ -154,9 +185,15 @@ public class ConsentService {
         if (!revoked) {
             throw ApiException.conflict(CODE_GRANT_ALREADY_REVOKED, "授权代次已撤回");
         }
+        try {
+            erasureRepository.insertTask(request.subjectKey(), request.purpose(), request.epoch(), request.requestId());
+        } catch (DuplicateKeyException alreadyExists) {
+            // 同一主体用途代次的清除任务唯一：并发重复建立时保留已有任务
+        }
         GrantResponse response = new GrantResponse(request.subjectKey(), request.purpose(),
                 request.epoch(), GrantStatus.REVOKED);
-        storeSuccess(request.requestId(), OP_REVOKE, fingerprint, response);
+        storeSuccess(request.requestId(), OP_REVOKE, fingerprint, response,
+                response.subjectKey(), response.purpose(), response.epoch(), null);
         return response;
     }
 
@@ -192,11 +229,13 @@ public class ConsentService {
         return row;
     }
 
-    private void storeSuccess(String requestId, String operation, String fingerprint, Object response) {
+    private void storeSuccess(String requestId, String operation, String fingerprint, Object response,
+                              String subjectKey, Purpose purpose, Integer epoch, String recordKey) {
         try {
-            idempotencyRepository.insert(requestId, operation, fingerprint, writeSnapshot(response));
+            idempotencyRepository.insert(requestId, operation, fingerprint, writeSnapshot(response),
+                    subjectKey, purpose, epoch, recordKey);
         } catch (DuplicateKeyException concurrent) {
-            // 并发同 requestId：校验已提交快照参数一致，否则视为冲突
+            // 并发同 requestId：校验已提交快照参数一致，否则视为冲突，不泄漏唯一键异常
             IdempotencyRow committed = idempotencyRepository.find(requestId)
                     .orElseThrow(() -> concurrent);
             if (!committed.paramsFingerprint().equals(fingerprint)) {
@@ -207,6 +246,25 @@ public class ConsentService {
 
     private RecordResponse toResponse(ConsentRepository.RecordRow row) {
         return new RecordResponse(row.subjectKey(), row.purpose(), row.epoch(), row.recordKey(), row.payload());
+    }
+
+    /**
+     * 载荷摘要以 SHA-256 参与指纹比对：文本逐字节原样等值，指纹不残留原文。
+     */
+    private static String digest(String text) {
+        try {
+            return HexFormat.of().formatHex(
+                    MessageDigest.getInstance("SHA-256").digest(text.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 不可用", e);
+        }
+    }
+
+    /**
+     * 十进制参数按值规范化：同值同参（如 1、1.0、1.00 指纹一致）。
+     */
+    private static String canonicalDecimal(Number value) {
+        return new BigDecimal(value.toString()).stripTrailingZeros().toPlainString();
     }
 
     private String writeSnapshot(Object response) {

@@ -9,6 +9,9 @@ import org.springframework.stereotype.Repository;
 
 /**
  * 幂等请求持久化访问：成功结果与业务变更同事务保存，应用重启后幂等语义仍成立。
+ *
+ * <p>除参数指纹与响应快照外，同时保存结构化身份（操作、资源、期望版本），
+ * 用于授权状态前置核验与旧代缓存载荷清除；指纹中载荷以摘要参与，不残留原文。
  */
 @Repository
 public class IdempotencyRepository {
@@ -17,7 +20,11 @@ public class IdempotencyRepository {
             rs.getString("request_id"),
             rs.getString("operation"),
             rs.getString("params_fingerprint"),
-            rs.getString("response_body"));
+            rs.getString("response_body"),
+            rs.getString("subject_key"),
+            rs.getString("purpose") == null ? null : Purpose.valueOf(rs.getString("purpose")),
+            rs.getObject("epoch", Integer.class),
+            rs.getString("record_key"));
 
     private final JdbcTemplate jdbc;
 
@@ -29,25 +36,35 @@ public class IdempotencyRepository {
      * 幂等请求行。
      *
      * @param requestId         幂等请求标识
-     * @param operation         操作类型：GRANT / WRITE / REVOKE
+     * @param operation         操作类型：GRANT / WRITE / REVOKE / ERASE
      * @param paramsFingerprint 规范化参数指纹，用于检测同 requestId 参数变更
      * @param responseBody      成功响应快照（JSON）
+     * @param subjectKey        资源主体标识（合成字符串）
+     * @param purpose           资源用途
+     * @param epoch             资源所属代次（期望版本）
+     * @param recordKey         记录键，非记录操作为 null
      */
-    public record IdempotencyRow(String requestId, String operation, String paramsFingerprint, String responseBody) {
+    public record IdempotencyRow(String requestId, String operation, String paramsFingerprint, String responseBody,
+                                 String subjectKey, Purpose purpose, Integer epoch, String recordKey) {
     }
 
     Optional<IdempotencyRow> find(String requestId) {
         List<IdempotencyRow> rows = jdbc.query(
-                "SELECT request_id, operation, params_fingerprint, response_body"
+                "SELECT request_id, operation, params_fingerprint, response_body,"
+                        + " subject_key, purpose, epoch, record_key"
                         + " FROM idempotency_request WHERE request_id = ?",
                 MAPPER, requestId);
         return rows.stream().findFirst();
     }
 
-    void insert(String requestId, String operation, String paramsFingerprint, String responseBody) {
+    void insert(String requestId, String operation, String paramsFingerprint, String responseBody,
+                String subjectKey, Purpose purpose, Integer epoch, String recordKey) {
         jdbc.update(
-                "INSERT INTO idempotency_request (request_id, operation, params_fingerprint, response_body)"
-                        + " VALUES (?, ?, ?, ?)",
-                requestId, operation, paramsFingerprint, responseBody);
+                "INSERT INTO idempotency_request"
+                        + " (request_id, operation, params_fingerprint, response_body,"
+                        + " subject_key, purpose, epoch, record_key)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                requestId, operation, paramsFingerprint, responseBody,
+                subjectKey, purpose == null ? null : purpose.name(), epoch, recordKey);
     }
 }

@@ -48,6 +48,7 @@ class ConsentApiTest {
         jdbc.update("DELETE FROM consent_record");
         jdbc.update("DELETE FROM consent_grant");
         jdbc.update("DELETE FROM idempotency_request");
+        jdbc.update("DELETE FROM erasure_task");
     }
 
     private ResultActions grant(String requestId, String subjectKey, String purpose) throws Exception {
@@ -60,11 +61,16 @@ class ConsentApiTest {
 
     private ResultActions write(String requestId, String subjectKey, String purpose,
                                 String recordKey, String payload) throws Exception {
+        return write(requestId, subjectKey, purpose, recordKey, payload, 1);
+    }
+
+    private ResultActions write(String requestId, String subjectKey, String purpose,
+                                String recordKey, String payload, int expectedEpoch) throws Exception {
         return mockMvc.perform(post("/api/v1/records")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content("""
-                        {"requestId":"%s","subjectKey":"%s","purpose":"%s","recordKey":"%s","payload":"%s"}
-                        """.formatted(requestId, subjectKey, purpose, recordKey, payload)));
+                        {"requestId":"%s","subjectKey":"%s","purpose":"%s","recordKey":"%s","payload":"%s","operator":"op-test","expectedEpoch":%d}
+                        """.formatted(requestId, subjectKey, purpose, recordKey, payload, expectedEpoch)));
     }
 
     private ResultActions revoke(String requestId, String subjectKey, String purpose, int epoch) throws Exception {
@@ -329,7 +335,7 @@ class ConsentApiTest {
         grant("g-2", "subj-a", "RESEARCH").andExpect(status().isOk());
 
         // 新 epoch 可复用 recordKey
-        write("w-2", "subj-a", "RESEARCH", "rec-1", "new-payload")
+        write("w-2", "subj-a", "RESEARCH", "rec-1", "new-payload", 2)
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.epoch").value(2));
         // 查询只返回新代数据，不混入旧代
@@ -382,7 +388,7 @@ class ConsentApiTest {
                 ready.countDown();
                 start.await();
                 return consentService.write(new RecordWriteRequest(
-                        requestId, "subj-a", Purpose.RESEARCH, "rec-1", "same-payload")).payload();
+                        requestId, "subj-a", Purpose.RESEARCH, "rec-1", "same-payload", "op-test", 1)).payload();
             });
         }
         List<Future<String>> futures = new ArrayList<>();
@@ -426,5 +432,54 @@ class ConsentApiTest {
         }
         pool.shutdown();
         assertThat(count("SELECT COUNT(*) FROM consent_grant WHERE subject_key = 'subj-c'")).isEqualTo(1);
+    }
+
+    // ---------- 写入结构化身份：操作者与期望版本 ----------
+
+    @Test
+    void blankOperatorReturns400() throws Exception {
+        grant("g-1", "subj-a", "RESEARCH").andExpect(status().isOk());
+        mockMvc.perform(post("/api/v1/records")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"requestId":"w-1","subjectKey":"subj-a","purpose":"RESEARCH","recordKey":"rec-1","payload":"payload-1","operator":"","expectedEpoch":1}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_ARGUMENT"));
+    }
+
+    @Test
+    void missingExpectedEpochReturns400() throws Exception {
+        grant("g-1", "subj-a", "RESEARCH").andExpect(status().isOk());
+        mockMvc.perform(post("/api/v1/records")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"requestId":"w-1","subjectKey":"subj-a","purpose":"RESEARCH","recordKey":"rec-1","payload":"payload-1","operator":"op-test"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_ARGUMENT"));
+    }
+
+    @Test
+    void writeWithMismatchedExpectedEpochReturns409AndDoesNotConsumeRequestId() throws Exception {
+        grant("g-1", "subj-a", "RESEARCH").andExpect(status().isOk());
+        write("w-1", "subj-a", "RESEARCH", "rec-1", "payload-1", 2)
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("GRANT_EPOCH_MISMATCH"));
+        // 失败不占键：修正期望版本后同一 requestId 可成功
+        write("w-1", "subj-a", "RESEARCH", "rec-1", "payload-1", 1)
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.epoch").value(1));
+    }
+
+    @Test
+    void writeReplayAfterRevokeWithDifferentParamsReturns410() throws Exception {
+        grant("g-1", "subj-a", "RESEARCH").andExpect(status().isOk());
+        write("w-1", "subj-a", "RESEARCH", "rec-1", "payload-1").andExpect(status().isOk());
+        revoke("r-1", "subj-a", "RESEARCH", 1).andExpect(status().isOk());
+        // 撤回门禁优先于旧写重放：即使参数不一致也返回 410 而非 409，不能恢复旧文本
+        write("w-1", "subj-a", "RESEARCH", "rec-1", "payload-2")
+                .andExpect(status().isGone())
+                .andExpect(jsonPath("$.code").value("CONSENT_REVOKED"));
     }
 }
