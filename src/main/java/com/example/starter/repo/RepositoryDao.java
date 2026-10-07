@@ -56,9 +56,11 @@ public class RepositoryDao {
      */
     public RepositorySnapshot loadSnapshot() {
         List<ArtifactRow> rows = jdbcTemplate.query(
-                "SELECT id, name, version, withdrawn FROM artifact ORDER BY name ASC, version DESC",
+                "SELECT id, name, version, withdrawn, size_bytes FROM artifact "
+                        + "ORDER BY name ASC, version DESC",
                 (rs, n) -> new ArtifactRow(rs.getLong("id"), rs.getString("name"),
-                        rs.getInt("version"), rs.getInt("withdrawn") == 1));
+                        rs.getInt("version"), rs.getInt("withdrawn") == 1,
+                        rs.getLong("size_bytes")));
 
         List<DepRow> depRows = jdbcTemplate.query(
                 "SELECT artifact_id, name, minimum_version, maximum_version FROM artifact_dependency",
@@ -73,7 +75,7 @@ public class RepositoryDao {
         for (ArtifactRow row : rows) {
             List<DependencyRange> deps = depsByArtifact.getOrDefault(row.id(), List.of());
             ArtifactVersion version = new ArtifactVersion(row.id(), row.name(), row.version(),
-                    row.withdrawn(), List.copyOf(deps));
+                    row.withdrawn(), row.sizeBytes(), List.copyOf(deps));
             artifacts.computeIfAbsent(row.name(), k -> new ArrayList<>()).add(version);
         }
         return new RepositorySnapshot(getRepositoryVersion(), Map.copyOf(artifacts));
@@ -102,15 +104,17 @@ public class RepositoryDao {
     }
 
     /** 新增制品版本，返回自增主键。 */
-    public long insertArtifact(String name, int version, Instant createdAt) {
+    public long insertArtifact(String name, int version, long sizeBytes, Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbcTemplate.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO artifact (name, version, withdrawn, created_at) VALUES (?, ?, 0, ?)",
+                    "INSERT INTO artifact (name, version, withdrawn, size_bytes, created_at) "
+                            + "VALUES (?, ?, 0, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, name);
             ps.setInt(2, version);
-            ps.setTimestamp(3, Timestamp.from(createdAt));
+            ps.setLong(3, sizeBytes);
+            ps.setTimestamp(4, Timestamp.from(createdAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -131,9 +135,11 @@ public class RepositoryDao {
     /** 读取单个制品版本（含依赖），不存在返回 null。 */
     public ArtifactVersion loadArtifact(String name, int version) {
         List<ArtifactRow> rows = jdbcTemplate.query(
-                "SELECT id, name, version, withdrawn FROM artifact WHERE name = ? AND version = ?",
+                "SELECT id, name, version, withdrawn, size_bytes FROM artifact "
+                        + "WHERE name = ? AND version = ?",
                 (rs, n) -> new ArtifactRow(rs.getLong("id"), rs.getString("name"),
-                        rs.getInt("version"), rs.getInt("withdrawn") == 1),
+                        rs.getInt("version"), rs.getInt("withdrawn") == 1,
+                        rs.getLong("size_bytes")),
                 name, version);
         if (rows.isEmpty()) {
             return null;
@@ -145,7 +151,7 @@ public class RepositoryDao {
                         rs.getInt("minimum_version"), rs.getInt("maximum_version")),
                 row.id());
         return new ArtifactVersion(row.id(), row.name(), row.version(), row.withdrawn(),
-                List.copyOf(deps));
+                row.sizeBytes(), List.copyOf(deps));
     }
 
     /** 仓库版本号加一，返回加一后的版本号（须在持有行锁时调用）。 */
@@ -165,18 +171,23 @@ public class RepositoryDao {
 
     /** 新增锁文件主记录，返回自增主键。 */
     public long insertLockFile(String rootName, int rootVersion, long repositoryVersion,
+                               long budgetBytes, long totalSizeBytes, String operator,
                                String requestId, Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbcTemplate.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO lock_file (root_name, root_version, repository_version, request_id, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO lock_file (root_name, root_version, repository_version, "
+                            + "budget_bytes, total_size_bytes, operator, request_id, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, rootName);
             ps.setInt(2, rootVersion);
             ps.setLong(3, repositoryVersion);
-            ps.setString(4, requestId);
-            ps.setTimestamp(5, Timestamp.from(createdAt));
+            ps.setLong(4, budgetBytes);
+            ps.setLong(5, totalSizeBytes);
+            ps.setString(6, operator);
+            ps.setString(7, requestId);
+            ps.setTimestamp(8, Timestamp.from(createdAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -186,16 +197,17 @@ public class RepositoryDao {
         return key.longValue();
     }
 
-    /** 新增锁文件精确版本条目。 */
-    public void insertLockEntry(long lockFileId, String name, int version) {
+    /** 新增锁文件精确版本条目，并冻结该制品版本当时的体积（字节）。 */
+    public void insertLockEntry(long lockFileId, String name, int version, long sizeBytes) {
         jdbcTemplate.update(
-                "INSERT INTO lock_file_entry (lock_file_id, name, version) VALUES (?, ?, ?)",
-                lockFileId, name, version);
+                "INSERT INTO lock_file_entry (lock_file_id, name, version, size_bytes) "
+                        + "VALUES (?, ?, ?, ?)",
+                lockFileId, name, version, sizeBytes);
     }
 
     /** 幂等记录视图。 */
     public record IdempotentRecord(String requestId, String operation, String requestHash,
-                                   int httpStatus, String responseJson) {
+                                   String operator, int httpStatus, String responseJson) {
     }
 
     /**
@@ -203,11 +215,12 @@ public class RepositoryDao {
      * requestId 冲突由唯一索引抛出 DuplicateKeyException。
      */
     public void insertPendingIdempotentRequest(String requestId, String operation, String requestHash,
-                                               Instant createdAt) {
+                                               String operator, Instant createdAt) {
         jdbcTemplate.update(
-                "INSERT INTO idempotent_request (request_id, operation, request_hash, http_status, "
-                        + "response_json, created_at) VALUES (?, ?, ?, ?, CAST('' AS CHARACTER LARGE OBJECT), ?)",
-                requestId, operation, requestHash, 0, Timestamp.from(createdAt));
+                "INSERT INTO idempotent_request (request_id, operation, request_hash, operator, "
+                        + "http_status, response_json, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, CAST('' AS CHARACTER LARGE OBJECT), ?)",
+                requestId, operation, requestHash, operator, 0, Timestamp.from(createdAt));
     }
 
     /** 将幂等记录更新为成功完成态，与业务变更在同一事务提交。 */
@@ -224,42 +237,46 @@ public class RepositoryDao {
     /** 按 requestId 查找已完成的成功幂等记录，不存在返回 null。 */
     public IdempotentRecord findIdempotentRequest(String requestId) {
         List<IdempotentRecord> records = jdbcTemplate.query(
-                "SELECT request_id, operation, request_hash, http_status, response_json "
+                "SELECT request_id, operation, request_hash, operator, http_status, response_json "
                         + "FROM idempotent_request WHERE request_id = ? AND http_status > 0",
                 (rs, n) -> new IdempotentRecord(rs.getString("request_id"),
                         rs.getString("operation"), rs.getString("request_hash"),
-                        rs.getInt("http_status"), rs.getString("response_json")),
+                        rs.getString("operator"), rs.getInt("http_status"),
+                        rs.getString("response_json")),
                 requestId);
         return records.isEmpty() ? null : records.get(0);
     }
 
     /** 锁文件列表行：不含条目明细。 */
     public record LockFileRow(long id, String rootName, int rootVersion,
-                              long repositoryVersion, Instant createdAt) {
+                              long repositoryVersion, long budgetBytes, long totalSizeBytes,
+                              String operator, Instant createdAt) {
     }
 
     /** 锁文件条目行。 */
-    public record LockEntryRow(long lockFileId, String name, int version) {
+    public record LockEntryRow(long lockFileId, String name, int version, long sizeBytes) {
     }
 
     /** 查询全部历史锁文件，按 ID 升序。 */
     public List<LockFileRow> listLockFiles() {
         return jdbcTemplate.query(
-                "SELECT id, root_name, root_version, repository_version, created_at "
-                        + "FROM lock_file ORDER BY id ASC",
+                "SELECT id, root_name, root_version, repository_version, budget_bytes, "
+                        + "total_size_bytes, operator, created_at FROM lock_file ORDER BY id ASC",
                 (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
                         rs.getInt("root_version"), rs.getLong("repository_version"),
-                        rs.getTimestamp("created_at").toInstant()));
+                        rs.getLong("budget_bytes"), rs.getLong("total_size_bytes"),
+                        rs.getString("operator"), rs.getTimestamp("created_at").toInstant()));
     }
 
     /** 按主键查询锁文件，不存在返回 null。 */
     public LockFileRow getLockFile(long id) {
         List<LockFileRow> rows = jdbcTemplate.query(
-                "SELECT id, root_name, root_version, repository_version, created_at "
-                        + "FROM lock_file WHERE id = ?",
+                "SELECT id, root_name, root_version, repository_version, budget_bytes, "
+                        + "total_size_bytes, operator, created_at FROM lock_file WHERE id = ?",
                 (rs, n) -> new LockFileRow(rs.getLong("id"), rs.getString("root_name"),
                         rs.getInt("root_version"), rs.getLong("repository_version"),
-                        rs.getTimestamp("created_at").toInstant()),
+                        rs.getLong("budget_bytes"), rs.getLong("total_size_bytes"),
+                        rs.getString("operator"), rs.getTimestamp("created_at").toInstant()),
                 id);
         return rows.isEmpty() ? null : rows.get(0);
     }
@@ -267,14 +284,15 @@ public class RepositoryDao {
     /** 查询某锁文件的全部条目，按名称升序。 */
     public List<LockEntryRow> listLockEntries(long lockFileId) {
         return jdbcTemplate.query(
-                "SELECT lock_file_id, name, version FROM lock_file_entry "
+                "SELECT lock_file_id, name, version, size_bytes FROM lock_file_entry "
                         + "WHERE lock_file_id = ? ORDER BY name ASC",
                 (rs, n) -> new LockEntryRow(rs.getLong("lock_file_id"),
-                        rs.getString("name"), rs.getInt("version")),
+                        rs.getString("name"), rs.getInt("version"), rs.getLong("size_bytes")),
                 lockFileId);
     }
 
-    private record ArtifactRow(long id, String name, int version, boolean withdrawn) {
+    private record ArtifactRow(long id, String name, int version, boolean withdrawn,
+                               long sizeBytes) {
     }
 
     private record DepRow(long artifactId, String name, int minimumVersion, int maximumVersion) {

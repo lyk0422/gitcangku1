@@ -21,6 +21,8 @@ import java.util.List;
 
 /**
  * 软件制品依赖锁定 REST API。
+ *
+ * <p>所有写入口要求请求头 X-Request-Id（全局幂等键）与 X-Operator（非空操作者）。
  */
 @RestController
 @RequestMapping("/api/artifacts")
@@ -37,25 +39,30 @@ public class ArtifactController {
     @PostMapping
     public ResponseEntity<ArtifactResponse> register(
             @RequestHeader("X-Request-Id") String requestId,
+            @RequestHeader("X-Operator") String operator,
             @Valid @RequestBody RegisterArtifactRequest request) {
-        return ResponseEntity.status(HttpStatus.CREATED).body(artifactService.registerArtifact(requestId, request));
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(artifactService.registerArtifact(requestId, operator, request));
     }
 
     /** 撤回制品版本。 */
     @PostMapping("/{name}/versions/{version}/withdraw")
     public ArtifactResponse withdraw(
             @RequestHeader("X-Request-Id") String requestId,
+            @RequestHeader("X-Operator") String operator,
             @PathVariable String name,
             @PathVariable @Positive int version) {
-        return artifactService.withdrawArtifact(requestId, name, version);
+        return artifactService.withdrawArtifact(requestId, operator, name, version);
     }
 
     /** 创建锁文件。 */
     @PostMapping("/locks")
     public ResponseEntity<LockFileResponse> lock(
             @RequestHeader("X-Request-Id") String requestId,
+            @RequestHeader("X-Operator") String operator,
             @Valid @RequestBody LockRequest request) {
-        return ResponseEntity.status(HttpStatus.CREATED).body(artifactService.createLock(requestId, request));
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(artifactService.createLock(requestId, operator, request));
     }
 
     /** 查询全部历史锁文件。 */

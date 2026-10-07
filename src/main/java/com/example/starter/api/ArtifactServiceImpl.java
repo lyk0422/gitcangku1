@@ -10,6 +10,7 @@ import com.example.starter.api.dto.RegisterArtifactRequest;
 import com.example.starter.domain.ArtifactVersion;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.LockResolver;
+import com.example.starter.domain.LockSolution;
 import com.example.starter.domain.RepositorySnapshot;
 import com.example.starter.repo.RepositoryDao;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
@@ -39,6 +40,7 @@ import java.util.function.Supplier;
  *
  * <p>所有写操作在单个事务内完成：先锁单行仓库版本表互斥并发写，
  * 再做业务变更并写入幂等成功记录，原子提交；业务失败整体回滚，不占用 requestId。
+ * 写操作必须携带非空操作者；幂等参数以结构化方式参与比较：数值按值、文本原样。
  */
 @Service
 public class ArtifactServiceImpl implements ArtifactService {
@@ -66,36 +68,41 @@ public class ArtifactServiceImpl implements ArtifactService {
     }
 
     @Override
-    public ArtifactResponse registerArtifact(String requestId, RegisterArtifactRequest request) {
-        requireRequestId(requestId);
+    public ArtifactResponse registerArtifact(String requestId, String operator,
+                                             RegisterArtifactRequest request) {
+        requireWriteIdentity(requestId, operator);
         validateRegisterRequest(request);
-        String hash = sha256(OP_REGISTER + "|" + request.name().trim() + "|" + request.version() + "|"
-                + canonicalDependencies(request));
-        return executeIdempotent(requestId, OP_REGISTER, hash, 201,
+        String hash = sha256(OP_REGISTER + "|" + request.name().trim() + "|" + request.version()
+                + "|" + request.effectiveSizeBytes() + "|" + canonicalDependencies(request)
+                + "|" + operator);
+        return executeIdempotent(requestId, OP_REGISTER, hash, operator, 201,
                 () -> doRegister(request), ArtifactResponse.class);
     }
 
     @Override
-    public ArtifactResponse withdrawArtifact(String requestId, String name, int version) {
-        requireRequestId(requestId);
+    public ArtifactResponse withdrawArtifact(String requestId, String operator,
+                                             String name, int version) {
+        requireWriteIdentity(requestId, operator);
         if (name == null || name.isBlank()) {
             throw ApiException.badRequest("name 不能为空");
         }
-        String hash = sha256(OP_WITHDRAW + "|" + name.trim() + "|" + version);
-        return executeIdempotent(requestId, OP_WITHDRAW, hash, 200,
+        String hash = sha256(OP_WITHDRAW + "|" + name.trim() + "|" + version + "|" + operator);
+        return executeIdempotent(requestId, OP_WITHDRAW, hash, operator, 200,
                 () -> doWithdraw(name.trim(), version), ArtifactResponse.class);
     }
 
     @Override
-    public LockFileResponse createLock(String requestId, LockRequest request) {
-        requireRequestId(requestId);
+    public LockFileResponse createLock(String requestId, String operator, LockRequest request) {
+        requireWriteIdentity(requestId, operator);
         if (request.rootName() == null || request.rootName().isBlank()) {
             throw ApiException.badRequest("rootName 不能为空");
         }
+        // 结构化参数：预算为十进制数值，按其数值参与比较；文本（根名、操作者）原样入摘。
         String hash = sha256(OP_LOCK + "|" + request.rootName().trim() + "|" + request.rootVersion()
-                + "|" + request.expectedRepositoryVersion());
-        return executeIdempotent(requestId, OP_LOCK, hash, 201,
-                () -> doLock(request), LockFileResponse.class);
+                + "|" + request.expectedRepositoryVersion() + "|" + request.budgetBytes()
+                + "|" + operator);
+        return executeIdempotent(requestId, OP_LOCK, hash, operator, 201,
+                () -> doLock(request, operator), LockFileResponse.class);
     }
 
     @Override
@@ -123,6 +130,7 @@ public class ArtifactServiceImpl implements ArtifactService {
     private ArtifactResponse doRegister(RegisterArtifactRequest request) {
         String name = request.name().trim();
         int version = request.version();
+        long sizeBytes = request.effectiveSizeBytes();
 
         if (repositoryDao.artifactExists(name, version)) {
             throw ApiException.conflict("制品版本已存在: " + name + ":" + version);
@@ -138,14 +146,14 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
 
         Instant now = Instant.now(clock);
-        long artifactId = repositoryDao.insertArtifact(name, version, now);
-        for (var dep : request.dependencies()) {
+        long artifactId = repositoryDao.insertArtifact(name, version, sizeBytes, now);
+        for (DependencySpec dep : request.dependencies()) {
             repositoryDao.insertDependency(artifactId, dep.name().trim(),
                     dep.minimumVersion(), dep.maximumVersion());
         }
         long repositoryVersion = repositoryDao.incrementRepositoryVersion();
 
-        return new ArtifactResponse(name, version, false, repositoryVersion, now,
+        return new ArtifactResponse(name, version, sizeBytes, false, repositoryVersion, now,
                 toDependencyViews(request.dependencies()));
     }
 
@@ -163,13 +171,14 @@ public class ArtifactServiceImpl implements ArtifactService {
             throw ApiException.conflict("制品版本已撤回: " + name + ":" + version);
         }
         long repositoryVersion = repositoryDao.incrementRepositoryVersion();
-        return new ArtifactResponse(name, version, true, repositoryVersion,
+        return new ArtifactResponse(name, version, artifact.sizeBytes(), true, repositoryVersion,
                 Instant.now(clock), toDependencyViews(artifact.dependencies()));
     }
 
-    private LockFileResponse doLock(LockRequest request) {
+    private LockFileResponse doLock(LockRequest request, String operator) {
         String rootName = request.rootName().trim();
         int rootVersion = request.rootVersion();
+        long budgetBytes = request.budgetBytes();
 
         // 当前事务已在入口持有 repository_state 行锁；此处读取版本号并做乐观校验。
         long currentVersion = repositoryDao.lockRepositoryState();
@@ -187,20 +196,34 @@ public class ArtifactServiceImpl implements ArtifactService {
         }
 
         RepositorySnapshot snapshot = repositoryDao.loadSnapshot();
-        Map<String, Integer> solution = LockResolver.resolve(snapshot, rootName, rootVersion);
+        // 沿用按名称、从高到低的回溯；超预算（含求和溢出 long）的候选继续回退。
+        LockSolution solution = LockResolver.resolveWithBudget(
+                snapshot, rootName, rootVersion, budgetBytes);
         if (solution == null) {
             throw ApiException.unprocessable(
-                    "不存在满足全部依赖区间的未撤回版本组合，无法锁定");
+                    "不存在满足全部依赖区间、无环且总体积不超过预算 " + budgetBytes
+                            + " 字节的未撤回版本组合，无法锁定");
         }
 
+        Map<String, Integer> versions = solution.versions();
         Instant now = Instant.now(clock);
         long lockFileId = repositoryDao.insertLockFile(rootName, rootVersion, currentVersion,
-                currentRequestId.get(), now);
-        solution.forEach((n, v) -> repositoryDao.insertLockEntry(lockFileId, n, v));
-
+                budgetBytes, solution.totalSizeBytes(), operator, currentRequestId.get(), now);
+        // 冻结每个选中制品版本当时的大小，不以后续元数据补齐改写历史。
         List<LockEntryResponse> entries = new ArrayList<>();
-        solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
-        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
+        for (Map.Entry<String, Integer> selected : versions.entrySet()) {
+            ArtifactVersion chosen = snapshot.artifacts().get(selected.getKey()).stream()
+                    .filter(a -> a.version() == selected.getValue())
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalStateException("解析结果缺少制品快照: "
+                            + selected.getKey() + ":" + selected.getValue()));
+            repositoryDao.insertLockEntry(lockFileId, selected.getKey(), selected.getValue(),
+                    chosen.sizeBytes());
+            entries.add(new LockEntryResponse(selected.getKey(), selected.getValue(),
+                    chosen.sizeBytes()));
+        }
+        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion,
+                budgetBytes, solution.totalSizeBytes(), operator, now, entries);
     }
 
     // ------------------------------------------------------------------
@@ -213,7 +236,8 @@ public class ArtifactServiceImpl implements ArtifactService {
     private final ThreadLocal<String> currentRequestId = new ThreadLocal<>();
 
     private <T> T executeIdempotent(String requestId, String operation, String requestHash,
-                                    int httpStatus, Supplier<T> action, Class<T> responseType) {
+                                    String operator, int httpStatus, Supplier<T> action,
+                                    Class<T> responseType) {
         // 快速路径：已提交的成功记录直接重放。
         T replay = replayIfPresent(requestId, operation, requestHash, responseType);
         if (replay != null) {
@@ -230,7 +254,7 @@ public class ArtifactServiceImpl implements ArtifactService {
                     return existing;
                 }
                 repositoryDao.insertPendingIdempotentRequest(
-                        requestId, operation, requestHash, Instant.now(clock));
+                        requestId, operation, requestHash, operator, Instant.now(clock));
                 currentRequestId.set(requestId);
                 try {
                     T result = action.get();
@@ -242,7 +266,7 @@ public class ArtifactServiceImpl implements ArtifactService {
                 }
             });
         } catch (DuplicateKeyException e) {
-            // 同键并发：赢家已提交则重放其结果，否则报告冲突。
+            // 同键并发：赢家已提交则重放其结果，否则报告冲突，不把竞争报成唯一键 500。
             T replayAfterRace = replayIfPresent(requestId, operation, requestHash, responseType);
             if (replayAfterRace != null) {
                 return replayAfterRace;
@@ -252,7 +276,8 @@ public class ArtifactServiceImpl implements ArtifactService {
     }
 
     /**
-     * 存在成功记录时：同操作同参返回原结果；异参（含异操作）返回 409。不存在返回 null。
+     * 存在成功记录时：同操作同参（含操作者、预算等全部结构化参数）返回原结果；
+     * 异参（含异操作）返回 409。不存在返回 null。
      */
     private <T> T replayIfPresent(String requestId, String operation, String requestHash,
                                   Class<T> responseType) {
@@ -271,9 +296,21 @@ public class ArtifactServiceImpl implements ArtifactService {
     // 校验与转换
     // ------------------------------------------------------------------
 
+    private void requireWriteIdentity(String requestId, String operator) {
+        if (requestId == null || requestId.isBlank()) {
+            throw ApiException.badRequest("缺少请求头 X-Request-Id");
+        }
+        if (operator == null || operator.isBlank()) {
+            throw ApiException.badRequest("缺少请求头 X-Operator");
+        }
+    }
+
     private void validateRegisterRequest(RegisterArtifactRequest request) {
         if (request.name() == null || request.name().isBlank()) {
             throw ApiException.badRequest("name 不能为空");
+        }
+        if (request.sizeBytes() != null && request.sizeBytes() < 0L) {
+            throw ApiException.badRequest("sizeBytes 不能为负");
         }
         List<DependencySpec> deps = request.dependencies();
         if (deps.size() > 10) {
@@ -306,7 +343,7 @@ public class ArtifactServiceImpl implements ArtifactService {
     private List<DependencyView> toDependencyViews(List<?> raw) {
         TreeMap<String, DependencyView> sorted = new TreeMap<>();
         for (Object o : raw) {
-            if (o instanceof com.example.starter.api.dto.DependencySpec spec) {
+            if (o instanceof DependencySpec spec) {
                 sorted.put(spec.name().trim(), new DependencyView(
                         spec.name().trim(), spec.minimumVersion(), spec.maximumVersion()));
             } else if (o instanceof DependencyRange range) {
@@ -319,16 +356,11 @@ public class ArtifactServiceImpl implements ArtifactService {
 
     private LockFileResponse toLockResponse(LockFileRow row, List<LockEntryRow> entries) {
         List<LockEntryResponse> entryViews = entries.stream()
-                .map(e -> new LockEntryResponse(e.name(), e.version()))
+                .map(e -> new LockEntryResponse(e.name(), e.version(), e.sizeBytes()))
                 .toList();
         return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(),
-                row.repositoryVersion(), row.createdAt(), entryViews);
-    }
-
-    private void requireRequestId(String requestId) {
-        if (requestId == null || requestId.isBlank()) {
-            throw ApiException.badRequest("缺少请求头 X-Request-Id");
-        }
+                row.repositoryVersion(), row.budgetBytes(), row.totalSizeBytes(),
+                row.operator(), row.createdAt(), entryViews);
     }
 
     private String writeJson(Object value) {
