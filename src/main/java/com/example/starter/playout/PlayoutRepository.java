@@ -47,6 +47,11 @@ public class PlayoutRepository {
     public record SegmentRow(String id, String assetId, long startMs, long endMs) {
     }
 
+    /** 草稿伴随轨行；position 从 1 起，grantId 为指定授权，区间与主片段一致。 */
+    public record DraftCompanionRow(String segmentId, int position, String assetId, long grantId,
+                                    long startMs, long endMs) {
+    }
+
     /** 发布快照行。 */
     public record PublicationRow(long id, String channelId, LocalDate businessDay,
                                  long publishedVersion, long draftVersion) {
@@ -58,9 +63,15 @@ public class PlayoutRepository {
                                         long startMs, long endMs) {
     }
 
+    /** 发布快照伴随轨行，成员身份、授权与源区间在发布时冻结。 */
+    public record PublicationCompanionRow(long id, long publicationId, String segmentId,
+                                          int position, String assetId, long grantId,
+                                          long startMs, long endMs) {
+    }
+
     /** 幂等请求记录行；responseBody 为 NULL 表示尚未成功完成（同事务回滚后记录不保留）。 */
     public record RequestRow(String requestId, String operation, String paramsHash,
-                             String responseBody) {
+                             String operator, String responseBody) {
     }
 
     /** 紧急插播行；status 为 ACTIVE / CANCELLED，grantId 始终保留创建时指定的原授权关联。 */
@@ -101,9 +112,21 @@ public class PlayoutRepository {
                     rs.getString("segment_id"), rs.getString("asset_id"), rs.getLong("grant_id"),
                     rs.getLong("start_ms"), rs.getLong("end_ms"));
 
+    private static final RowMapper<DraftCompanionRow> DRAFT_COMPANION_MAPPER = (rs, n) ->
+            new DraftCompanionRow(rs.getString("segment_id"), rs.getInt("position"),
+                    rs.getString("asset_id"), rs.getLong("grant_id"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"));
+
+    private static final RowMapper<PublicationCompanionRow> PUBLICATION_COMPANION_MAPPER = (rs, n) ->
+            new PublicationCompanionRow(rs.getLong("id"), rs.getLong("publication_id"),
+                    rs.getString("segment_id"), rs.getInt("position"),
+                    rs.getString("asset_id"), rs.getLong("grant_id"),
+                    rs.getLong("start_ms"), rs.getLong("end_ms"));
+
     private static final RowMapper<RequestRow> REQUEST_MAPPER = (rs, n) ->
             new RequestRow(rs.getString("request_id"), rs.getString("operation"),
-                    rs.getString("params_hash"), rs.getString("response_body"));
+                    rs.getString("params_hash"), rs.getString("operator"),
+                    rs.getString("response_body"));
 
     private static final RowMapper<OverrideRow> OVERRIDE_MAPPER = (rs, n) ->
             new OverrideRow(rs.getString("override_key"), rs.getString("channel_id"),
@@ -236,6 +259,33 @@ public class PlayoutRepository {
                 SEGMENT_MAPPER, channelId, Date.valueOf(businessDay));
     }
 
+    // ---------- 草稿伴随轨 ----------
+
+    public void insertDraftCompanion(String segmentId, String channelId, LocalDate businessDay,
+                                     int position, String assetId, long grantId,
+                                     long startMs, long endMs) {
+        jdbc.update("INSERT INTO playout_draft_segment_companion"
+                        + " (segment_id, channel_id, business_day, position, asset_id, grant_id,"
+                        + "  start_ms, end_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                segmentId, channelId, Date.valueOf(businessDay), position, assetId, grantId,
+                startMs, endMs);
+    }
+
+    public void deleteDraftCompanions(String channelId, LocalDate businessDay) {
+        jdbc.update("DELETE FROM playout_draft_segment_companion"
+                        + " WHERE channel_id = ? AND business_day = ?",
+                channelId, Date.valueOf(businessDay));
+    }
+
+    /** 某频道业务日全部草稿伴随轨，按片段与顺序排序。 */
+    public List<DraftCompanionRow> findDraftCompanions(String channelId, LocalDate businessDay) {
+        return jdbc.query("SELECT segment_id, position, asset_id, grant_id, start_ms, end_ms"
+                        + " FROM playout_draft_segment_companion"
+                        + " WHERE channel_id = ? AND business_day = ?"
+                        + " ORDER BY segment_id, position",
+                DRAFT_COMPANION_MAPPER, channelId, Date.valueOf(businessDay));
+    }
+
     // ---------- 发布快照 ----------
 
     /** 当前发布版本，无发布记录时为 0。 */
@@ -291,18 +341,40 @@ public class PlayoutRepository {
                 PUBLICATION_SEGMENT_MAPPER, publicationId, atMs, atMs).stream().findFirst();
     }
 
+    // ---------- 发布快照伴随轨 ----------
+
+    public void insertPublicationCompanion(long publicationId, String segmentId, int position,
+                                           String assetId, long grantId, long startMs, long endMs) {
+        jdbc.update("INSERT INTO playout_publication_segment_companion"
+                        + " (publication_id, segment_id, position, asset_id, grant_id, start_ms, end_ms)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                publicationId, segmentId, position, assetId, grantId, startMs, endMs);
+    }
+
+    /** 快照中某片段的有序伴随轨（按 position 升序）。 */
+    public List<PublicationCompanionRow> findPublicationCompanions(long publicationId,
+                                                                   String segmentId) {
+        return jdbc.query("SELECT id, publication_id, segment_id, position, asset_id, grant_id,"
+                        + " start_ms, end_ms FROM playout_publication_segment_companion"
+                        + " WHERE publication_id = ? AND segment_id = ? ORDER BY position",
+                PUBLICATION_COMPANION_MAPPER, publicationId, segmentId);
+    }
+
     // ---------- 幂等请求记录 ----------
 
     /** 按请求 ID 查询并加行锁，用于去重判定。 */
     public Optional<RequestRow> findRequestForUpdate(String requestId) {
-        return jdbc.query("SELECT request_id, operation, params_hash, response_body"
+        return jdbc.query("SELECT request_id, operation, params_hash, operator, response_body"
                         + " FROM playout_request WHERE request_id = ? FOR UPDATE",
                 REQUEST_MAPPER, requestId).stream().findFirst();
     }
 
-    public void insertRequest(String requestId, String operation, String paramsHash, long createdAtMs) {
-        jdbc.update("INSERT INTO playout_request (request_id, operation, params_hash, created_at_ms)"
-                + " VALUES (?, ?, ?, ?)", requestId, operation, paramsHash, createdAtMs);
+    public void insertRequest(String requestId, String operation, String paramsHash,
+                              String operator, long createdAtMs) {
+        jdbc.update("INSERT INTO playout_request"
+                        + " (request_id, operation, params_hash, operator, created_at_ms)"
+                        + " VALUES (?, ?, ?, ?, ?)",
+                requestId, operation, paramsHash, operator, createdAtMs);
     }
 
     public void completeRequest(String requestId, String responseBody) {

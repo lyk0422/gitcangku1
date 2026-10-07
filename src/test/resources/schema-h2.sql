@@ -45,6 +45,20 @@ CREATE TABLE IF NOT EXISTS playout_draft_segment (
 );
 CREATE INDEX IF NOT EXISTS idx_draft_segment ON playout_draft_segment (channel_id, business_day);
 
+CREATE TABLE IF NOT EXISTS playout_draft_segment_companion (
+    id           BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    segment_id   VARCHAR(64) NOT NULL,
+    channel_id   VARCHAR(64) NOT NULL,
+    business_day DATE        NOT NULL,
+    position     INT         NOT NULL,
+    asset_id     VARCHAR(64) NOT NULL,
+    grant_id     BIGINT      NOT NULL,
+    start_ms     BIGINT      NOT NULL,
+    end_ms       BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_draft_companion
+    ON playout_draft_segment_companion (channel_id, business_day, segment_id);
+
 CREATE TABLE IF NOT EXISTS playout_publication (
     id                BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
     channel_id        VARCHAR(64) NOT NULL,
@@ -67,10 +81,24 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
 );
 CREATE INDEX IF NOT EXISTS idx_pub_segment ON playout_publication_segment (publication_id);
 
+CREATE TABLE IF NOT EXISTS playout_publication_segment_companion (
+    id             BIGINT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    publication_id BIGINT      NOT NULL,
+    segment_id     VARCHAR(64) NOT NULL,
+    position       INT         NOT NULL,
+    asset_id       VARCHAR(64) NOT NULL,
+    grant_id       BIGINT      NOT NULL,
+    start_ms       BIGINT      NOT NULL,
+    end_ms         BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pub_companion
+    ON playout_publication_segment_companion (publication_id, segment_id);
+
 CREATE TABLE IF NOT EXISTS playout_request (
     request_id    VARCHAR(64) NOT NULL PRIMARY KEY,
     operation     VARCHAR(32) NOT NULL,
     params_hash   VARCHAR(64) NOT NULL,
+    operator      VARCHAR(64) NULL,
     response_body TEXT        NULL,
     created_at_ms BIGINT      NOT NULL
 );

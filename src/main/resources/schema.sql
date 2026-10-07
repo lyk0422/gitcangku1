@@ -49,6 +49,20 @@ CREATE TABLE IF NOT EXISTS playout_draft_segment (
     KEY idx_draft_segment (channel_id, business_day)
 ) COMMENT = '草稿片段表，随草稿整份替换而整体重建';
 
+CREATE TABLE IF NOT EXISTS playout_draft_segment_companion (
+    id           BIGINT      NOT NULL AUTO_INCREMENT COMMENT '草稿伴随轨自增 ID',
+    segment_id   VARCHAR(64) NOT NULL COMMENT '所属草稿片段 ID，随草稿整份替换而重建',
+    channel_id   VARCHAR(64) NOT NULL COMMENT '所属频道 ID',
+    business_day DATE        NOT NULL COMMENT '所属业务日，Asia/Shanghai 日历日',
+    position     INT         NOT NULL COMMENT '伴随顺序，从 1 起递增，顺序有意义',
+    asset_id     VARCHAR(64) NOT NULL COMMENT '伴随素材 ID，须不同于主素材且片段内互不重复',
+    grant_id     BIGINT      NOT NULL COMMENT '指定授权 ID，须属于该频道与伴随素材、未撤销并完整覆盖片段区间',
+    start_ms     BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒，与主片段一致',
+    end_ms       BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒，与主片段一致',
+    PRIMARY KEY (id),
+    KEY idx_draft_companion (channel_id, business_day, segment_id)
+) COMMENT = '草稿片段伴随轨表，每片段最多 2 条，与主片段同 UTC 毫秒起止';
+
 CREATE TABLE IF NOT EXISTS playout_publication (
     id                BIGINT      NOT NULL AUTO_INCREMENT COMMENT '发布快照自增 ID',
     channel_id        VARCHAR(64) NOT NULL COMMENT '频道 ID',
@@ -72,10 +86,24 @@ CREATE TABLE IF NOT EXISTS playout_publication_segment (
     KEY idx_pub_segment (publication_id)
 ) COMMENT = '发布快照片段表，只读';
 
+CREATE TABLE IF NOT EXISTS playout_publication_segment_companion (
+    id             BIGINT      NOT NULL AUTO_INCREMENT COMMENT '快照伴随轨自增 ID',
+    publication_id BIGINT      NOT NULL COMMENT '所属发布快照 ID',
+    segment_id     VARCHAR(64) NOT NULL COMMENT '来源草稿片段 ID',
+    position       INT         NOT NULL COMMENT '伴随顺序，从 1 起递增，与草稿一致',
+    asset_id       VARCHAR(64) NOT NULL COMMENT '伴随素材 ID，发布时冻结',
+    grant_id       BIGINT      NOT NULL COMMENT '发布时指定的授权 ID，播出查询据此实时判定撤销状态',
+    start_ms       BIGINT      NOT NULL COMMENT '播出开始（含），UTC 纪元毫秒，与主片段一致',
+    end_ms         BIGINT      NOT NULL COMMENT '播出结束（不含），UTC 纪元毫秒，与主片段一致',
+    PRIMARY KEY (id),
+    KEY idx_pub_companion (publication_id, segment_id)
+) COMMENT = '发布快照片段伴随轨表，只读，授权撤销不改写历史快照';
+
 CREATE TABLE IF NOT EXISTS playout_request (
     request_id    VARCHAR(64)  NOT NULL COMMENT '幂等请求 ID，客户端生成',
     operation     VARCHAR(32)  NOT NULL COMMENT '操作类型：REPLACE_DRAFT / PUBLISH / REVOKE_GRANT / CREATE_OVERRIDE / CANCEL_OVERRIDE',
     params_hash   VARCHAR(64)  NOT NULL COMMENT '业务参数（不含 requestId）的 SHA-256，十六进制',
+    operator      VARCHAR(64)  NULL COMMENT '操作者标识，客户端提供时非空白；未提供时为 NULL',
     response_body TEXT         NULL COMMENT '成功时的响应 JSON；失败请求回滚不占用 requestId',
     created_at_ms BIGINT       NOT NULL COMMENT '记录创建时间，UTC 纪元毫秒',
     PRIMARY KEY (request_id)
