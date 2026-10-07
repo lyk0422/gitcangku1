@@ -8,20 +8,19 @@ import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.RecallResponse;
+import com.example.starter.batch.dto.ReleaseSnapshotResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import com.example.starter.batch.dto.TestResultResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.support.TransactionTemplate;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -56,18 +55,22 @@ public class BatchService {
      */
     private static final String SEP = "\u0000";
 
-    private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
-
     private final BatchRepository repo;
-    private final TransactionTemplate tx;
+    private final CertificateRepository certRepo;
+    private final IdempotentExecutor idempotent;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
     public BatchService(BatchRepository repo,
-                        PlatformTransactionManager transactionManager,
-                        ObjectMapper objectMapper) {
+                        CertificateRepository certRepo,
+                        IdempotentExecutor idempotent,
+                        ObjectMapper objectMapper,
+                        Clock clock) {
         this.repo = repo;
-        this.tx = new TransactionTemplate(transactionManager);
+        this.certRepo = certRepo;
+        this.idempotent = idempotent;
         this.objectMapper = objectMapper;
+        this.clock = clock;
     }
 
     /**
@@ -123,7 +126,8 @@ public class BatchService {
             BatchStatus status = BatchStatus.valueOf(batch.status());
             assertNoRecalledAncestor(batchKey);
             if (status == BatchStatus.REJECTED || status == BatchStatus.RELEASED
-                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT) {
+                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT
+                    || status == BatchStatus.MERGED) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许提交检验");
             }
             List<String> required = repo.findRequiredTests(batchKey);
@@ -200,6 +204,20 @@ public class BatchService {
                 seq = 2;
                 newStatus = BatchStatus.RELEASED;
             }
+            if (newStatus == BatchStatus.RELEASED) {
+                // 放行门禁：必须存在与物料、批号前缀匹配且在放行时点有效的已绑定声明版本；
+                // 放行快照固化声明版本、匹配前缀与时点，随后续声明撤回不改写
+                CertificateRepository.DeclarationRow matched =
+                        selectReleaseDeclaration(batch, clock.instant());
+                if (matched == null) {
+                    throw ApiException.unprocessable(
+                            "无有效合格证声明绑定，不能放行: 批次物料=" + batch.productCode()
+                                    + " 批号=" + batch.batchNo());
+                }
+                certRepo.insertReleaseSnapshot(new CertificateRepository.ReleaseSnapshotRow(0L,
+                        batchKey, matched.declarationKey(), matched.version(),
+                        matched.batchNoPrefix(), now, now));
+            }
             repo.insertApproval(new BatchRepository.ApprovalRow(0L, batchKey, req.commandKey(),
                     actor, role.name(), seq, now));
             repo.updateStatus(batchKey, newStatus.name());
@@ -253,6 +271,7 @@ public class BatchService {
         Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
         return repo.findAvailableBatches().stream()
                 .filter(b -> !BatchStatus.SPLIT.name().equals(b.status()))
+                .filter(b -> !BatchStatus.MERGED.name().equals(b.status()))
                 .filter(b -> recalledAncestor(b.batchKey(), parentOf, recalled).isEmpty())
                 .map(this::toBatchResponse)
                 .toList();
@@ -286,32 +305,20 @@ public class BatchService {
                 .map(r -> new RecallResponse(r.batchKey(), r.actorId(), r.reason(),
                         BatchStatus.RECALLED, Instant.parse(r.createdAt())))
                 .orElse(null);
-        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall);
+        ReleaseSnapshotResponse release = certRepo.findReleaseSnapshot(batchKey)
+                .map(s -> new ReleaseSnapshotResponse(s.batchKey(), s.declarationKey(),
+                        s.declarationVersion(), s.matchedPrefix(), Instant.parse(s.releasedAt())))
+                .orElse(null);
+        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall, release);
     }
 
     /**
-     * 幂等执行：同事务内先查 command_log，命中则按指纹返回快照或 409；
-     * 未命中执行业务动作并写入快照。并发同键插入冲突时重试，读取已提交结果。
+     * 幂等执行：委托 {@link IdempotentExecutor}，同事务内先查 command_log，
+     * 命中则按指纹返回快照或 409；未命中执行业务动作并写入快照。
      */
     private StoredResponse executeIdempotent(String type, String commandKey, String fingerprint,
                                              Supplier<StoredResponse> action) {
-        for (int attempt = 0; attempt < IDEMPOTENCY_MAX_ATTEMPTS; attempt++) {
-            try {
-                return tx.execute(status -> {
-                    var logged = loggedResponse(type, commandKey, fingerprint);
-                    if (logged.isPresent()) {
-                        return logged.get();
-                    }
-                    StoredResponse response = action.get();
-                    repo.insertCommand(new BatchRepository.CommandRow(type, commandKey, fingerprint,
-                            response.status(), response.body()), now());
-                    return response;
-                });
-            } catch (DuplicateKeyException e) {
-                // 并发同事务键冲突：回滚后重试，读取对方已提交的命令快照或业务结果
-            }
-        }
-        throw ApiException.conflict("命令并发冲突，请重试: " + commandKey);
+        return idempotent.execute(type, commandKey, fingerprint, action);
     }
 
     /**
@@ -319,15 +326,7 @@ public class BatchService {
      */
     private Optional<StoredResponse> loggedResponse(String type, String commandKey,
                                                     String fingerprint) {
-        var existing = repo.findCommand(type, commandKey);
-        if (existing.isEmpty()) {
-            return Optional.empty();
-        }
-        BatchRepository.CommandRow row = existing.get();
-        if (!row.fingerprint().equals(fingerprint)) {
-            throw ApiException.conflict("commandKey 已以不同参数使用: " + commandKey);
-        }
-        return Optional.of(new StoredResponse(row.responseStatus(), row.responseBody()));
+        return idempotent.logged(type, commandKey, fingerprint);
     }
 
     private boolean allRequiredPassed(String batchKey, List<String> required) {
@@ -396,7 +395,7 @@ public class BatchService {
     }
 
     private String now() {
-        return Instant.now().toString();
+        return clock.instant().toString();
     }
 
     private String fingerprint(String... parts) {        String canonical = String.join(SEP, parts);
@@ -462,6 +461,13 @@ public class BatchService {
                         spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
+                }
+                // 拆分产物继承父批的合格证声明绑定引用（保留原绑定操作人）
+                for (CertificateRepository.BindingRow binding : certRepo.findBindings(parentKey)) {
+                    certRepo.insertBinding(new CertificateRepository.BindingRow(0L,
+                            spec.batchKey(), binding.declarationKey(),
+                            binding.declarationVersion(), binding.materialCode(),
+                            binding.batchNoPrefix(), binding.boundBy(), now));
                 }
                 repo.insertLineage(new BatchRepository.LineageRow(0L, parentKey, spec.batchKey(),
                         i + 1, now));
@@ -574,5 +580,34 @@ public class BatchService {
         return new LineageEntryResponse(row.batchKey(), row.batchNo(),
                 BatchStatus.valueOf(row.status()),
                 recalledAncestor(batchKey, parentOf, recalled).orElse(null));
+    }
+
+    /**
+     * 放行门禁匹配：行锁读取该批次已绑定的声明版本（与撤回按事务提交顺序裁决），
+     * 选取物料一致、批号前缀匹配、ACTIVE 且在给定时点处于有效区间（左闭右开）的声明；
+     * 多个匹配时取优先级最高、版本最新者（同物料前缀重叠的 ACTIVE 声明优先级必不同，
+     * 结果确定）。无匹配返回 null。
+     */
+    private CertificateRepository.DeclarationRow selectReleaseDeclaration(
+            BatchRepository.BatchRow batch, Instant at) {
+        CertificateRepository.DeclarationRow best = null;
+        for (CertificateRepository.BindingRow binding : certRepo.findBindings(batch.batchKey())) {
+            CertificateRepository.DeclarationRow d = certRepo.findDeclarationForUpdate(
+                    binding.declarationKey(), binding.declarationVersion()).orElse(null);
+            if (d == null) {
+                continue;
+            }
+            if (!DeclarationStatus.ACTIVE.name().equals(d.status())
+                    || !d.materialCode().equals(batch.productCode())
+                    || !batch.batchNo().startsWith(d.batchNoPrefix())
+                    || !CertificateService.withinValidity(d, at)) {
+                continue;
+            }
+            if (best == null || d.priority() > best.priority()
+                    || (d.priority() == best.priority() && d.version() > best.version())) {
+                best = d;
+            }
+        }
+        return best;
     }
 }

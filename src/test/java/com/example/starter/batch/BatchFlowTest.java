@@ -50,6 +50,10 @@ class BatchFlowTest {
         jdbc.update("DELETE FROM test_result");
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
+        jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM certificate_binding");
+        jdbc.update("DELETE FROM batch_merge");
+        jdbc.update("DELETE FROM declaration");
         jdbc.update("DELETE FROM batch");
     }
 
@@ -71,6 +75,7 @@ class BatchFlowTest {
         submitTest(batchKey, testReq("TK-3", "无菌", "PASS", "inspect-c"), null, null, 201);
         assertEquals("PENDING_RELEASE", currentStatus(batchKey));
 
+        bindBatch(batchKey);
         approve(batchKey, "qa-1", "QUALITY", "CK-AP-1", 201);
         assertEquals("RELEASE_REVIEW", currentStatus(batchKey));
         approve(batchKey, "ops-1", "OPERATIONS", "CK-AP-2", 201);
@@ -135,6 +140,7 @@ class BatchFlowTest {
         approve(batchKey, "inspector-1", "QUALITY", "CK-A0", 422);
         assertEquals("PENDING_RELEASE", currentStatus(batchKey));
 
+        bindBatch(batchKey);
         approve(batchKey, "qa-1", "QUALITY", "CK-A1", 201);
         // 重复角色
         approve(batchKey, "ops-1", "QUALITY", "CK-A2", 409);
@@ -284,6 +290,7 @@ class BatchFlowTest {
         String batchKey = "BK-CMD-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
+        bindBatch(batchKey);
 
         String body = "{\"commandKey\":\"CK-A1\"}";
         MvcResult first = mockMvc.perform(post("/api/batches/" + batchKey + "/approvals")
@@ -403,6 +410,7 @@ class BatchFlowTest {
         String batchKey = "BK-RACE-RC-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
+        bindBatch(batchKey);
         approve(batchKey, "qa", "QUALITY", "CK-Q", 201);
 
         List<Future<Integer>> results = runConcurrent(
@@ -444,6 +452,7 @@ class BatchFlowTest {
         String batchKey = "BK-PERSIST-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
+        bindBatch(batchKey);
         approve(batchKey, "qa", "QUALITY", "CK-A1", 201);
         approve(batchKey, "ops", "OPERATIONS", "CK-A2", 201);
         recall(batchKey, "u", "原因", "CK-R1", 201);
@@ -494,6 +503,38 @@ class BatchFlowTest {
     }
 
     // ---------- helpers ----------
+
+    /**
+     * 每个测试方法惰性发布一条 PROD-1、空前缀（匹配任意批号）的声明，用于满足放行门禁。
+     */
+    private String declKey;
+
+    private String decl() throws Exception {
+        if (declKey == null) {
+            declKey = "DECL-" + unique();
+            mockMvc.perform(post("/api/declarations")
+                            .header("X-Actor-Id", "supplier-1")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"commandKey\":\"CK-D-" + unique() + "\",\"declarationKey\":\""
+                                    + declKey + "\",\"materialCode\":\"PROD-1\",\"batchNoPrefix\":\"\","
+                                    + "\"priority\":1,\"validFrom\":\"2020-01-01T00:00:00Z\","
+                                    + "\"validTo\":\"2030-01-01T00:00:00Z\"}"))
+                    .andExpect(status().isCreated());
+        }
+        return declKey;
+    }
+
+    /**
+     * 将批次绑定到本测试的声明版本 1，使其满足放行门禁。
+     */
+    private void bindBatch(String batchKey) throws Exception {
+        mockMvc.perform(post("/api/batches/" + batchKey + "/certificate-bindings")
+                        .header("X-Actor-Id", "planner-1")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"CK-B-" + unique() + "\",\"bindings\":[{"
+                                + "\"declarationKey\":\"" + decl() + "\",\"version\":1}]}"))
+                .andExpect(status().isCreated());
+    }
 
     private record CreateCmd(String commandKey, String batchKey, String productCode, String batchNo,
                              Instant producedAt, List<String> requiredTests) {

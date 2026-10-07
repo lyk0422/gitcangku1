@@ -51,6 +51,10 @@ class BatchSplitLineageTest {
         jdbc.update("DELETE FROM test_result");
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
+        jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM certificate_binding");
+        jdbc.update("DELETE FROM batch_merge");
+        jdbc.update("DELETE FROM declaration");
         jdbc.update("DELETE FROM batch");
     }
 
@@ -377,6 +381,7 @@ class BatchSplitLineageTest {
         assertFalse(available.contains(childA));
         assertTrue(available.contains(childB));
         submitTest(childB, "t1", "PASS", "insp-b2", 201);
+        bindBatch(childB);
         approve(childB, "qa-b", "QUALITY", "CK-UT-AB1", 201);
         approve(childB, "ops-b", "OPERATIONS", "CK-UT-AB2", 201);
         assertEquals("RELEASED", currentStatus(childB));
@@ -415,6 +420,7 @@ class BatchSplitLineageTest {
         split(root, "CK-CRA-S", List.of(new String[]{child, "L1"},
                 new String[]{"BK-CRA-C2-" + unique(), "L2"}), 201);
         submitTest(child, "t1", "PASS", "insp-2", 201);
+        bindBatch(child);
         approve(child, "qa-1", "QUALITY", "CK-CRA-A1", 201);
 
         List<Future<Integer>> results = runConcurrent(
@@ -563,7 +569,7 @@ class BatchSplitLineageTest {
     }
 
     /**
-     * 让批次走完 检验 PASS + 双角色批准 进入 RELEASED。
+     * 让批次走完 检验 PASS + 绑定合格证声明 + 双角色批准 进入 RELEASED。
      */
     private void releaseBatch(String batchKey, String inspector) throws Exception {
         MvcResult history = mockMvc.perform(get("/api/batches/" + batchKey + "/history"))
@@ -572,8 +578,44 @@ class BatchSplitLineageTest {
         for (JsonNode item : node.path("batch").path("requiredTests")) {
             submitTest(batchKey, item.asText(), "PASS", inspector, 201);
         }
+        bindBatch(batchKey);
         approve(batchKey, "qa-" + unique(), "QUALITY", "CK-AQ-" + unique(), 201);
         approve(batchKey, "ops-" + unique(), "OPERATIONS", "CK-AO-" + unique(), 201);
+    }
+
+    /**
+     * 每个测试方法惰性发布一条 PROD-1、空前缀（匹配任意批号）的声明，用于满足放行门禁。
+     */
+    private String declKey;
+
+    private void bindBatch(String batchKey) throws Exception {
+        if (declKey == null) {
+            declKey = "DECL-" + unique();
+            mockMvc.perform(post("/api/declarations")
+                            .header("X-Actor-Id", "supplier-1")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"commandKey\":\"CK-D-" + unique() + "\",\"declarationKey\":\""
+                                    + declKey + "\",\"materialCode\":\"PROD-1\",\"batchNoPrefix\":\"\","
+                                    + "\"priority\":1,\"validFrom\":\"2020-01-01T00:00:00Z\","
+                                    + "\"validTo\":\"2030-01-01T00:00:00Z\"}"))
+                    .andExpect(status().isCreated());
+        }
+        // 拆分产物已继承父批的同一声明绑定，无需重复绑定
+        MvcResult existing = mockMvc.perform(get("/api/batches/" + batchKey
+                        + "/certificate-bindings"))
+                .andExpect(status().isOk()).andReturn();
+        for (JsonNode b : objectMapper.readTree(existing.getResponse().getContentAsString())) {
+            if (declKey.equals(b.path("declarationKey").asText())
+                    && b.path("declarationVersion").asInt() == 1) {
+                return;
+            }
+        }
+        mockMvc.perform(post("/api/batches/" + batchKey + "/certificate-bindings")
+                        .header("X-Actor-Id", "planner-1")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"CK-B-" + unique() + "\",\"bindings\":[{"
+                                + "\"declarationKey\":\"" + declKey + "\",\"version\":1}]}"))
+                .andExpect(status().isCreated());
     }
 
     private void submitTest(String batchKey, String item, String result, String inspector,
