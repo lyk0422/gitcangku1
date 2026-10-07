@@ -4,11 +4,15 @@ import java.math.BigDecimal;
 import java.util.List;
 
 import com.example.starter.calibration.api.dto.CertificateResponse;
+import com.example.starter.calibration.api.dto.FitPointResponse;
+import com.example.starter.calibration.api.dto.FitResponse;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRecordResponse;
 import com.example.starter.calibration.model.Certificate;
+import com.example.starter.calibration.model.FitPoint;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
+import com.example.starter.calibration.model.ReferenceFit;
 import com.example.starter.calibration.model.ReleaseRecord;
 
 /**
@@ -65,5 +69,30 @@ final class DtoMapper {
 
     static ReleaseRecordResponse toResponse(ReleaseRecord record) {
         return new ReleaseRecordResponse(record.batchId(), record.releasedBy(), record.releasedAt());
+    }
+
+    static FitResponse toResponse(ReferenceFit fit, List<FitPoint> points) {
+        return new FitResponse(
+                fit.id(),
+                fit.requestId(),
+                fit.instrumentId(),
+                fit.validFrom(),
+                fit.validTo(),
+                format(fit.a()),
+                format(fit.b()),
+                format(fit.residualLimit()),
+                format(fit.maxAbsResidual()),
+                fit.expectedVersion(),
+                fit.submittedBy(),
+                fit.approvedBy(),
+                fit.approvedAt(),
+                fit.status().name(),
+                fit.certificateId(),
+                points.stream().map(DtoMapper::toResponse).toList(),
+                fit.createdAt());
+    }
+
+    static FitPointResponse toResponse(FitPoint point) {
+        return new FitPointResponse(format(point.x()), format(point.y()), format(point.residual()));
     }
 }

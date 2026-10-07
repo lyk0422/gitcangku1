@@ -42,6 +42,53 @@ CREATE TABLE IF NOT EXISTS measurement (
     KEY idx_measurement_cert (certificate_id)
 ) COMMENT='测量记录';
 
+-- 幂等请求登记：全局 requestId 唯一；仅成功提交占键，失败随事务回滚不占键。
+-- 同 requestId 重放时按 操作+资源+规范化全参数（十进制按值、文本原样）结构化比较，
+-- 一致返回首次完整响应，不一致返回 409。
+CREATE TABLE IF NOT EXISTS fit_request (
+    request_id VARCHAR(64) NOT NULL PRIMARY KEY COMMENT '全局请求 ID（幂等键）',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型，如 FIT_SUBMIT',
+    resource VARCHAR(64) NOT NULL COMMENT '资源标识（仪器 ID）',
+    canonical_params TEXT NOT NULL COMMENT '规范化后的全参数（含期望版本），十进制按值、文本原样',
+    response_body TEXT NOT NULL COMMENT '首次成功的完整响应 JSON，用于同参重放',
+    created_at DATETIME(6) NOT NULL COMMENT '首次成功登记时间（UTC）'
+) COMMENT='幂等请求登记表';
+
+-- 参考点线性拟合历史：提交时冻结参考点、系数与残差评分；批准一次创建不可变证书。
+-- 历史不被后续撤证改写；certificate_id 保留指向首次签发的证书。
+CREATE TABLE IF NOT EXISTS reference_fit (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '拟合 ID，自增',
+    request_id VARCHAR(64) NOT NULL COMMENT '提交该拟合的全局请求 ID',
+    instrument_id VARCHAR(64) NOT NULL COMMENT '仪器 ID',
+    valid_from DATETIME(6) NOT NULL COMMENT '有效期起点（UTC，左闭，含该时刻）',
+    valid_to DATETIME(6) NOT NULL COMMENT '有效期终点（UTC，右开，不含该时刻）',
+    coeff_a DECIMAL(38,6) NOT NULL COMMENT '拟合系数 a，精确可表示为最多 6 位小数',
+    offset_b DECIMAL(38,6) NOT NULL COMMENT '拟合偏移 b，精确可表示为最多 6 位小数',
+    residual_limit DECIMAL(38,6) NOT NULL COMMENT '非负残差上限，最多 6 位小数',
+    max_abs_residual DECIMAL(38,12) NOT NULL COMMENT '各点绝对残差最大值（精确值，最多 12 位小数）',
+    point_count INT NOT NULL COMMENT '参考点对数量（3～8）',
+    expected_version BIGINT NULL COMMENT '调用方期望版本，仅参与幂等参数比较；未提供为 NULL',
+    submitted_by VARCHAR(64) NOT NULL COMMENT '提交人（非空操作者）',
+    approved_by VARCHAR(64) NULL COMMENT '批准人（须不同于提交人）；未批准为 NULL',
+    approved_at DATETIME(6) NULL COMMENT '批准时间（UTC）；未批准为 NULL',
+    status VARCHAR(16) NOT NULL COMMENT '状态：PENDING=待批准，APPROVED=已批准',
+    certificate_id BIGINT NULL COMMENT '批准时创建的证书 ID；未批准为 NULL，撤证不改写',
+    created_at DATETIME(6) NOT NULL COMMENT '提交时间（UTC）',
+    CONSTRAINT uk_fit_request UNIQUE (request_id),
+    KEY idx_fit_instrument (instrument_id)
+) COMMENT='参考点线性拟合历史';
+
+-- 拟合参考点：提交时冻结的 (x, y) 与逐点残差评分，不再修改。
+CREATE TABLE IF NOT EXISTS reference_fit_point (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '参考点 ID，自增',
+    fit_id BIGINT NOT NULL COMMENT '所属拟合 ID',
+    seq INT NOT NULL COMMENT '输入顺序，从 0 开始',
+    x_value DECIMAL(38,6) NOT NULL COMMENT '合成原值 x，最多 6 位小数',
+    y_value DECIMAL(38,6) NOT NULL COMMENT '标准值 y，最多 6 位小数',
+    residual DECIMAL(38,12) NOT NULL COMMENT '冻结残差评分 y-(a×x+b)，精确值最多 12 位小数',
+    KEY idx_fit_point_fit (fit_id)
+) COMMENT='拟合参考点与冻结残差';
+
 -- 放行历史：证书撤销后保留，不回写为从未放行。
 CREATE TABLE IF NOT EXISTS release_record (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '放行记录 ID，自增',
