@@ -11,7 +11,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 设备登记、查询与固件拉取。
+ * 设备登记、查询、固件拉取与启动计数维护。
  */
 @RestController
 @RequestMapping("/api/devices")
@@ -36,7 +36,13 @@ public class DeviceController {
     }
 
     @PostMapping("/{deviceId}/pull")
-    public PullResponse pull(@PathVariable String deviceId, @Valid @RequestBody RequestIdBody request) {
-        return taskService.pull(deviceId, request.requestId());
+    public PullResponse pull(@PathVariable String deviceId, @Valid @RequestBody PullRequest request) {
+        return taskService.pull(deviceId, request);
+    }
+
+    @PostMapping("/{deviceId}/boot-maintenance")
+    public DeviceView maintainBootCount(@PathVariable String deviceId,
+                                        @Valid @RequestBody BootMaintenanceRequest request) {
+        return deviceService.maintainBootCount(deviceId, request);
     }
 }

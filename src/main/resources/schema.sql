@@ -5,6 +5,8 @@ CREATE TABLE IF NOT EXISTS device (
   model VARCHAR(64) NOT NULL COMMENT '设备型号，登记后不可修改',
   current_version VARCHAR(64) NOT NULL COMMENT '设备当前固件版本',
   bucket_no INT NOT NULL COMMENT '灰度分桶号，取值0~99，登记后不可修改',
+  boot_count BIGINT NOT NULL DEFAULT 0 COMMENT '设备启动计数，不可递减的非负值；领取启动挑战任务时冻结基线，成功回执或计数维护后更新',
+  profile_version INT NOT NULL DEFAULT 1 COMMENT '设备档案版本，从1开始，计数维护携带expectedDeviceVersion成功后加一',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
   PRIMARY KEY (device_id)
 ) COMMENT='设备登记表';
@@ -36,11 +38,16 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  task_type VARCHAR(16) NOT NULL DEFAULT 'NORMAL' COMMENT '任务类型：NORMAL普通；BOOT_CHALLENGE启动挑战，回执须携带挑战串与更大的启动计数',
+  challenge VARCHAR(64) NULL COMMENT '领取时生成的全局唯一挑战串，仅BOOT_CHALLENGE任务非空；历史随任务行保留，不被下一任务覆盖',
+  frozen_boot_count BIGINT NULL COMMENT '领取时冻结的设备启动计数基线b，仅BOOT_CHALLENGE任务非空；成功回执要求计数严格大于b及提交时设备实际计数',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
   CONSTRAINT uk_task_release_device UNIQUE (release_id, device_id)
 ) COMMENT='设备投放任务，同设备同发布单最多一条';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_task_challenge ON rollout_task (challenge);
 
 CREATE TABLE IF NOT EXISTS release_pause_record (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '暂停记录ID',

@@ -3,6 +3,7 @@ package com.example.starter.firmware.repo;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
+import com.example.starter.firmware.domain.TaskType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
@@ -21,12 +22,17 @@ public class TaskRepository {
 
     private static final RowMapper<RolloutTask> MAPPER = (rs, rowNum) -> {
         String firstResult = rs.getString("first_result");
+        long frozen = rs.getLong("frozen_boot_count");
+        Long frozenBootCount = rs.wasNull() ? null : frozen;
         return new RolloutTask(rs.getLong("id"), rs.getLong("release_id"), rs.getString("device_id"),
                 TaskStatus.valueOf(rs.getString("status")),
-                firstResult == null ? null : ReceiptResult.valueOf(firstResult));
+                firstResult == null ? null : ReceiptResult.valueOf(firstResult),
+                TaskType.valueOf(rs.getString("task_type")), rs.getString("challenge"),
+                frozenBootCount);
     };
 
-    private static final String COLUMNS = "id, release_id, device_id, status, first_result";
+    private static final String COLUMNS = "id, release_id, device_id, status, first_result,"
+            + " task_type, challenge, frozen_boot_count";
 
     private final JdbcTemplate jdbc;
 
@@ -34,14 +40,26 @@ public class TaskRepository {
         this.jdbc = jdbc;
     }
 
-    public long insert(long releaseId, String deviceId) {
+    /**
+     * 创建任务：BOOT_CHALLENGE 任务携带唯一挑战串与冻结的启动计数基线，普通任务两列为 NULL。
+     */
+    public long insert(long releaseId, String deviceId, TaskType taskType, String challenge,
+                       Long frozenBootCount) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
-                    "INSERT INTO rollout_task (release_id, device_id, status) VALUES (?, ?, 'PENDING')",
+                    "INSERT INTO rollout_task (release_id, device_id, status, task_type, challenge,"
+                            + " frozen_boot_count) VALUES (?, ?, 'PENDING', ?, ?, ?)",
                     new String[]{"id"});
             ps.setLong(1, releaseId);
             ps.setString(2, deviceId);
+            ps.setString(3, taskType.name());
+            ps.setString(4, challenge);
+            if (frozenBootCount == null) {
+                ps.setNull(5, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(5, frozenBootCount);
+            }
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
