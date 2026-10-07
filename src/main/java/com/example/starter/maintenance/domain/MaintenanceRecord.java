@@ -12,6 +12,9 @@ import java.time.Instant;
  * @param anchorSampledAt           锚点读数的 UTC 采样时刻（快照）
  * @param anchorCumulativeMinutes   锚点读数在保养完成时的累计工时快照（分钟）
  * @param completedAt               保养完成登记时刻（UTC）
+ * @param workHoursDue              保养完成时冻结的工时到期原因（当时本轮运行分钟是否已达周期）
+ * @param calendarDue               保养完成时冻结的日历到期原因（当时是否已达日历截止）
+ * @param newCalendarDeadline       保养后新日历截止（UTC）= 本次锚点时刻 + 日历周期；未启用日历为 null
  */
 public record MaintenanceRecord(
         long maintenanceId,
@@ -20,5 +23,8 @@ public record MaintenanceRecord(
         int anchorRevisionNo,
         Instant anchorSampledAt,
         long anchorCumulativeMinutes,
-        Instant completedAt) {
+        Instant completedAt,
+        boolean workHoursDue,
+        boolean calendarDue,
+        Instant newCalendarDeadline) {
 }

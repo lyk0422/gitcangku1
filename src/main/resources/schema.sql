@@ -6,13 +6,17 @@ CREATE TABLE IF NOT EXISTS equipment (
     equipment_id VARCHAR(64) NOT NULL PRIMARY KEY,
     maintenance_period_minutes BIGINT NOT NULL,
     version BIGINT NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    commissioned_at TIMESTAMP WITH TIME ZONE,
+    calendar_period_days INT
 );
 COMMENT ON TABLE equipment IS '设备主表：每台设备一行';
 COMMENT ON COLUMN equipment.equipment_id IS '设备唯一标识（客户端提供）';
 COMMENT ON COLUMN equipment.maintenance_period_minutes IS '保养周期（分钟），正整数，登记后不可修改';
-COMMENT ON COLUMN equipment.version IS '设备版本号，初始 1；新增读数/修订/完成保养均校验 expectedVersion 并加一';
+COMMENT ON COLUMN equipment.version IS '设备版本号，初始 1；新增读数/修订/完成保养/启用日历均校验 expectedVersion 并加一';
 COMMENT ON COLUMN equipment.created_at IS '登记时刻（UTC）';
+COMMENT ON COLUMN equipment.commissioned_at IS '日历档案投用时刻（UTC）；NULL 表示未启用日历周期，启用后不可修改';
+COMMENT ON COLUMN equipment.calendar_period_days IS '日历保养周期（天），1 至 365 整数；NULL 表示未启用日历周期';
 
 -- 工时读数当前值表：reading_id 设备内唯一，同设备同一采样时刻仅一条。
 CREATE TABLE IF NOT EXISTS reading (
@@ -62,7 +66,10 @@ CREATE TABLE IF NOT EXISTS maintenance (
     anchor_sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
     anchor_cumulative_minutes BIGINT NOT NULL,
     request_id VARCHAR(128) NOT NULL,
-    completed_at TIMESTAMP WITH TIME ZONE NOT NULL
+    completed_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    work_hours_due BOOLEAN NOT NULL,
+    calendar_due BOOLEAN NOT NULL,
+    new_calendar_deadline TIMESTAMP WITH TIME ZONE
 );
 CREATE INDEX IF NOT EXISTS idx_maintenance_equipment ON maintenance (equipment_id, anchor_sampled_at);
 COMMENT ON TABLE maintenance IS '保养记录：锚点时间须严格晚于上次保养锚点；作为锚点的读数不可再修订';
@@ -74,6 +81,9 @@ COMMENT ON COLUMN maintenance.anchor_sampled_at IS '锚点读数的 UTC 采样�
 COMMENT ON COLUMN maintenance.anchor_cumulative_minutes IS '锚点读数在保养完成时的累计工时快照（分钟）';
 COMMENT ON COLUMN maintenance.request_id IS '完成保养请求的 requestId';
 COMMENT ON COLUMN maintenance.completed_at IS '保养完成登记时刻（UTC）';
+COMMENT ON COLUMN maintenance.work_hours_due IS '保养完成时冻结的工时到期原因：当时本轮运行分钟是否已达保养周期';
+COMMENT ON COLUMN maintenance.calendar_due IS '保养完成时冻结的日历到期原因：当时是否已达日历截止；未启用日历设备恒为 FALSE';
+COMMENT ON COLUMN maintenance.new_calendar_deadline IS '保养后新日历截止（UTC）= 本次锚点时刻 + 日历周期；未启用日历设备为 NULL';
 
 -- 幂等去重表：requestId 全局唯一；仅成功结果占键，失败回滚不占键。
 CREATE TABLE IF NOT EXISTS idempotency_request (

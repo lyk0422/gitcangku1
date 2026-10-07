@@ -1,6 +1,7 @@
 package com.example.starter.maintenance.service;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
@@ -11,6 +12,7 @@ import org.springframework.transaction.annotation.Transactional;
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.EnableCalendarRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -140,13 +142,51 @@ public class EquipmentTxService {
                                 "保养锚点时间必须晚于上次保养锚点时间");
                     }
                     Instant now = clock.instant();
+                    checkAnchorTimeGate(equipment, anchor.sampledAt(), now);
+                    // 冻结保养完成时的两个到期原因与保养后新日历截止
+                    long latestCumulative = repository.findLatestReading(equipmentId)
+                            .map(Reading::cumulativeMinutes).orElse(0L);
+                    long anchorCumulative = last.map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
+                    boolean workHoursDue = latestCumulative - anchorCumulative
+                            >= equipment.maintenancePeriodMinutes();
+                    boolean calendarDue = false;
+                    Instant newCalendarDeadline = null;
+                    if (equipment.calendarEnabled()) {
+                        Instant currentDeadline = calendarDeadline(equipment, last);
+                        calendarDue = !now.isBefore(currentDeadline);
+                        newCalendarDeadline = anchor.sampledAt()
+                                .plus(Duration.ofDays(equipment.calendarPeriodDays()));
+                    }
                     long maintenanceId = repository.insertMaintenance(equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
-                            req.requestId(), now);
+                            req.requestId(), now, workHoursDue, calendarDue, newCalendarDeadline);
                     repository.incrementVersion(equipmentId);
                     return new MaintenanceResponse(maintenanceId, equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
-                            now, equipment.version() + 1);
+                            now, equipment.version() + 1, workHoursDue, calendarDue,
+                            newCalendarDeadline);
+                });
+    }
+
+    // ---------- 启用日历周期档案 ----------
+
+    @Transactional
+    public StatusResponse enableCalendar(String equipmentId, EnableCalendarRequest req) {
+        Equipment equipment = lockEquipment(equipmentId);
+        String fingerprint = equipmentId + "|" + req.commissionedAt() + "|" + req.periodDays()
+                + "|" + req.expectedVersion() + "|" + req.operator();
+        return idempotency.execute(req.requestId(), "ENABLE_CALENDAR", fingerprint,
+                StatusResponse.class, () -> {
+                    checkVersion(equipment, req.expectedVersion());
+                    if (equipment.calendarEnabled()) {
+                        throw ApiException.conflict("CALENDAR_ALREADY_ENABLED",
+                                "设备已启用日历周期档案，投用时刻与周期不可修改：" + equipmentId);
+                    }
+                    repository.enableCalendar(equipmentId, req.commissionedAt(), req.periodDays());
+                    repository.incrementVersion(equipmentId);
+                    Equipment updated = repository.findEquipment(equipmentId)
+                            .orElseThrow(() -> equipmentNotFound(equipmentId));
+                    return statusView(updated);
                 });
     }
 
@@ -156,16 +196,7 @@ public class EquipmentTxService {
     public StatusResponse getStatus(String equipmentId) {
         Equipment equipment = repository.findEquipment(equipmentId)
                 .orElseThrow(() -> equipmentNotFound(equipmentId));
-        Optional<Reading> latest = repository.findLatestReading(equipmentId);
-        Optional<MaintenanceRecord> last = repository.findLastMaintenance(equipmentId);
-        long latestCumulative = latest.map(Reading::cumulativeMinutes).orElse(0L);
-        long anchorCumulative = last.map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
-        long runMinutes = latestCumulative - anchorCumulative;
-        String status = runMinutes >= equipment.maintenancePeriodMinutes() ? "DUE" : "OK";
-        return new StatusResponse(equipmentId, equipment.version(), equipment.maintenancePeriodMinutes(),
-                latest.map(Reading::sampledAt).orElse(null), latestCumulative,
-                last.map(MaintenanceRecord::anchorSampledAt).orElse(null), anchorCumulative,
-                runMinutes, status);
+        return statusView(equipment);
     }
 
     @Transactional(readOnly = true)
@@ -197,11 +228,53 @@ public class EquipmentTxService {
         return repository.listMaintenances(equipmentId).stream()
                 .map(record -> new MaintenanceResponse(record.maintenanceId(), equipmentId,
                         record.readingId(), record.anchorRevisionNo(), record.anchorSampledAt(),
-                        record.anchorCumulativeMinutes(), record.completedAt(), 0L))
+                        record.anchorCumulativeMinutes(), record.completedAt(), 0L,
+                        record.workHoursDue(), record.calendarDue(), record.newCalendarDeadline()))
                 .toList();
     }
 
     // ---------- 内部规则 ----------
+
+    /** 状态视图：工时到期与日历到期任一为真即 DUE；日历截止随启用档案返回。 */
+    private StatusResponse statusView(Equipment equipment) {
+        String equipmentId = equipment.equipmentId();
+        Optional<Reading> latest = repository.findLatestReading(equipmentId);
+        Optional<MaintenanceRecord> last = repository.findLastMaintenance(equipmentId);
+        long latestCumulative = latest.map(Reading::cumulativeMinutes).orElse(0L);
+        long anchorCumulative = last.map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
+        long runMinutes = latestCumulative - anchorCumulative;
+        boolean workHoursDue = runMinutes >= equipment.maintenancePeriodMinutes();
+        Instant calendarDeadline = null;
+        boolean calendarDue = false;
+        if (equipment.calendarEnabled()) {
+            calendarDeadline = calendarDeadline(equipment, last);
+            calendarDue = !clock.instant().isBefore(calendarDeadline);
+        }
+        String status = (workHoursDue || calendarDue) ? "DUE" : "OK";
+        return new StatusResponse(equipmentId, equipment.version(), equipment.maintenancePeriodMinutes(),
+                latest.map(Reading::sampledAt).orElse(null), latestCumulative,
+                last.map(MaintenanceRecord::anchorSampledAt).orElse(null), anchorCumulative,
+                runMinutes, status, equipment.commissionedAt(), equipment.calendarPeriodDays(),
+                calendarDeadline, workHoursDue, calendarDue);
+    }
+
+    /** 当前日历截止 = 最近保养锚点时刻 + 日历周期；无保养时从投用时刻起算。调用前须确认已启用日历。 */
+    private Instant calendarDeadline(Equipment equipment, Optional<MaintenanceRecord> last) {
+        Instant base = last.map(MaintenanceRecord::anchorSampledAt).orElse(equipment.commissionedAt());
+        return base.plus(Duration.ofDays(equipment.calendarPeriodDays()));
+    }
+
+    /** 保养锚点时间门禁：不得晚于服务端当前时间；启用日历时不得早于投用时刻。 */
+    private void checkAnchorTimeGate(Equipment equipment, Instant anchorSampledAt, Instant now) {
+        if (anchorSampledAt.isAfter(now)) {
+            throw ApiException.unprocessable("ANCHOR_TIME_IN_FUTURE",
+                    "保养锚点时间不能晚于服务端当前时间");
+        }
+        if (equipment.calendarEnabled() && anchorSampledAt.isBefore(equipment.commissionedAt())) {
+            throw ApiException.unprocessable("ANCHOR_BEFORE_COMMISSIONING",
+                    "保养锚点时间不能早于设备投用时刻");
+        }
+    }
 
     private Equipment lockEquipment(String equipmentId) {
         return repository.findEquipmentForUpdate(equipmentId)

@@ -15,6 +15,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.EnableCalendarRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -67,6 +68,14 @@ public class EquipmentController {
     public MaintenanceResponse completeMaintenance(@PathVariable String equipmentId,
                                                    @Valid @RequestBody CompleteMaintenanceRequest req) {
         return service.completeMaintenance(equipmentId, req);
+    }
+
+    /** 启用日历周期档案：每台设备仅可启用一次，启用后投用时刻与周期（1 至 365 天）不可修改。 */
+    @PostMapping("/{equipmentId}/calendar")
+    @ResponseStatus(HttpStatus.CREATED)
+    public StatusResponse enableCalendar(@PathVariable String equipmentId,
+                                         @Valid @RequestBody EnableCalendarRequest req) {
+        return service.enableCalendar(equipmentId, req);
     }
 
     /** 保养状态：本轮运行分钟 = 最新读数 - 最近保养锚点工时（无保养从 0 计），达到周期即 DUE。 */

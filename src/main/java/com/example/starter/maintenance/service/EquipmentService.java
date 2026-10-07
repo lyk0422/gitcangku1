@@ -9,6 +9,7 @@ import org.springframework.stereotype.Service;
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.EnableCalendarRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -48,6 +49,10 @@ public class EquipmentService {
 
     public MaintenanceResponse completeMaintenance(String equipmentId, CompleteMaintenanceRequest req) {
         return txService.completeMaintenance(equipmentId, req);
+    }
+
+    public StatusResponse enableCalendar(String equipmentId, EnableCalendarRequest req) {
+        return txService.enableCalendar(equipmentId, req);
     }
 
     public StatusResponse getStatus(String equipmentId) {

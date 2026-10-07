@@ -38,10 +38,18 @@ public class EquipmentRepository {
         return rs.getObject(column, OffsetDateTime.class).toInstant();
     }
 
+    private static Instant readNullableInstant(java.sql.ResultSet rs, String column)
+            throws java.sql.SQLException {
+        OffsetDateTime value = rs.getObject(column, OffsetDateTime.class);
+        return value == null ? null : value.toInstant();
+    }
+
     private static final RowMapper<Equipment> EQUIPMENT_MAPPER = (rs, rowNum) -> new Equipment(
             rs.getString("equipment_id"),
             rs.getLong("maintenance_period_minutes"),
-            rs.getLong("version"));
+            rs.getLong("version"),
+            readNullableInstant(rs, "commissioned_at"),
+            rs.getObject("calendar_period_days", Integer.class));
 
     private static final RowMapper<Reading> READING_MAPPER = (rs, rowNum) -> new Reading(
             rs.getString("equipment_id"),
@@ -57,7 +65,17 @@ public class EquipmentRepository {
             rs.getInt("anchor_revision_no"),
             readInstant(rs, "anchor_sampled_at"),
             rs.getLong("anchor_cumulative_minutes"),
-            readInstant(rs, "completed_at"));
+            readInstant(rs, "completed_at"),
+            rs.getBoolean("work_hours_due"),
+            rs.getBoolean("calendar_due"),
+            readNullableInstant(rs, "new_calendar_deadline"));
+
+    private static final String EQUIPMENT_COLUMNS = "equipment_id, maintenance_period_minutes, version,"
+            + " commissioned_at, calendar_period_days";
+
+    private static final String MAINTENANCE_COLUMNS = "maintenance_id, equipment_id, reading_id,"
+            + " anchor_revision_no, anchor_sampled_at, anchor_cumulative_minutes, completed_at,"
+            + " work_hours_due, calendar_due, new_calendar_deadline";
 
     // ---------- 设备 ----------
 
@@ -69,7 +87,7 @@ public class EquipmentRepository {
 
     public Optional<Equipment> findEquipment(String equipmentId) {
         List<Equipment> rows = jdbc.query(
-                "SELECT equipment_id, maintenance_period_minutes, version FROM equipment WHERE equipment_id = ?",
+                "SELECT " + EQUIPMENT_COLUMNS + " FROM equipment WHERE equipment_id = ?",
                 EQUIPMENT_MAPPER, equipmentId);
         return rows.stream().findFirst();
     }
@@ -77,7 +95,7 @@ public class EquipmentRepository {
     /** 悲观行锁：同一设备的写操作串行化，保证版本校验与业务变更原子。 */
     public Optional<Equipment> findEquipmentForUpdate(String equipmentId) {
         List<Equipment> rows = jdbc.query(
-                "SELECT equipment_id, maintenance_period_minutes, version FROM equipment"
+                "SELECT " + EQUIPMENT_COLUMNS + " FROM equipment"
                         + " WHERE equipment_id = ? FOR UPDATE",
                 EQUIPMENT_MAPPER, equipmentId);
         return rows.stream().findFirst();
@@ -85,6 +103,13 @@ public class EquipmentRepository {
 
     public void incrementVersion(String equipmentId) {
         jdbc.update("UPDATE equipment SET version = version + 1 WHERE equipment_id = ?", equipmentId);
+    }
+
+    /** 启用日历周期档案：写入投用时刻与周期天，仅允许在均未启用时调用。 */
+    public void enableCalendar(String equipmentId, Instant commissionedAt, int periodDays) {
+        jdbc.update("UPDATE equipment SET commissioned_at = ?, calendar_period_days = ?"
+                        + " WHERE equipment_id = ?",
+                utc(commissionedAt), periodDays, equipmentId);
     }
 
     // ---------- 读数 ----------
@@ -182,13 +207,15 @@ public class EquipmentRepository {
 
     public long insertMaintenance(String equipmentId, String readingId, int anchorRevisionNo,
                                   Instant anchorSampledAt, long anchorCumulativeMinutes,
-                                  String requestId, Instant completedAt) {
+                                  String requestId, Instant completedAt,
+                                  boolean workHoursDue, boolean calendarDue, Instant newCalendarDeadline) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(connection -> {
             PreparedStatement ps = connection.prepareStatement(
                     "INSERT INTO maintenance (equipment_id, reading_id, anchor_revision_no,"
-                            + " anchor_sampled_at, anchor_cumulative_minutes, request_id, completed_at)"
-                            + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            + " anchor_sampled_at, anchor_cumulative_minutes, request_id, completed_at,"
+                            + " work_hours_due, calendar_due, new_calendar_deadline)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, equipmentId);
             ps.setString(2, readingId);
@@ -197,6 +224,13 @@ public class EquipmentRepository {
             ps.setLong(5, anchorCumulativeMinutes);
             ps.setString(6, requestId);
             ps.setObject(7, utc(completedAt));
+            ps.setBoolean(8, workHoursDue);
+            ps.setBoolean(9, calendarDue);
+            if (newCalendarDeadline == null) {
+                ps.setNull(10, java.sql.Types.TIMESTAMP_WITH_TIMEZONE);
+            } else {
+                ps.setObject(10, utc(newCalendarDeadline));
+            }
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -209,8 +243,7 @@ public class EquipmentRepository {
     /** 最近一次保养（锚点时间最大者；锚点时间严格递增，故唯一）。 */
     public Optional<MaintenanceRecord> findLastMaintenance(String equipmentId) {
         List<MaintenanceRecord> rows = jdbc.query(
-                "SELECT maintenance_id, equipment_id, reading_id, anchor_revision_no,"
-                        + " anchor_sampled_at, anchor_cumulative_minutes, completed_at"
+                "SELECT " + MAINTENANCE_COLUMNS
                         + " FROM maintenance WHERE equipment_id = ?"
                         + " ORDER BY anchor_sampled_at DESC, maintenance_id DESC LIMIT 1",
                 MAINTENANCE_MAPPER, equipmentId);
@@ -219,8 +252,7 @@ public class EquipmentRepository {
 
     public List<MaintenanceRecord> listMaintenances(String equipmentId) {
         return jdbc.query(
-                "SELECT maintenance_id, equipment_id, reading_id, anchor_revision_no,"
-                        + " anchor_sampled_at, anchor_cumulative_minutes, completed_at"
+                "SELECT " + MAINTENANCE_COLUMNS
                         + " FROM maintenance WHERE equipment_id = ?"
                         + " ORDER BY anchor_sampled_at ASC, maintenance_id ASC",
                 MAINTENANCE_MAPPER, equipmentId);
