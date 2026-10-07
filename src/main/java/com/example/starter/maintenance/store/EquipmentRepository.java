@@ -15,6 +15,7 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import com.example.starter.maintenance.domain.Equipment;
+import com.example.starter.maintenance.domain.EquipmentCalendar;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
 
@@ -38,6 +39,12 @@ public class EquipmentRepository {
         return rs.getObject(column, OffsetDateTime.class).toInstant();
     }
 
+    private static Instant readNullableInstant(java.sql.ResultSet rs, String column)
+            throws java.sql.SQLException {
+        OffsetDateTime value = rs.getObject(column, OffsetDateTime.class);
+        return value == null ? null : value.toInstant();
+    }
+
     private static final RowMapper<Equipment> EQUIPMENT_MAPPER = (rs, rowNum) -> new Equipment(
             rs.getString("equipment_id"),
             rs.getLong("maintenance_period_minutes"),
@@ -57,7 +64,40 @@ public class EquipmentRepository {
             rs.getInt("anchor_revision_no"),
             readInstant(rs, "anchor_sampled_at"),
             rs.getLong("anchor_cumulative_minutes"),
+            rs.getBoolean("hours_due"),
+            rs.getBoolean("calendar_due"),
+            readNullableInstant(rs, "new_calendar_deadline"),
             readInstant(rs, "completed_at"));
+
+    private static final RowMapper<EquipmentCalendar> CALENDAR_MAPPER = (rs, rowNum) -> new EquipmentCalendar(
+            rs.getString("equipment_id"),
+            readInstant(rs, "commissioned_at"),
+            rs.getInt("period_days"),
+            rs.getString("operator"),
+            rs.getString("request_id"),
+            readInstant(rs, "created_at"));
+
+    private static final String MAINTENANCE_COLUMNS =
+            "maintenance_id, equipment_id, reading_id, anchor_revision_no,"
+                    + " anchor_sampled_at, anchor_cumulative_minutes,"
+                    + " hours_due, calendar_due, new_calendar_deadline, completed_at";
+
+    // ---------- 设备日历档案 ----------
+
+    public void insertCalendar(EquipmentCalendar calendar) {
+        jdbc.update("INSERT INTO equipment_calendar (equipment_id, commissioned_at, period_days,"
+                        + " operator, request_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                calendar.equipmentId(), utc(calendar.commissionedAt()), calendar.periodDays(),
+                calendar.operator(), calendar.requestId(), utc(calendar.createdAt()));
+    }
+
+    public Optional<EquipmentCalendar> findCalendar(String equipmentId) {
+        List<EquipmentCalendar> rows = jdbc.query(
+                "SELECT equipment_id, commissioned_at, period_days, operator, request_id, created_at"
+                        + " FROM equipment_calendar WHERE equipment_id = ?",
+                CALENDAR_MAPPER, equipmentId);
+        return rows.stream().findFirst();
+    }
 
     // ---------- 设备 ----------
 
@@ -182,21 +222,27 @@ public class EquipmentRepository {
 
     public long insertMaintenance(String equipmentId, String readingId, int anchorRevisionNo,
                                   Instant anchorSampledAt, long anchorCumulativeMinutes,
+                                  boolean hoursDue, boolean calendarDue, Instant newCalendarDeadline,
                                   String requestId, Instant completedAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(connection -> {
             PreparedStatement ps = connection.prepareStatement(
                     "INSERT INTO maintenance (equipment_id, reading_id, anchor_revision_no,"
-                            + " anchor_sampled_at, anchor_cumulative_minutes, request_id, completed_at)"
-                            + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            + " anchor_sampled_at, anchor_cumulative_minutes,"
+                            + " hours_due, calendar_due, new_calendar_deadline,"
+                            + " request_id, completed_at)"
+                            + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, equipmentId);
             ps.setString(2, readingId);
             ps.setInt(3, anchorRevisionNo);
             ps.setObject(4, utc(anchorSampledAt));
             ps.setLong(5, anchorCumulativeMinutes);
-            ps.setString(6, requestId);
-            ps.setObject(7, utc(completedAt));
+            ps.setBoolean(6, hoursDue);
+            ps.setBoolean(7, calendarDue);
+            ps.setObject(8, newCalendarDeadline == null ? null : utc(newCalendarDeadline));
+            ps.setString(9, requestId);
+            ps.setObject(10, utc(completedAt));
             return ps;
         }, keyHolder);
         Number key = keyHolder.getKey();
@@ -209,8 +255,7 @@ public class EquipmentRepository {
     /** 最近一次保养（锚点时间最大者；锚点时间严格递增，故唯一）。 */
     public Optional<MaintenanceRecord> findLastMaintenance(String equipmentId) {
         List<MaintenanceRecord> rows = jdbc.query(
-                "SELECT maintenance_id, equipment_id, reading_id, anchor_revision_no,"
-                        + " anchor_sampled_at, anchor_cumulative_minutes, completed_at"
+                "SELECT " + MAINTENANCE_COLUMNS
                         + " FROM maintenance WHERE equipment_id = ?"
                         + " ORDER BY anchor_sampled_at DESC, maintenance_id DESC LIMIT 1",
                 MAINTENANCE_MAPPER, equipmentId);
@@ -219,8 +264,7 @@ public class EquipmentRepository {
 
     public List<MaintenanceRecord> listMaintenances(String equipmentId) {
         return jdbc.query(
-                "SELECT maintenance_id, equipment_id, reading_id, anchor_revision_no,"
-                        + " anchor_sampled_at, anchor_cumulative_minutes, completed_at"
+                "SELECT " + MAINTENANCE_COLUMNS
                         + " FROM maintenance WHERE equipment_id = ?"
                         + " ORDER BY anchor_sampled_at ASC, maintenance_id ASC",
                 MAINTENANCE_MAPPER, equipmentId);

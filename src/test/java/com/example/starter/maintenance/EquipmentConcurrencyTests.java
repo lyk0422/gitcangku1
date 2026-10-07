@@ -49,6 +49,7 @@ class EquipmentConcurrencyTests {
         jdbc.update("DELETE FROM maintenance");
         jdbc.update("DELETE FROM reading_revision");
         jdbc.update("DELETE FROM reading");
+        jdbc.update("DELETE FROM equipment_calendar");
         jdbc.update("DELETE FROM equipment");
         executor = Executors.newFixedThreadPool(8);
     }
@@ -219,5 +220,80 @@ class EquipmentConcurrencyTests {
                 .andExpect(jsonPath("$.length()").value(threads));
         mockMvc.perform(get("/api/equipment/eq-par/status"))
                 .andExpect(jsonPath("$.version").value(1 + threads));
+    }
+
+    /** 并发启用日历（同一期望版本、不同 requestId）：恰有一个成功，档案仅一条，版本仅推进一次。 */
+    @Test
+    void concurrentEnableCalendar_singleSuccess() throws Exception {
+        register("eq-ccal", 1000);
+        int threads = 4;
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<MvcResult>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            int index = i;
+            futures.add(executor.submit(() -> {
+                gate.await(5, TimeUnit.SECONDS);
+                return postJson("/api/equipment/eq-ccal/calendar", """
+                        {"requestId":"ccal-%d","expectedVersion":1,"operator":"op-%d",
+                         "commissionedAt":"2026-01-01T00:00:00Z","periodDays":30}
+                        """.formatted(index, index));
+            }));
+        }
+        gate.countDown();
+
+        int created = 0;
+        int conflict = 0;
+        for (Future<MvcResult> future : futures) {
+            int status = future.get(15, TimeUnit.SECONDS).getResponse().getStatus();
+            if (status == 201) {
+                created++;
+            } else {
+                assertEquals(409, status, "并发启用日历失败者应返回 409");
+                conflict++;
+            }
+        }
+        assertEquals(1, created, "并发启用日历应恰有一个成功");
+        assertEquals(threads - 1, conflict);
+
+        Integer rows = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM equipment_calendar WHERE equipment_id = 'eq-ccal'",
+                Integer.class);
+        assertEquals(1, rows, "日历档案只应启用一次");
+        mockMvc.perform(get("/api/equipment/eq-ccal/status"))
+                .andExpect(jsonPath("$.version").value(2))
+                .andExpect(jsonPath("$.calendarEnabled").value(true))
+                .andExpect(jsonPath("$.calendarPeriodDays").value(30));
+    }
+
+    /** 日历启用与新增读数共享设备版本：并发同版本写恰有一个成功，版本只前进一次。 */
+    @Test
+    void concurrentEnableCalendarVsAddReading_sharedVersion() throws Exception {
+        register("eq-cmix", 1000);
+        CountDownLatch gate = new CountDownLatch(1);
+        Future<MvcResult> calendarFuture = executor.submit(() -> {
+            gate.await(5, TimeUnit.SECONDS);
+            return postJson("/api/equipment/eq-cmix/calendar", """
+                    {"requestId":"cmix-cal","expectedVersion":1,"operator":"op",
+                     "commissionedAt":"2026-01-01T00:00:00Z","periodDays":30}
+                    """);
+        });
+        Future<MvcResult> readingFuture = executor.submit(() -> {
+            gate.await(5, TimeUnit.SECONDS);
+            return postJson("/api/equipment/eq-cmix/readings", """
+                    {"requestId":"cmix-r1","expectedVersion":1,"readingId":"r1",
+                     "sampledAt":"2026-01-01T10:00:00Z","cumulativeMinutes":100}
+                    """);
+        });
+        gate.countDown();
+
+        int calendarStatus = calendarFuture.get(15, TimeUnit.SECONDS).getResponse().getStatus();
+        int readingStatus = readingFuture.get(15, TimeUnit.SECONDS).getResponse().getStatus();
+        assertTrue(
+                (calendarStatus == 201 && readingStatus == 409)
+                        || (calendarStatus == 409 && readingStatus == 201),
+                "日历启用与读数写入并发应恰有一个成功，实际：calendar=" + calendarStatus
+                        + ", reading=" + readingStatus);
+        mockMvc.perform(get("/api/equipment/eq-cmix/status"))
+                .andExpect(jsonPath("$.version").value(2));
     }
 }

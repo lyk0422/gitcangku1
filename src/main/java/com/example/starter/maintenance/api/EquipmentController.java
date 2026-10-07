@@ -14,7 +14,9 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
+import com.example.starter.maintenance.api.dto.CalendarResponse;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.EnableCalendarRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -52,6 +54,14 @@ public class EquipmentController {
         return service.addReading(equipmentId, req);
     }
 
+    /** 启用日历档案：UTC 投用时刻与 1 至 365 天周期，每台设备仅可启用一次，启用后不可修改。 */
+    @PostMapping("/{equipmentId}/calendar")
+    @ResponseStatus(HttpStatus.CREATED)
+    public CalendarResponse enableCalendar(@PathVariable String equipmentId,
+                                           @Valid @RequestBody EnableCalendarRequest req) {
+        return service.enableCalendar(equipmentId, req);
+    }
+
     /** 修订读数：只改累计分钟、不改采样时刻；作为历史保养锚点的读数返回 409。 */
     @PostMapping("/{equipmentId}/readings/{readingId}/revisions")
     @ResponseStatus(HttpStatus.CREATED)
@@ -69,7 +79,7 @@ public class EquipmentController {
         return service.completeMaintenance(equipmentId, req);
     }
 
-    /** 保养状态：本轮运行分钟 = 最新读数 - 最近保养锚点工时（无保养从 0 计），达到周期即 DUE。 */
+    /** 保养状态：返回工时与日历两种到期原因及日历截止；任一到期即 DUE（未启用日历只看工时）。 */
     @GetMapping("/{equipmentId}/status")
     public StatusResponse getStatus(@PathVariable String equipmentId) {
         return service.getStatus(equipmentId);

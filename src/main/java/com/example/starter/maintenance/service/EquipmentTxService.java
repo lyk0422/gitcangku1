@@ -2,6 +2,7 @@ package com.example.starter.maintenance.service;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Optional;
 
@@ -10,7 +11,9 @@ import org.springframework.transaction.annotation.Transactional;
 
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
+import com.example.starter.maintenance.api.dto.CalendarResponse;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.EnableCalendarRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -19,6 +22,7 @@ import com.example.starter.maintenance.api.dto.ReviseReadingRequest;
 import com.example.starter.maintenance.api.dto.RevisionView;
 import com.example.starter.maintenance.api.dto.StatusResponse;
 import com.example.starter.maintenance.domain.Equipment;
+import com.example.starter.maintenance.domain.EquipmentCalendar;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
 import com.example.starter.maintenance.store.EquipmentRepository;
@@ -44,8 +48,7 @@ public class EquipmentTxService {
 
     @Transactional
     public EquipmentResponse register(RegisterEquipmentRequest req) {
-        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes();
-        return idempotency.execute(req.requestId(), "REGISTER_EQUIPMENT", fingerprint,
+        return idempotency.execute(req.requestId(), "REGISTER_EQUIPMENT", registerFingerprint(req),
                 EquipmentResponse.class, () -> {
                     if (repository.findEquipment(req.equipmentId()).isPresent()) {
                         throw ApiException.conflict("EQUIPMENT_EXISTS", "设备已存在：" + req.equipmentId());
@@ -55,14 +58,38 @@ public class EquipmentTxService {
                 });
     }
 
+    // ---------- 启用日历档案 ----------
+
+    /**
+     * 启用设备日历档案：每台设备仅可启用一次，投用时刻与周期启用后不可修改。
+     * 与其他写操作共享设备 expectedVersion，成功版本加一。
+     */
+    @Transactional
+    public CalendarResponse enableCalendar(String equipmentId, EnableCalendarRequest req) {
+        Equipment equipment = lockEquipment(equipmentId);
+        return idempotency.execute(req.requestId(), "ENABLE_CALENDAR",
+                enableCalendarFingerprint(equipmentId, req),
+                CalendarResponse.class, () -> {
+                    checkVersion(equipment, req.expectedVersion());
+                    if (repository.findCalendar(equipmentId).isPresent()) {
+                        throw ApiException.conflict("CALENDAR_ALREADY_ENABLED",
+                                "设备日历档案已启用，不可修改：" + equipmentId);
+                    }
+                    repository.insertCalendar(new EquipmentCalendar(equipmentId, req.commissionedAt(),
+                            req.periodDays(), req.operator(), req.requestId(), clock.instant()));
+                    repository.incrementVersion(equipmentId);
+                    return new CalendarResponse(equipmentId, req.commissionedAt(), req.periodDays(),
+                            req.operator(), equipment.version() + 1);
+                });
+    }
+
     // ---------- 新增读数 ----------
 
     @Transactional
     public ReadingResponse addReading(String equipmentId, AddReadingRequest req) {
         Equipment equipment = lockEquipment(equipmentId);
-        String fingerprint = equipmentId + "|" + req.readingId() + "|" + req.sampledAt()
-                + "|" + req.cumulativeMinutes() + "|" + req.expectedVersion();
-        return idempotency.execute(req.requestId(), "ADD_READING", fingerprint,
+        return idempotency.execute(req.requestId(), "ADD_READING",
+                addReadingFingerprint(equipmentId, req),
                 ReadingResponse.class, () -> {
                     checkVersion(equipment, req.expectedVersion());
                     if (repository.findReading(equipmentId, req.readingId()).isPresent()) {
@@ -91,9 +118,8 @@ public class EquipmentTxService {
     @Transactional
     public ReadingResponse reviseReading(String equipmentId, String readingId, ReviseReadingRequest req) {
         Equipment equipment = lockEquipment(equipmentId);
-        String fingerprint = equipmentId + "|" + readingId + "|" + req.cumulativeMinutes()
-                + "|" + req.expectedVersion();
-        return idempotency.execute(req.requestId(), "REVISE_READING", fingerprint,
+        return idempotency.execute(req.requestId(), "REVISE_READING",
+                reviseReadingFingerprint(equipmentId, readingId, req),
                 ReadingResponse.class, () -> {
                     checkVersion(equipment, req.expectedVersion());
                     Reading reading = repository.findReading(equipmentId, readingId)
@@ -121,9 +147,8 @@ public class EquipmentTxService {
     @Transactional
     public MaintenanceResponse completeMaintenance(String equipmentId, CompleteMaintenanceRequest req) {
         Equipment equipment = lockEquipment(equipmentId);
-        String fingerprint = equipmentId + "|" + req.readingId() + "|" + req.anchorRevisionNo()
-                + "|" + req.expectedVersion();
-        return idempotency.execute(req.requestId(), "COMPLETE_MAINTENANCE", fingerprint,
+        return idempotency.execute(req.requestId(), "COMPLETE_MAINTENANCE",
+                maintenanceFingerprint(equipmentId, req),
                 MaintenanceResponse.class, () -> {
                     checkVersion(equipment, req.expectedVersion());
                     Reading anchor = repository.findReading(equipmentId, req.readingId())
@@ -140,13 +165,33 @@ public class EquipmentTxService {
                                 "保养锚点时间必须晚于上次保养锚点时间");
                     }
                     Instant now = clock.instant();
+                    // 时间门禁：锚点不得晚于服务端当前时间；已启用日历的设备还不得早于投用时刻
+                    if (anchor.sampledAt().isAfter(now)) {
+                        throw ApiException.unprocessable("ANCHOR_TIME_IN_FUTURE",
+                                "保养锚点时间不能晚于服务端当前时间");
+                    }
+                    Optional<EquipmentCalendar> calendar = repository.findCalendar(equipmentId);
+                    if (calendar.isPresent()
+                            && anchor.sampledAt().isBefore(calendar.get().commissionedAt())) {
+                        throw ApiException.unprocessable("ANCHOR_BEFORE_COMMISSIONING",
+                                "保养锚点时间不能早于设备投用时刻");
+                    }
+                    // 冻结完成时的两个到期原因与本次保养后的新日历截止
+                    boolean hoursDue = currentRunMinutes(equipmentId, last)
+                            >= equipment.maintenancePeriodMinutes();
+                    boolean calendarDue = calendar
+                            .map(cal -> !now.isBefore(calendarDeadline(cal, last)))
+                            .orElse(false);
+                    Instant newDeadline = calendar
+                            .map(cal -> anchor.sampledAt().plus(cal.periodDays(), ChronoUnit.DAYS))
+                            .orElse(null);
                     long maintenanceId = repository.insertMaintenance(equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
-                            req.requestId(), now);
+                            hoursDue, calendarDue, newDeadline, req.requestId(), now);
                     repository.incrementVersion(equipmentId);
                     return new MaintenanceResponse(maintenanceId, equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
-                            now, equipment.version() + 1);
+                            now, equipment.version() + 1, hoursDue, calendarDue, newDeadline);
                 });
     }
 
@@ -161,11 +206,19 @@ public class EquipmentTxService {
         long latestCumulative = latest.map(Reading::cumulativeMinutes).orElse(0L);
         long anchorCumulative = last.map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
         long runMinutes = latestCumulative - anchorCumulative;
-        String status = runMinutes >= equipment.maintenancePeriodMinutes() ? "DUE" : "OK";
+        boolean hoursDue = runMinutes >= equipment.maintenancePeriodMinutes();
+        Optional<EquipmentCalendar> calendar = repository.findCalendar(equipmentId);
+        Instant deadline = calendar.map(cal -> calendarDeadline(cal, last)).orElse(null);
+        boolean calendarDue = deadline != null && !clock.instant().isBefore(deadline);
+        String status = hoursDue || calendarDue ? "DUE" : "OK";
         return new StatusResponse(equipmentId, equipment.version(), equipment.maintenancePeriodMinutes(),
                 latest.map(Reading::sampledAt).orElse(null), latestCumulative,
                 last.map(MaintenanceRecord::anchorSampledAt).orElse(null), anchorCumulative,
-                runMinutes, status);
+                runMinutes, status, hoursDue,
+                calendar.isPresent(),
+                calendar.map(EquipmentCalendar::periodDays).orElse(null),
+                calendar.map(EquipmentCalendar::commissionedAt).orElse(null),
+                deadline, calendarDue);
     }
 
     @Transactional(readOnly = true)
@@ -197,7 +250,8 @@ public class EquipmentTxService {
         return repository.listMaintenances(equipmentId).stream()
                 .map(record -> new MaintenanceResponse(record.maintenanceId(), equipmentId,
                         record.readingId(), record.anchorRevisionNo(), record.anchorSampledAt(),
-                        record.anchorCumulativeMinutes(), record.completedAt(), 0L))
+                        record.anchorCumulativeMinutes(), record.completedAt(), 0L,
+                        record.hoursDue(), record.calendarDue(), record.newCalendarDeadline()))
                 .toList();
     }
 
@@ -231,5 +285,46 @@ public class EquipmentTxService {
             throw ApiException.unprocessable("READING_ORDER_VIOLATION",
                     "累计工时大于后一条读数（" + next.get().cumulativeMinutes() + "），违反单调不减约束");
         }
+    }
+
+    /** 当前本轮运行分钟：最新读数累计工时 - 最近保养锚点工时（无保养从 0 计）。 */
+    private long currentRunMinutes(String equipmentId, Optional<MaintenanceRecord> last) {
+        long latestCumulative = repository.findLatestReading(equipmentId)
+                .map(Reading::cumulativeMinutes).orElse(0L);
+        long anchorCumulative = last.map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
+        return latestCumulative - anchorCumulative;
+    }
+
+    /** 当前日历截止：最近保养锚点时刻 + 日历周期；无保养时从投用时刻起算。 */
+    private Instant calendarDeadline(EquipmentCalendar calendar, Optional<MaintenanceRecord> last) {
+        Instant base = last.map(MaintenanceRecord::anchorSampledAt).orElse(calendar.commissionedAt());
+        return base.plus(calendar.periodDays(), ChronoUnit.DAYS);
+    }
+
+    // ---------- 请求指纹（外观层重放补偿与事务层共用，保证同键异参判定一致） ----------
+
+    static String registerFingerprint(RegisterEquipmentRequest req) {
+        return req.equipmentId() + "|" + req.maintenancePeriodMinutes();
+    }
+
+    static String enableCalendarFingerprint(String equipmentId, EnableCalendarRequest req) {
+        return equipmentId + "|" + req.commissionedAt() + "|" + req.periodDays()
+                + "|" + req.operator() + "|" + req.expectedVersion();
+    }
+
+    static String addReadingFingerprint(String equipmentId, AddReadingRequest req) {
+        return equipmentId + "|" + req.readingId() + "|" + req.sampledAt()
+                + "|" + req.cumulativeMinutes() + "|" + req.expectedVersion();
+    }
+
+    static String reviseReadingFingerprint(String equipmentId, String readingId,
+                                           ReviseReadingRequest req) {
+        return equipmentId + "|" + readingId + "|" + req.cumulativeMinutes()
+                + "|" + req.expectedVersion();
+    }
+
+    static String maintenanceFingerprint(String equipmentId, CompleteMaintenanceRequest req) {
+        return equipmentId + "|" + req.readingId() + "|" + req.anchorRevisionNo()
+                + "|" + req.expectedVersion();
     }
 }

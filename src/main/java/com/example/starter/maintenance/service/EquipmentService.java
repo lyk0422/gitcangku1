@@ -8,7 +8,9 @@ import org.springframework.stereotype.Service;
 
 import com.example.starter.maintenance.api.ApiException;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
+import com.example.starter.maintenance.api.dto.CalendarResponse;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.EnableCalendarRequest;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -33,21 +35,33 @@ public class EquipmentService {
     }
 
     public EquipmentResponse register(RegisterEquipmentRequest req) {
-        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes();
-        return recoverDuplicateKey(req.requestId(), "REGISTER_EQUIPMENT", fingerprint,
+        return recoverDuplicateKey(req.requestId(), "REGISTER_EQUIPMENT",
+                EquipmentTxService.registerFingerprint(req),
                 EquipmentResponse.class, () -> txService.register(req));
     }
 
+    public CalendarResponse enableCalendar(String equipmentId, EnableCalendarRequest req) {
+        return recoverDuplicateKey(req.requestId(), "ENABLE_CALENDAR",
+                EquipmentTxService.enableCalendarFingerprint(equipmentId, req),
+                CalendarResponse.class, () -> txService.enableCalendar(equipmentId, req));
+    }
+
     public ReadingResponse addReading(String equipmentId, AddReadingRequest req) {
-        return txService.addReading(equipmentId, req);
+        return recoverDuplicateKey(req.requestId(), "ADD_READING",
+                EquipmentTxService.addReadingFingerprint(equipmentId, req),
+                ReadingResponse.class, () -> txService.addReading(equipmentId, req));
     }
 
     public ReadingResponse reviseReading(String equipmentId, String readingId, ReviseReadingRequest req) {
-        return txService.reviseReading(equipmentId, readingId, req);
+        return recoverDuplicateKey(req.requestId(), "REVISE_READING",
+                EquipmentTxService.reviseReadingFingerprint(equipmentId, readingId, req),
+                ReadingResponse.class, () -> txService.reviseReading(equipmentId, readingId, req));
     }
 
     public MaintenanceResponse completeMaintenance(String equipmentId, CompleteMaintenanceRequest req) {
-        return txService.completeMaintenance(equipmentId, req);
+        return recoverDuplicateKey(req.requestId(), "COMPLETE_MAINTENANCE",
+                EquipmentTxService.maintenanceFingerprint(equipmentId, req),
+                MaintenanceResponse.class, () -> txService.completeMaintenance(equipmentId, req));
     }
 
     public StatusResponse getStatus(String equipmentId) {

@@ -3,7 +3,8 @@ package com.example.starter.maintenance.api.dto;
 import java.time.Instant;
 
 /**
- * 保养记录视图。
+ * 保养记录视图。完成时冻结当时两个到期原因、锚点与新日历截止；
+ * 同 requestId 重放返回首次冻结结果，新截止不随重放时间延长。
  *
  * @param maintenanceId             保养记录标识
  * @param equipmentId               所属设备标识
@@ -13,6 +14,9 @@ import java.time.Instant;
  * @param anchorCumulativeMinutes   锚点读数在保养完成时的累计工时快照（分钟）
  * @param completedAt               保养完成登记时刻（UTC）
  * @param equipmentVersion          操作后的设备版本号（查询历史时为 0，无意义）
+ * @param hoursDue                  完成时冻结的工时到期原因
+ * @param calendarDue               完成时冻结的日历到期原因
+ * @param newCalendarDeadline       完成时冻结的新日历截止（UTC；未启用日历为 null）
  */
 public record MaintenanceResponse(
         long maintenanceId,
@@ -22,5 +26,8 @@ public record MaintenanceResponse(
         Instant anchorSampledAt,
         long anchorCumulativeMinutes,
         Instant completedAt,
-        long equipmentVersion) {
+        long equipmentVersion,
+        boolean hoursDue,
+        boolean calendarDue,
+        Instant newCalendarDeadline) {
 }
