@@ -78,4 +78,22 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /** 分支组成员视图：taskStatus 为查询时任务当前状态（OPEN/DONE/CANCELLED）。 */
+    public record BranchGroupMemberView(String taskKey, String taskStatus) {
+    }
+
+    /**
+     * 分支组视图：version 为当前组版本（初始 1，选择成功后加一）；
+     * members 为冻结的成员全集；chosenTaskKey/chosenBy/chosenAt 仅 CHOSEN 有值。
+     */
+    public record BranchGroupView(String groupKey, String status, long version,
+                                  List<BranchGroupMemberView> members, String chosenTaskKey,
+                                  String chosenBy, Instant chosenAt,
+                                  String createdBy, Instant createdAt) {
+    }
+
+    /** 事件分支组列表视图：groups 按创建顺序返回。 */
+    public record IncidentBranchGroupsView(String incidentKey, List<BranchGroupView> groups) {
+    }
 }

@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
 CREATE TABLE IF NOT EXISTS command_keys (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
     command_key VARCHAR(128) NOT NULL COMMENT '调用方幂等键，全局唯一',
-    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型：takeover/transfer_initiate/transfer_accept/action/status/escalation_check/escalation_ack/task_create/task_complete/task_cancel/branch_group_create/branch_choose',
     request_hash VARCHAR(64) NOT NULL COMMENT '规范化请求参数的 SHA-256 摘要，用于同键改参检测',
     response_status INT NULL COMMENT '首次成功的 HTTP 状态码；事务提交前必写入',
     response_body MEDIUMTEXT NULL COMMENT '首次成功响应 JSON，用于同键同参重放',
@@ -100,3 +100,27 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS incident_branch_groups (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id',
+    group_key VARCHAR(128) NOT NULL COMMENT '分支组业务键，事件内唯一；同键同成员集合幂等，同键不同集合冲突',
+    status VARCHAR(16) NOT NULL COMMENT '状态：OPEN 待选择 / CHOSEN 已完成选择；仅允许 OPEN→CHOSEN，CHOSEN 为终态',
+    version BIGINT NOT NULL COMMENT '组版本，初始 1，选择成功后加一；选择入口按 expectedGroupVersion 校验',
+    chosen_task_id BIGINT NULL COMMENT '选中成员任务 id，关联 incident_tasks.id；仅 CHOSEN 有值，否则为空',
+    chosen_by VARCHAR(128) NULL COMMENT '选择操作人（操作时的当前指挥人）；仅 CHOSEN 有值，否则为空',
+    chosen_at TIMESTAMP(6) NULL COMMENT '选择完成 UTC 时间；仅 CHOSEN 有值，否则为空',
+    created_by VARCHAR(128) NOT NULL COMMENT '创建人（创建时的当前指挥人）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_branch_group_key UNIQUE (incident_id, group_key)
+) COMMENT='互斥处置分支组表';
+
+CREATE TABLE IF NOT EXISTS incident_branch_group_members (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    group_id BIGINT NOT NULL COMMENT '所属分支组 id，关联 incident_branch_groups.id；每组 2~5 个成员，建组后冻结不可变更',
+    task_id BIGINT NOT NULL COMMENT '成员任务 id，关联 incident_tasks.id；每任务最多属于一个分支组',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    CONSTRAINT uk_branch_member_task UNIQUE (task_id),
+    CONSTRAINT uk_branch_member_group_task UNIQUE (group_id, task_id)
+) COMMENT='分支组成员表（成员任务 → 所属分支组）';

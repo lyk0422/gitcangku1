@@ -15,6 +15,8 @@ import java.util.Set;
 import java.util.function.Supplier;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.BranchGroupChooseRequest;
+import com.example.starter.incident.dto.Requests.BranchGroupCreateRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
@@ -25,9 +27,12 @@ import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.BranchGroupMemberView;
+import com.example.starter.incident.dto.Responses.BranchGroupView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
+import com.example.starter.incident.dto.Responses.IncidentBranchGroupsView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
 import com.example.starter.incident.dto.Responses.StatusChangeView;
@@ -64,6 +69,12 @@ public class IncidentService {
     /** 每任务阻塞事件上限。 */
     private static final int MAX_BLOCKERS_PER_TASK = 5;
 
+    /** 每分支组成员下限。 */
+    private static final int MIN_BRANCH_GROUP_MEMBERS = 2;
+
+    /** 每分支组成员上限。 */
+    private static final int MAX_BRANCH_GROUP_MEMBERS = 5;
+
     /** 视为阻塞已解除的目标事件状态。 */
     private static final Set<IncidentStatus> UNBLOCKING_STATUSES = EnumSet.of(
             IncidentStatus.CONTAINED, IncidentStatus.RESOLVED, IncidentStatus.CLOSED);
@@ -71,16 +82,19 @@ public class IncidentService {
     private final IncidentRepository incidents;
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
+    private final IncidentBranchGroupRepository branchGroups;
     private final CommandKeyRepository commandKeys;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
-                           IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           IncidentTaskRepository tasks, IncidentBranchGroupRepository branchGroups,
+                           CommandKeyRepository commandKeys,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
+        this.branchGroups = branchGroups;
         this.commandKeys = commandKeys;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -464,6 +478,7 @@ public class IncidentService {
     /**
      * 完成任务：仅当前指挥人；仅 OPEN 可完成；全部阻塞事件进入
      * CONTAINED/RESOLVED/CLOSED 后才可完成，否则 409 并返回未解除事件列表。
+     * 分支组成员任务只能经整组选择入口处置，普通完成入口一律 409。
      * DONE/CANCELLED 为终态，重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
@@ -476,6 +491,7 @@ public class IncidentService {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    requireNotBranchMember(task);
                     if (task.status() != TaskStatus.OPEN) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能完成");
@@ -491,7 +507,8 @@ public class IncidentService {
     }
 
     /**
-     * 取消任务：仅当前指挥人；仅 OPEN 可取消；DONE/CANCELLED 为终态，
+     * 取消任务：仅当前指挥人；仅 OPEN 可取消；分支组成员任务只能经整组选择入口
+     * 处置，普通取消入口一律 409。DONE/CANCELLED 为终态，
      * 重复操作按 commandKey 幂等规则返回首次结果。
      */
     @Transactional
@@ -504,6 +521,7 @@ public class IncidentService {
                     requireCommander(incident, actor);
                     IncidentTask task = tasks.findByKey(incident.id(), taskKey)
                             .orElseThrow(() -> ApiException.notFound("任务不存在: " + taskKey));
+                    requireNotBranchMember(task);
                     if (task.status() != TaskStatus.OPEN) {
                         throw ApiException.conflict(
                                 "任务已处于终态 " + task.status() + "，不能取消");
@@ -662,5 +680,172 @@ public class IncidentService {
         List<EscalationView> views = list.stream().map(this::toEscalationView).toList();
         EscalationView current = views.isEmpty() ? null : views.get(views.size() - 1);
         return new EscalationHistoryView(incident.deadlineAt(), current, views);
+    }
+
+    /**
+     * 创建互斥分支组：仅当前指挥人且事件处于 COMMANDING；指定 2~5 个 OPEN 任务，
+     * 每任务最多属一组；组版本初始 1，成员全集建组后冻结。混入终态成员、成员
+     * 已属另一组或事件非 COMMANDING 均 422 且整次不建组。groupKey 事件内幂等：
+     * 同键同成员集合返回首次组，同键不同集合 409。权限校验先于幂等重放。
+     */
+    @Transactional
+    public BranchGroupView createBranchGroup(String incidentKey, String actor,
+                                             BranchGroupCreateRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        String groupKey = requireText(req.groupKey(), "groupKey");
+        List<String> memberKeys = req.memberTaskKeys() == null ? List.of()
+                : req.memberTaskKeys().stream()
+                        .map(k -> requireText(k, "memberTaskKey"))
+                        .distinct()
+                        .toList();
+        if (memberKeys.size() < MIN_BRANCH_GROUP_MEMBERS
+                || memberKeys.size() > MAX_BRANCH_GROUP_MEMBERS) {
+            throw ApiException.badRequest("分支组成员数必须为 " + MIN_BRANCH_GROUP_MEMBERS
+                    + "~" + MAX_BRANCH_GROUP_MEMBERS + " 个");
+        }
+        Incident incident = lockIncident(incidentKey);
+        requireCommander(incident, actor);
+        return runIdempotent(commandKey, "branch_group_create",
+                hash(incidentKey, actor, groupKey, String.join(",", memberKeys)),
+                BranchGroupView.class, () -> {
+                    if (incident.status() != IncidentStatus.COMMANDING) {
+                        throw ApiException.unprocessable(
+                                "仅 COMMANDING 状态可创建分支组，当前状态: " + incident.status());
+                    }
+                    var existing = branchGroups.findByKey(incident.id(), groupKey);
+                    if (existing.isPresent()) {
+                        IncidentBranchGroup found = existing.get();
+                        List<String> existingMembers = branchGroups.listMemberTasks(found.id())
+                                .stream().map(IncidentTask::taskKey).sorted().toList();
+                        if (!existingMembers.equals(memberKeys.stream().sorted().toList())) {
+                            throw ApiException.conflict(
+                                    "groupKey 已被不同成员集合使用: " + groupKey);
+                        }
+                        return toGroupView(found);
+                    }
+                    List<IncidentTask> members = new ArrayList<>();
+                    for (String memberKey : memberKeys) {
+                        members.add(tasks.findByKey(incident.id(), memberKey)
+                                .orElseThrow(() -> ApiException.notFound(
+                                        "任务不存在: " + memberKey)));
+                    }
+                    for (IncidentTask member : members) {
+                        if (member.status() != TaskStatus.OPEN) {
+                            throw ApiException.unprocessable("成员任务已处于终态 "
+                                    + member.status() + "，不能加入分支组: " + member.taskKey());
+                        }
+                        if (branchGroups.findGroupByTaskId(member.id()).isPresent()) {
+                            throw ApiException.unprocessable(
+                                    "任务已属于其他分支组: " + member.taskKey());
+                        }
+                    }
+                    Instant now = now();
+                    long groupId = branchGroups.insert(new IncidentBranchGroup(0L, incident.id(),
+                            groupKey, BranchGroupStatus.OPEN, 1L, null, null, null,
+                            actor, now, now));
+                    for (IncidentTask member : members) {
+                        branchGroups.insertMember(groupId, member.id(), now);
+                    }
+                    return toGroupView(
+                            branchGroups.findByKey(incident.id(), groupKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 整组选择：仅当前指挥人；要求 expectedGroupVersion 等于组当前版本、选中成员
+     * 属于该组且其阻塞事件已全部解除。成功将选中成员 DONE、其余成员 CANCELLED，
+     * 组转 CHOSEN 且版本加一；已选组再次选择 409，旧版本 409，未知成员 404。
+     * 事件行锁与条件 UPDATE 双重保证并发争选只有一份提交；选择不改变事件状态，
+     * 也不替代事件原解决门禁。权限校验先于幂等重放。
+     */
+    @Transactional
+    public BranchGroupView chooseBranch(String incidentKey, String groupKey, String actor,
+                                        BranchGroupChooseRequest req) {
+        String commandKey = requireText(req.commandKey(), "commandKey");
+        String taskKey = requireText(req.taskKey(), "taskKey");
+        if (req.expectedGroupVersion() == null) {
+            throw ApiException.badRequest("expectedGroupVersion 不能为空");
+        }
+        long expectedVersion = req.expectedGroupVersion();
+        Incident incident = lockIncident(incidentKey);
+        requireCommander(incident, actor);
+        return runIdempotent(commandKey, "branch_choose",
+                hash(incidentKey, actor, groupKey, taskKey, String.valueOf(expectedVersion)),
+                BranchGroupView.class, () -> {
+                    IncidentBranchGroup group = branchGroups.findByKey(incident.id(), groupKey)
+                            .orElseThrow(() -> ApiException.notFound("分支组不存在: " + groupKey));
+                    List<IncidentTask> members = branchGroups.listMemberTasks(group.id());
+                    IncidentTask chosen = members.stream()
+                            .filter(t -> t.taskKey().equals(taskKey)).findFirst()
+                            .orElseThrow(() -> ApiException.notFound(
+                                    "任务不是分支组 " + groupKey + " 的成员: " + taskKey));
+                    if (group.status() == BranchGroupStatus.CHOSEN) {
+                        throw ApiException.conflict("分支组已完成选择，不能再次选择: " + groupKey);
+                    }
+                    if (group.version() != expectedVersion) {
+                        throw ApiException.conflict("分支组版本不匹配，期望 " + expectedVersion
+                                + "，当前 " + group.version());
+                    }
+                    List<String> unresolved = unresolvedBlockers(chosen.id());
+                    if (!unresolved.isEmpty()) {
+                        throw ApiException.conflict("存在未解除阻塞的事件: "
+                                + String.join(",", unresolved), List.copyOf(unresolved));
+                    }
+                    Instant now = now();
+                    int updated = branchGroups.markChosen(group.id(), expectedVersion,
+                            chosen.id(), actor, now);
+                    if (updated == 0) {
+                        throw ApiException.conflict("分支组已被并发选择: " + groupKey);
+                    }
+                    tasks.markDone(chosen.id(), actor, now);
+                    for (IncidentTask sibling : members) {
+                        if (sibling.id() != chosen.id()) {
+                            tasks.markCancelled(sibling.id(), actor, now);
+                        }
+                    }
+                    return toGroupView(
+                            branchGroups.findByKey(incident.id(), groupKey).orElseThrow());
+                });
+    }
+
+    /**
+     * 查询事件全部分支组（含冻结成员全集、成员当前状态、选中成员与版本）。
+     * 只读，不隐式写入。
+     */
+    @Transactional(readOnly = true)
+    public IncidentBranchGroupsView listBranchGroups(String incidentKey) {
+        Incident incident = incidents.findByKey(incidentKey)
+                .orElseThrow(() -> ApiException.notFound("事件不存在: " + incidentKey));
+        List<BranchGroupView> groups = branchGroups.listByIncident(incident.id()).stream()
+                .map(this::toGroupView).toList();
+        return new IncidentBranchGroupsView(incident.incidentKey(), groups);
+    }
+
+    /**
+     * 分支组成员任务只能经整组选择入口处置；普通完成/取消入口一律 409。
+     */
+    private void requireNotBranchMember(IncidentTask task) {
+        if (branchGroups.findGroupByTaskId(task.id()).isPresent()) {
+            throw ApiException.conflict(
+                    "任务属于互斥分支组，只能通过整组选择入口处置: " + task.taskKey());
+        }
+    }
+
+    /**
+     * 组装分支组视图：成员状态按查询时任务当前状态计算。
+     */
+    private BranchGroupView toGroupView(IncidentBranchGroup group) {
+        List<IncidentTask> members = branchGroups.listMemberTasks(group.id());
+        List<BranchGroupMemberView> memberViews = members.stream()
+                .map(t -> new BranchGroupMemberView(t.taskKey(), t.status().name()))
+                .toList();
+        String chosenKey = null;
+        if (group.chosenTaskId() != null) {
+            chosenKey = members.stream().filter(t -> t.id() == group.chosenTaskId())
+                    .map(IncidentTask::taskKey).findFirst().orElse(null);
+        }
+        return new BranchGroupView(group.groupKey(), group.status().name(), group.version(),
+                memberViews, chosenKey, group.chosenBy(), group.chosenAt(),
+                group.createdBy(), group.createdAt());
     }
 }

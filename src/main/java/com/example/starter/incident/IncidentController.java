@@ -1,6 +1,8 @@
 package com.example.starter.incident;
 
 import com.example.starter.incident.dto.Requests.ActionRequest;
+import com.example.starter.incident.dto.Requests.BranchGroupChooseRequest;
+import com.example.starter.incident.dto.Requests.BranchGroupCreateRequest;
 import com.example.starter.incident.dto.Requests.EscalationAckRequest;
 import com.example.starter.incident.dto.Requests.EscalationCheckRequest;
 import com.example.starter.incident.dto.Requests.ReportRequest;
@@ -11,9 +13,11 @@ import com.example.starter.incident.dto.Requests.TaskCreateRequest;
 import com.example.starter.incident.dto.Requests.TransferAcceptRequest;
 import com.example.starter.incident.dto.Requests.TransferRequest;
 import com.example.starter.incident.dto.Responses.ActionView;
+import com.example.starter.incident.dto.Responses.BranchGroupView;
 import com.example.starter.incident.dto.Responses.EscalationHistoryView;
 import com.example.starter.incident.dto.Responses.EscalationView;
 import com.example.starter.incident.dto.Responses.HistoryView;
+import com.example.starter.incident.dto.Responses.IncidentBranchGroupsView;
 import com.example.starter.incident.dto.Responses.IncidentTasksView;
 import com.example.starter.incident.dto.Responses.IncidentView;
 import com.example.starter.incident.dto.Responses.TaskView;
@@ -187,5 +191,34 @@ public class IncidentController {
                                @RequestHeader("X-Actor-Id") String actor,
                                @RequestBody TaskActionRequest req) {
         return service.cancelTask(incidentKey, taskKey, actor, req);
+    }
+
+    /**
+     * 创建互斥分支组（仅当前指挥人；事件须处于 COMMANDING，2~5 个 OPEN 成员）。
+     */
+    @PostMapping("/{incidentKey}/branch-groups")
+    public BranchGroupView createBranchGroup(@PathVariable String incidentKey,
+                                             @RequestHeader("X-Actor-Id") String actor,
+                                             @RequestBody BranchGroupCreateRequest req) {
+        return service.createBranchGroup(incidentKey, actor, req);
+    }
+
+    /**
+     * 查询事件全部分支组（含成员当前状态、选中成员与版本，只读）。
+     */
+    @GetMapping("/{incidentKey}/branch-groups")
+    public IncidentBranchGroupsView listBranchGroups(@PathVariable String incidentKey) {
+        return service.listBranchGroups(incidentKey);
+    }
+
+    /**
+     * 整组选择（仅当前指挥人；选中成员 DONE、其余成员 CANCELLED，组转 CHOSEN）。
+     */
+    @PostMapping("/{incidentKey}/branch-groups/{groupKey}/choose")
+    public BranchGroupView chooseBranch(@PathVariable String incidentKey,
+                                        @PathVariable String groupKey,
+                                        @RequestHeader("X-Actor-Id") String actor,
+                                        @RequestBody BranchGroupChooseRequest req) {
+        return service.chooseBranch(incidentKey, groupKey, actor, req);
     }
 }

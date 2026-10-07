@@ -55,4 +55,20 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 分支组创建请求：memberTaskKeys 为 2~5 个 OPEN 任务键，重复键按去重处理；
+     * 仅当前指挥人且事件处于 COMMANDING 可建组，组版本初始 1。
+     */
+    public record BranchGroupCreateRequest(String commandKey, String groupKey,
+                                           List<String> memberTaskKeys) {
+    }
+
+    /**
+     * 分支选择请求：taskKey 为选中成员（其阻塞事件须已全部解除）；
+     * expectedGroupVersion 为期望的组当前版本，不匹配或组已选择均 409。
+     */
+    public record BranchGroupChooseRequest(String commandKey, String taskKey,
+                                           Long expectedGroupVersion) {
+    }
 }

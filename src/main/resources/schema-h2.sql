@@ -100,3 +100,27 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS incident_branch_groups (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    group_key VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    version BIGINT NOT NULL,
+    chosen_task_id BIGINT NULL,
+    chosen_by VARCHAR(128) NULL,
+    chosen_at TIMESTAMP(6) NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_branch_group_key UNIQUE (incident_id, group_key)
+);
+
+CREATE TABLE IF NOT EXISTS incident_branch_group_members (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    group_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_branch_member_task UNIQUE (task_id),
+    CONSTRAINT uk_branch_member_group_task UNIQUE (group_id, task_id)
+);
