@@ -40,4 +40,13 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.NOT_FOUND)
                 .body(new ErrorResponse("RESOURCE_NOT_FOUND", "资源不存在"));
     }
+
+    /**
+     * 兜底：未预期的异常统一转为 500，不向调用方泄漏内部异常细节。
+     */
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> handleUnexpected(Exception ex) {
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(new ErrorResponse("INTERNAL_ERROR", "服务内部错误"));
+    }
 }

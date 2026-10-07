@@ -1,12 +1,14 @@
 spring:
   datasource:
-    url: jdbc:h2:mem:consent-test;MODE=MySQL;DB_CLOSE_DELAY=-1
+    url: jdbc:h2:mem:consent-erasure-test;MODE=MySQL;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000
     driver-class-name: org.h2.Driver
     username: sa
     password: ""
   sql:
     init:
       mode: always
+      # 测试不加载本地入口的合成演示数据，场景数据由用例自行准备并清理
+      data-locations: optional:classpath:data-test.sql
   jackson:
     time-zone: Asia/Shanghai
 

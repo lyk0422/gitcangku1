@@ -103,4 +103,37 @@ public class ConsentRepository {
                         + " VALUES (?, ?, ?, ?, ?, ?)",
                 subjectKey, purpose.name(), epoch, recordKey, payload, requestId);
     }
+
+    /**
+     * 按 recordKey 字典序取指定代次最多 limit 条未清除记录的键；只访问指定代，不触碰其他代或用途。
+     */
+    List<String> findPendingPayloadKeys(String subjectKey, Purpose purpose, int epoch, int limit) {
+        return jdbc.queryForList(
+                "SELECT record_key FROM consent_record"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? AND payload_erased = FALSE"
+                        + " ORDER BY record_key ASC LIMIT ?",
+                String.class, subjectKey, purpose.name(), epoch, limit);
+    }
+
+    /**
+     * 物理清除单条记录载荷：置空 payload 并打清除标记，保留记录身份；返回实际清除条数（0 或 1）。
+     */
+    int erasePayload(String subjectKey, Purpose purpose, int epoch, String recordKey) {
+        return jdbc.update(
+                "UPDATE consent_record SET payload = NULL, payload_erased = TRUE"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? AND record_key = ?"
+                        + " AND payload_erased = FALSE",
+                subjectKey, purpose.name(), epoch, recordKey);
+    }
+
+    /**
+     * 统计指定代次仍未清除载荷的记录数，用于判断任务是否转 DONE。
+     */
+    int countPendingPayloads(String subjectKey, Purpose purpose, int epoch) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM consent_record"
+                        + " WHERE subject_key = ? AND purpose = ? AND epoch = ? AND payload_erased = FALSE",
+                Integer.class, subjectKey, purpose.name(), epoch);
+        return count == null ? 0 : count;
+    }
 }
