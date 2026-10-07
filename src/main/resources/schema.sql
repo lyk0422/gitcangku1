@@ -5,13 +5,17 @@
 CREATE TABLE IF NOT EXISTS equipment (
     equipment_id VARCHAR(64) NOT NULL PRIMARY KEY,
     maintenance_period_minutes BIGINT NOT NULL,
+    fatigue_threshold BIGINT NULL,
+    baseline_stress_mpa BIGINT NULL,
     version BIGINT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
 COMMENT ON TABLE equipment IS '设备主表：每台设备一行';
 COMMENT ON COLUMN equipment.equipment_id IS '设备唯一标识（客户端提供）';
 COMMENT ON COLUMN equipment.maintenance_period_minutes IS '保养周期（分钟），正整数，登记后不可修改';
-COMMENT ON COLUMN equipment.version IS '设备版本号，初始 1；新增读数/修订/完成保养均校验 expectedVersion 并加一';
+COMMENT ON COLUMN equipment.fatigue_threshold IS '疲劳阈值（损伤累计达到即 DUE），正整数，NULL 表示未设置';
+COMMENT ON COLUMN equipment.baseline_stress_mpa IS '基准应力（兆帕），非负整数，NULL 表示未设置（未设置时不可登记应力循环）';
+COMMENT ON COLUMN equipment.version IS '设备版本号，初始 1；新增读数/修订/完成保养/新增应力循环均校验 expectedVersion 并加一';
 COMMENT ON COLUMN equipment.created_at IS '登记时刻（UTC）';
 
 -- 工时读数当前值表：reading_id 设备内唯一，同设备同一采样时刻仅一条。
@@ -89,3 +93,39 @@ COMMENT ON COLUMN idempotency_request.operation IS '操作类型（登记设备/
 COMMENT ON COLUMN idempotency_request.request_fingerprint IS '业务参数指纹（不含 requestId），用于同键异参判定';
 COMMENT ON COLUMN idempotency_request.response_body IS '原成功响应报文（JSON），重放时原样返回';
 COMMENT ON COLUMN idempotency_request.created_at IS '首次成功处理时刻（UTC）';
+
+-- 闭合应力循环账本：仅完整闭合循环（升峰+回落至基准）落库，不写半循环。
+-- 循环区间为 [rise_sampled_at, fall_sampled_at]，同设备区间不得重叠、不得跨保养锚点。
+CREATE TABLE IF NOT EXISTS stress_cycle (
+    equipment_id VARCHAR(64) NOT NULL,
+    cycle_id VARCHAR(64) NOT NULL,
+    operator VARCHAR(128) NOT NULL,
+    rise_stress_mpa BIGINT NOT NULL,
+    rise_sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    rise_reading_id VARCHAR(64) NOT NULL,
+    rise_reading_revision_no INT NOT NULL,
+    fall_stress_mpa BIGINT NOT NULL,
+    fall_sampled_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    fall_reading_id VARCHAR(64) NOT NULL,
+    fall_reading_revision_no INT NOT NULL,
+    damage BIGINT NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    PRIMARY KEY (equipment_id, cycle_id)
+);
+CREATE INDEX IF NOT EXISTS idx_stress_cycle_time ON stress_cycle (equipment_id, rise_sampled_at, fall_sampled_at);
+COMMENT ON TABLE stress_cycle IS '闭合应力循环账本：损伤 = (峰值应力 - 基准应力)^3（兆帕三次方，精确整数）';
+COMMENT ON COLUMN stress_cycle.equipment_id IS '所属设备标识';
+COMMENT ON COLUMN stress_cycle.cycle_id IS '循环标识，设备内唯一';
+COMMENT ON COLUMN stress_cycle.operator IS '操作者标识，非空';
+COMMENT ON COLUMN stress_cycle.rise_stress_mpa IS '升峰采样应力（兆帕），须大于基准应力';
+COMMENT ON COLUMN stress_cycle.rise_sampled_at IS '升峰采样 UTC 时刻，须不早于其引用读数采样时刻且严格早于回落时刻';
+COMMENT ON COLUMN stress_cycle.rise_reading_id IS '升峰采样引用的工时读数标识';
+COMMENT ON COLUMN stress_cycle.rise_reading_revision_no IS '升峰采样引用读数在登记时的现存修订号';
+COMMENT ON COLUMN stress_cycle.fall_stress_mpa IS '回落采样应力（兆帕），须等于基准应力';
+COMMENT ON COLUMN stress_cycle.fall_sampled_at IS '回落采样 UTC 时刻，须不晚于其引用读数采样时刻';
+COMMENT ON COLUMN stress_cycle.fall_reading_id IS '回落采样引用的工时读数标识';
+COMMENT ON COLUMN stress_cycle.fall_reading_revision_no IS '回落采样引用读数在登记时的现存修订号';
+COMMENT ON COLUMN stress_cycle.damage IS '本循环损伤量（精确整数，超 long 拒绝登记）';
+COMMENT ON COLUMN stress_cycle.request_id IS '登记该循环请求的 requestId';
+COMMENT ON COLUMN stress_cycle.created_at IS '循环登记时刻（UTC）';

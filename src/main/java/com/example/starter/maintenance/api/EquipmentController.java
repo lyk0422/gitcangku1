@@ -13,8 +13,10 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.example.starter.maintenance.api.dto.AddCycleRequest;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.CycleResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -92,5 +94,22 @@ public class EquipmentController {
     @GetMapping("/{equipmentId}/maintenances")
     public List<MaintenanceResponse> listMaintenances(@PathVariable String equipmentId) {
         return service.listMaintenances(equipmentId);
+    }
+
+    /**
+     * 新增闭合应力循环（不连接真实传感器，由调用方登记）。仅完整闭合循环写损伤；
+     * 缺回落、越界、重叠、跨锚点 422；损伤超 long 400。
+     */
+    @PostMapping("/{equipmentId}/cycles")
+    @ResponseStatus(HttpStatus.CREATED)
+    public CycleResponse addCycle(@PathVariable String equipmentId,
+                                  @Valid @RequestBody AddCycleRequest req) {
+        return service.addCycle(equipmentId, req);
+    }
+
+    /** 应力循环账本（按升峰时刻升序），含每循环损伤与轮次归属。 */
+    @GetMapping("/{equipmentId}/cycles")
+    public List<CycleResponse> listCycles(@PathVariable String equipmentId) {
+        return service.listCycles(equipmentId);
     }
 }

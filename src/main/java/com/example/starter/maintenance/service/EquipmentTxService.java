@@ -9,8 +9,10 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.example.starter.maintenance.api.ApiException;
+import com.example.starter.maintenance.api.dto.AddCycleRequest;
 import com.example.starter.maintenance.api.dto.AddReadingRequest;
 import com.example.starter.maintenance.api.dto.CompleteMaintenanceRequest;
+import com.example.starter.maintenance.api.dto.CycleResponse;
 import com.example.starter.maintenance.api.dto.EquipmentResponse;
 import com.example.starter.maintenance.api.dto.MaintenanceResponse;
 import com.example.starter.maintenance.api.dto.ReadingResponse;
@@ -21,6 +23,7 @@ import com.example.starter.maintenance.api.dto.StatusResponse;
 import com.example.starter.maintenance.domain.Equipment;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
+import com.example.starter.maintenance.domain.StressCycle;
 import com.example.starter.maintenance.store.EquipmentRepository;
 
 /**
@@ -44,14 +47,17 @@ public class EquipmentTxService {
 
     @Transactional
     public EquipmentResponse register(RegisterEquipmentRequest req) {
-        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes();
+        String fingerprint = req.equipmentId() + "|" + req.maintenancePeriodMinutes()
+                + "|" + req.fatigueThreshold() + "|" + req.baselineStressMpa();
         return idempotency.execute(req.requestId(), "REGISTER_EQUIPMENT", fingerprint,
                 EquipmentResponse.class, () -> {
                     if (repository.findEquipment(req.equipmentId()).isPresent()) {
                         throw ApiException.conflict("EQUIPMENT_EXISTS", "设备已存在：" + req.equipmentId());
                     }
-                    repository.insertEquipment(req.equipmentId(), req.maintenancePeriodMinutes(), clock.instant());
-                    return new EquipmentResponse(req.equipmentId(), req.maintenancePeriodMinutes(), 1L);
+                    repository.insertEquipment(req.equipmentId(), req.maintenancePeriodMinutes(),
+                            req.fatigueThreshold(), req.baselineStressMpa(), clock.instant());
+                    return new EquipmentResponse(req.equipmentId(), req.maintenancePeriodMinutes(),
+                            req.fatigueThreshold(), req.baselineStressMpa(), 1L);
                 });
     }
 
@@ -103,6 +109,10 @@ public class EquipmentTxService {
                         throw ApiException.conflict("READING_ANCHORED",
                                 "读数已作为历史保养锚点，不可修订：" + readingId);
                     }
+                    if (repository.existsCycleReferencingReading(equipmentId, readingId)) {
+                        throw ApiException.conflict("READING_CYCLE_REFERENCED",
+                                "读数已被应力循环引用，不可修订：" + readingId);
+                    }
                     checkMonotonic(equipmentId, reading.sampledAt(), req.cumulativeMinutes());
                     int newRevisionNo = reading.revisionNo() + 1;
                     Instant now = clock.instant();
@@ -139,6 +149,10 @@ public class EquipmentTxService {
                         throw ApiException.unprocessable("ANCHOR_TIME_NOT_LATER",
                                 "保养锚点时间必须晚于上次保养锚点时间");
                     }
+                    if (repository.existsCycleSpanningAnchor(equipmentId, anchor.sampledAt())) {
+                        throw ApiException.unprocessable("CYCLE_SPANS_ANCHOR",
+                                "存在跨锚点的完整应力循环，不能把一个损伤拆进两轮");
+                    }
                     Instant now = clock.instant();
                     long maintenanceId = repository.insertMaintenance(equipmentId, req.readingId(),
                             req.anchorRevisionNo(), anchor.sampledAt(), anchor.cumulativeMinutes(),
@@ -150,7 +164,81 @@ public class EquipmentTxService {
                 });
     }
 
+    // ---------- 新增闭合应力循环 ----------
+
+    /**
+     * 登记闭合应力循环。仅完整闭合循环（升峰大于基准、回落等于基准）写损伤；
+     * 缺回落、越界（时刻不递增或不落在引用读数间）、区间重叠、跨历史锚点均 422，不写半循环。
+     * 指纹由调用方按结构化身份（操作、资源、全参数、期望版本）生成。
+     */
+    @Transactional
+    public CycleResponse addCycle(String equipmentId, AddCycleRequest req, String fingerprint) {
+        Equipment equipment = lockEquipment(equipmentId);
+        return idempotency.execute(req.requestId(), "ADD_STRESS_CYCLE", fingerprint,
+                CycleResponse.class, () -> {
+                    checkVersion(equipment, req.expectedVersion());
+                    if (equipment.baselineStressMpa() == null) {
+                        throw ApiException.unprocessable("FATIGUE_NOT_CONFIGURED",
+                                "设备未设置基准应力，不可登记应力循环：" + equipmentId);
+                    }
+                    if (req.fall() == null) {
+                        throw ApiException.unprocessable("CYCLE_NOT_CLOSED",
+                                "循环缺少回落采样，未闭合，不写入半循环");
+                    }
+                    if (repository.findCycle(equipmentId, req.cycleId()).isPresent()) {
+                        throw ApiException.conflict("CYCLE_EXISTS", "循环已存在：" + req.cycleId());
+                    }
+                    long baseline = equipment.baselineStressMpa();
+                    if (req.rise().stressMpa() <= baseline) {
+                        throw ApiException.unprocessable("CYCLE_PEAK_NOT_ABOVE_BASELINE",
+                                "峰值应力须大于基准应力（" + baseline + " 兆帕）");
+                    }
+                    if (req.fall().stressMpa() != baseline) {
+                        throw ApiException.unprocessable("CYCLE_NOT_CLOSED",
+                                "回落应力须等于基准应力（" + baseline + " 兆帕），未回到基准视为未闭合");
+                    }
+                    long damage = computeDamage(req.rise().stressMpa(), baseline);
+                    Reading riseRef = referencedReading(equipmentId, req.rise());
+                    Reading fallRef = referencedReading(equipmentId, req.fall());
+                    Instant riseAt = req.rise().sampledAt();
+                    Instant fallAt = req.fall().sampledAt();
+                    if (!riseAt.isBefore(fallAt)
+                            || riseAt.isBefore(riseRef.sampledAt())
+                            || fallAt.isAfter(fallRef.sampledAt())) {
+                        throw ApiException.unprocessable("CYCLE_TIME_OUT_OF_BOUNDS",
+                                "采样时刻须递增且落在引用读数采样时刻之间");
+                    }
+                    if (repository.existsOverlappingCycle(equipmentId, riseAt, fallAt)) {
+                        throw ApiException.unprocessable("CYCLE_INTERVAL_OVERLAP",
+                                "循环区间与已有循环重叠");
+                    }
+                    if (repository.existsAnchorBetween(equipmentId, riseAt, fallAt)) {
+                        throw ApiException.unprocessable("CYCLE_SPANS_ANCHOR",
+                                "循环跨历史保养锚点，不能把一个损伤拆进两轮");
+                    }
+                    StressCycle cycle = new StressCycle(equipmentId, req.cycleId(), req.operator(),
+                            req.rise().stressMpa(), riseAt, req.rise().readingId(),
+                            req.rise().readingRevisionNo(),
+                            req.fall().stressMpa(), fallAt, req.fall().readingId(),
+                            req.fall().readingRevisionNo(), damage);
+                    repository.insertCycle(cycle, req.requestId(), clock.instant());
+                    repository.incrementVersion(equipmentId);
+                    return toCycleResponse(cycle, isCurrentRound(equipment, riseAt),
+                            equipment.version() + 1);
+                });
+    }
+
     // ---------- 查询 ----------
+
+    @Transactional(readOnly = true)
+    public List<CycleResponse> listCycles(String equipmentId) {
+        Equipment equipment = repository.findEquipment(equipmentId)
+                .orElseThrow(() -> equipmentNotFound(equipmentId));
+        return repository.listCycles(equipmentId).stream()
+                .map(cycle -> toCycleResponse(cycle,
+                        isCurrentRound(equipment, cycle.riseSampledAt()), equipment.version()))
+                .toList();
+    }
 
     @Transactional(readOnly = true)
     public StatusResponse getStatus(String equipmentId) {
@@ -161,11 +249,17 @@ public class EquipmentTxService {
         long latestCumulative = latest.map(Reading::cumulativeMinutes).orElse(0L);
         long anchorCumulative = last.map(MaintenanceRecord::anchorCumulativeMinutes).orElse(0L);
         long runMinutes = latestCumulative - anchorCumulative;
-        String status = runMinutes >= equipment.maintenancePeriodMinutes() ? "DUE" : "OK";
+        long currentRoundDamage = repository.sumCurrentRoundDamage(equipmentId,
+                last.map(MaintenanceRecord::anchorSampledAt).orElse(null));
+        boolean due = runMinutes >= equipment.maintenancePeriodMinutes()
+                || (equipment.fatigueThreshold() != null
+                        && currentRoundDamage >= equipment.fatigueThreshold());
+        String status = due ? "DUE" : "OK";
         return new StatusResponse(equipmentId, equipment.version(), equipment.maintenancePeriodMinutes(),
                 latest.map(Reading::sampledAt).orElse(null), latestCumulative,
                 last.map(MaintenanceRecord::anchorSampledAt).orElse(null), anchorCumulative,
-                runMinutes, status);
+                runMinutes, status, equipment.fatigueThreshold(), equipment.baselineStressMpa(),
+                currentRoundDamage);
     }
 
     @Transactional(readOnly = true)
@@ -231,5 +325,44 @@ public class EquipmentTxService {
             throw ApiException.unprocessable("READING_ORDER_VIOLATION",
                     "累计工时大于后一条读数（" + next.get().cumulativeMinutes() + "），违反单调不减约束");
         }
+    }
+
+    /** 损伤 = (峰值 - 基准)^3，精确整数运算；超出 long 范围拒绝（400）。 */
+    private long computeDamage(long peakStressMpa, long baselineStressMpa) {
+        long delta = peakStressMpa - baselineStressMpa;
+        try {
+            return Math.multiplyExact(delta, Math.multiplyExact(delta, delta));
+        } catch (ArithmeticException e) {
+            throw ApiException.badRequest("DAMAGE_OVERFLOW", "损伤超出长整型范围，拒绝登记该循环");
+        }
+    }
+
+    /** 校验采样引用的读数存在且修订号为现存版本。 */
+    private Reading referencedReading(String equipmentId, AddCycleRequest.Sample sample) {
+        Reading reading = repository.findReading(equipmentId, sample.readingId())
+                .orElseThrow(() -> ApiException.notFound("READING_NOT_FOUND",
+                        "引用读数不存在：" + sample.readingId()));
+        if (reading.revisionNo() != sample.readingRevisionNo()) {
+            throw ApiException.conflict("READING_REVISION_CONFLICT",
+                    "引用读数修订号与现存版本不一致：期望 " + sample.readingRevisionNo()
+                            + "，当前 " + reading.revisionNo());
+        }
+        return reading;
+    }
+
+    /** 循环是否归属当前轮：升峰时刻不早于最近保养锚点（无保养时全部归当前轮）。 */
+    private boolean isCurrentRound(Equipment equipment, Instant riseAt) {
+        return repository.findLastMaintenance(equipment.equipmentId())
+                .map(last -> !riseAt.isBefore(last.anchorSampledAt()))
+                .orElse(true);
+    }
+
+    private CycleResponse toCycleResponse(StressCycle cycle, boolean currentRound, long equipmentVersion) {
+        return new CycleResponse(cycle.equipmentId(), cycle.cycleId(), cycle.operator(),
+                cycle.riseStressMpa(), cycle.riseSampledAt(), cycle.riseReadingId(),
+                cycle.riseReadingRevisionNo(),
+                cycle.fallStressMpa(), cycle.fallSampledAt(), cycle.fallReadingId(),
+                cycle.fallReadingRevisionNo(),
+                cycle.damage(), currentRound, equipmentVersion);
     }
 }

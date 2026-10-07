@@ -17,6 +17,7 @@ import org.springframework.stereotype.Repository;
 import com.example.starter.maintenance.domain.Equipment;
 import com.example.starter.maintenance.domain.MaintenanceRecord;
 import com.example.starter.maintenance.domain.Reading;
+import com.example.starter.maintenance.domain.StressCycle;
 
 /**
  * 设备工时保养数据访问层。所有 SQL 参数化；时刻字段（TIMESTAMP WITH TIME ZONE）以 UTC 存取。
@@ -41,6 +42,8 @@ public class EquipmentRepository {
     private static final RowMapper<Equipment> EQUIPMENT_MAPPER = (rs, rowNum) -> new Equipment(
             rs.getString("equipment_id"),
             rs.getLong("maintenance_period_minutes"),
+            (Long) rs.getObject("fatigue_threshold"),
+            (Long) rs.getObject("baseline_stress_mpa"),
             rs.getLong("version"));
 
     private static final RowMapper<Reading> READING_MAPPER = (rs, rowNum) -> new Reading(
@@ -61,15 +64,19 @@ public class EquipmentRepository {
 
     // ---------- 设备 ----------
 
-    public void insertEquipment(String equipmentId, long maintenancePeriodMinutes, Instant createdAt) {
-        jdbc.update("INSERT INTO equipment (equipment_id, maintenance_period_minutes, version, created_at)"
-                        + " VALUES (?, ?, 1, ?)",
-                equipmentId, maintenancePeriodMinutes, utc(createdAt));
+    public void insertEquipment(String equipmentId, long maintenancePeriodMinutes,
+                                Long fatigueThreshold, Long baselineStressMpa, Instant createdAt) {
+        jdbc.update("INSERT INTO equipment (equipment_id, maintenance_period_minutes,"
+                        + " fatigue_threshold, baseline_stress_mpa, version, created_at)"
+                        + " VALUES (?, ?, ?, ?, 1, ?)",
+                equipmentId, maintenancePeriodMinutes, fatigueThreshold, baselineStressMpa,
+                utc(createdAt));
     }
 
     public Optional<Equipment> findEquipment(String equipmentId) {
         List<Equipment> rows = jdbc.query(
-                "SELECT equipment_id, maintenance_period_minutes, version FROM equipment WHERE equipment_id = ?",
+                "SELECT equipment_id, maintenance_period_minutes, fatigue_threshold,"
+                        + " baseline_stress_mpa, version FROM equipment WHERE equipment_id = ?",
                 EQUIPMENT_MAPPER, equipmentId);
         return rows.stream().findFirst();
     }
@@ -77,7 +84,8 @@ public class EquipmentRepository {
     /** 悲观行锁：同一设备的写操作串行化，保证版本校验与业务变更原子。 */
     public Optional<Equipment> findEquipmentForUpdate(String equipmentId) {
         List<Equipment> rows = jdbc.query(
-                "SELECT equipment_id, maintenance_period_minutes, version FROM equipment"
+                "SELECT equipment_id, maintenance_period_minutes, fatigue_threshold,"
+                        + " baseline_stress_mpa, version FROM equipment"
                         + " WHERE equipment_id = ? FOR UPDATE",
                 EQUIPMENT_MAPPER, equipmentId);
         return rows.stream().findFirst();
@@ -257,5 +265,109 @@ public class EquipmentRepository {
     }
 
     public record IdempotencyRow(String requestId, String operation, String fingerprint, String responseBody) {
+    }
+
+    // ---------- 闭合应力循环 ----------
+
+    private static final RowMapper<StressCycle> CYCLE_MAPPER = (rs, rowNum) -> new StressCycle(
+            rs.getString("equipment_id"),
+            rs.getString("cycle_id"),
+            rs.getString("operator"),
+            rs.getLong("rise_stress_mpa"),
+            readInstant(rs, "rise_sampled_at"),
+            rs.getString("rise_reading_id"),
+            rs.getInt("rise_reading_revision_no"),
+            rs.getLong("fall_stress_mpa"),
+            readInstant(rs, "fall_sampled_at"),
+            rs.getString("fall_reading_id"),
+            rs.getInt("fall_reading_revision_no"),
+            rs.getLong("damage"));
+
+    private static final String CYCLE_COLUMNS = "equipment_id, cycle_id, operator,"
+            + " rise_stress_mpa, rise_sampled_at, rise_reading_id, rise_reading_revision_no,"
+            + " fall_stress_mpa, fall_sampled_at, fall_reading_id, fall_reading_revision_no, damage";
+
+    public void insertCycle(StressCycle cycle, String requestId, Instant createdAt) {
+        jdbc.update("INSERT INTO stress_cycle (equipment_id, cycle_id, operator,"
+                        + " rise_stress_mpa, rise_sampled_at, rise_reading_id, rise_reading_revision_no,"
+                        + " fall_stress_mpa, fall_sampled_at, fall_reading_id, fall_reading_revision_no,"
+                        + " damage, request_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                cycle.equipmentId(), cycle.cycleId(), cycle.operator(),
+                cycle.riseStressMpa(), utc(cycle.riseSampledAt()), cycle.riseReadingId(),
+                cycle.riseReadingRevisionNo(),
+                cycle.fallStressMpa(), utc(cycle.fallSampledAt()), cycle.fallReadingId(),
+                cycle.fallReadingRevisionNo(),
+                cycle.damage(), requestId, utc(createdAt));
+    }
+
+    public Optional<StressCycle> findCycle(String equipmentId, String cycleId) {
+        List<StressCycle> rows = jdbc.query(
+                "SELECT " + CYCLE_COLUMNS + " FROM stress_cycle"
+                        + " WHERE equipment_id = ? AND cycle_id = ?",
+                CYCLE_MAPPER, equipmentId, cycleId);
+        return rows.stream().findFirst();
+    }
+
+    /** 全部循环按升峰时刻升序（账本顺序）。 */
+    public List<StressCycle> listCycles(String equipmentId) {
+        return jdbc.query(
+                "SELECT " + CYCLE_COLUMNS + " FROM stress_cycle WHERE equipment_id = ?"
+                        + " ORDER BY rise_sampled_at ASC, cycle_id ASC",
+                CYCLE_MAPPER, equipmentId);
+    }
+
+    /** 是否存在与新区间 [riseAt, fallAt] 重叠的循环（端点相接不算重叠）。 */
+    public boolean existsOverlappingCycle(String equipmentId, Instant riseAt, Instant fallAt) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM stress_cycle WHERE equipment_id = ?"
+                        + " AND rise_sampled_at < ? AND fall_sampled_at > ?",
+                Integer.class, equipmentId, utc(fallAt), utc(riseAt));
+        return count != null && count > 0;
+    }
+
+    /** 是否存在跨越锚点时刻的完整循环（升峰早于锚点且回落晚于锚点）。 */
+    public boolean existsCycleSpanningAnchor(String equipmentId, Instant anchorSampledAt) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM stress_cycle WHERE equipment_id = ?"
+                        + " AND rise_sampled_at < ? AND fall_sampled_at > ?",
+                Integer.class, equipmentId, utc(anchorSampledAt), utc(anchorSampledAt));
+        return count != null && count > 0;
+    }
+
+    /** 是否存在保养锚点严格落在新区间内部（新循环跨历史锚点）。 */
+    public boolean existsAnchorBetween(String equipmentId, Instant riseAt, Instant fallAt) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM maintenance WHERE equipment_id = ?"
+                        + " AND anchor_sampled_at > ? AND anchor_sampled_at < ?",
+                Integer.class, equipmentId, utc(riseAt), utc(fallAt));
+        return count != null && count > 0;
+    }
+
+    /** 该读数是否已被任意应力循环引用（引用后不可修订）。 */
+    public boolean existsCycleReferencingReading(String equipmentId, String readingId) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM stress_cycle WHERE equipment_id = ?"
+                        + " AND (rise_reading_id = ? OR fall_reading_id = ?)",
+                Integer.class, equipmentId, readingId, readingId);
+        return count != null && count > 0;
+    }
+
+    /**
+     * 当前轮累计损伤：升峰时刻不早于最近保养锚点的循环损伤之和；since 为 null 时统计全部。
+     * 锚点之前（回落时刻不晚于锚点）的循环只归历史轮，不计入当前轮。
+     */
+    public long sumCurrentRoundDamage(String equipmentId, Instant since) {
+        Long sum;
+        if (since == null) {
+            sum = jdbc.queryForObject(
+                    "SELECT COALESCE(SUM(damage), 0) FROM stress_cycle WHERE equipment_id = ?",
+                    Long.class, equipmentId);
+        } else {
+            sum = jdbc.queryForObject(
+                    "SELECT COALESCE(SUM(damage), 0) FROM stress_cycle"
+                            + " WHERE equipment_id = ? AND rise_sampled_at >= ?",
+                    Long.class, equipmentId, utc(since));
+        }
+        return sum != null ? sum : 0L;
     }
 }
