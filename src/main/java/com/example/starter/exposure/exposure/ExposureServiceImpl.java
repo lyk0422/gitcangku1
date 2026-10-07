@@ -1,20 +1,28 @@
 package com.example.starter.exposure.exposure;
 
 import com.example.starter.exposure.domain.Campaign;
+import com.example.starter.exposure.domain.Pool;
+import com.example.starter.exposure.domain.PoolMember;
+import com.example.starter.exposure.domain.PoolSelection;
 import com.example.starter.exposure.domain.Reservation;
 import com.example.starter.exposure.domain.ReservationStatus;
 import com.example.starter.exposure.repo.CampaignRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository.IdempotencyRecord;
 import com.example.starter.exposure.repo.LedgerRepository;
+import com.example.starter.exposure.repo.PoolRepository;
 import com.example.starter.exposure.repo.ReservationRepository;
 import com.example.starter.exposure.web.ApiException;
 import com.example.starter.exposure.web.ApplyExposureRequest;
 import com.example.starter.exposure.web.CampaignResponse;
 import com.example.starter.exposure.web.CreateCampaignRequest;
+import com.example.starter.exposure.web.CreatePoolRequest;
+import com.example.starter.exposure.web.PoolResponse;
+import com.example.starter.exposure.web.PoolSelectionResponse;
 import com.example.starter.exposure.web.QuotaResponse;
 import com.example.starter.exposure.web.ReservationActionRequest;
 import com.example.starter.exposure.web.ReservationResponse;
+import com.example.starter.exposure.web.SelectFromPoolRequest;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
@@ -23,7 +31,11 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 import java.time.LocalDate;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -47,6 +59,7 @@ public class ExposureServiceImpl implements ExposureService {
     private final ReservationRepository reservationRepository;
     private final LedgerRepository ledgerRepository;
     private final IdempotencyRepository idempotencyRepository;
+    private final PoolRepository poolRepository;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate txTemplate;
 
@@ -55,6 +68,7 @@ public class ExposureServiceImpl implements ExposureService {
                                ReservationRepository reservationRepository,
                                LedgerRepository ledgerRepository,
                                IdempotencyRepository idempotencyRepository,
+                               PoolRepository poolRepository,
                                ObjectMapper objectMapper,
                                TransactionTemplate txTemplate) {
         this.clock = clock;
@@ -62,6 +76,7 @@ public class ExposureServiceImpl implements ExposureService {
         this.reservationRepository = reservationRepository;
         this.ledgerRepository = ledgerRepository;
         this.idempotencyRepository = idempotencyRepository;
+        this.poolRepository = poolRepository;
         this.objectMapper = objectMapper;
         this.txTemplate = txTemplate;
     }
@@ -196,7 +211,71 @@ public class ExposureServiceImpl implements ExposureService {
         CREATE_CAMPAIGN,
         APPLY,
         CONFIRM,
-        CANCEL
+        CANCEL,
+        CREATE_POOL,
+        POOL_SELECT
+    }
+
+    @Override
+    public PoolResponse createPool(CreatePoolRequest request) {
+        String fingerprint = structuredFingerprint(
+                request.operator(), request.poolId(), request.members());
+        return runIdempotent(request.requestId(), Operation.CREATE_POOL, fingerprint,
+                PoolResponse.class, () -> {
+                    if (poolRepository.findPoolById(request.poolId()).isPresent()) {
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "pool already exists: " + request.poolId());
+                    }
+                    List<String> campaignIds = request.members().stream()
+                            .map(CreatePoolRequest.Member::campaignId)
+                            .toList();
+                    if (new HashSet<>(campaignIds).size() != campaignIds.size()) {
+                        throw new ApiException(HttpStatus.BAD_REQUEST,
+                                "duplicate member campaign in pool " + request.poolId());
+                    }
+                    for (String campaignId : campaignIds) {
+                        requireCampaign(campaignId);
+                    }
+                    Pool pool = new Pool(request.poolId(), 1, request.operator(), clock.millis());
+                    try {
+                        poolRepository.insertPool(pool);
+                    } catch (DuplicateKeyException duplicatePool) {
+                        // 并发创建同一 poolId：明确返回 409，而非误报幂等键冲突
+                        throw new ApiException(HttpStatus.CONFLICT,
+                                "pool already exists: " + request.poolId());
+                    }
+                    for (CreatePoolRequest.Member member : request.members()) {
+                        poolRepository.insertMember(new PoolMember(
+                                request.poolId(), member.campaignId(), member.weight(), 0L));
+                    }
+                    return poolResponse(pool, null);
+                });
+    }
+
+    @Override
+    public PoolSelectionResponse selectFromPool(String poolId, SelectFromPoolRequest request) {
+        String fingerprint = structuredFingerprint(
+                request.operator(), poolId, request.visitorId(), request.expectedVersion());
+        return runIdempotent(request.requestId(), Operation.POOL_SELECT, fingerprint,
+                PoolSelectionResponse.class, () -> doSelectFromPool(poolId, request));
+    }
+
+    @Override
+    public PoolResponse getPool(String poolId) {
+        return txTemplate.execute(status -> {
+            Pool pool = poolRepository.findPoolById(poolId)
+                    .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                            "pool not found: " + poolId));
+            // 先结算各成员公告的过期预占，活动选择视图才准确
+            long now = clock.millis();
+            for (PoolMember member : poolRepository.findMembers(poolId)) {
+                settleExpired(member.campaignId(), now);
+            }
+            String activeReservationId = poolRepository.findActiveSelection(poolId)
+                    .map(PoolSelection::reservationId)
+                    .orElse(null);
+            return poolResponse(pool, activeReservationId);
+        });
     }
 
     /**
@@ -266,6 +345,8 @@ public class ExposureServiceImpl implements ExposureService {
                         reservationId, ReservationStatus.RESERVED, ReservationStatus.CONFIRMED, now)) {
                     throw new ApiException(HttpStatus.CONFLICT, "reservation state changed concurrently");
                 }
+                // 池选择的预占确认时，将选择时冻结的临时缺额正式提交为成员缺额
+                commitPoolDeficitsIfAny(reservationId);
             } else {
                 if (!reservationRepository.compareAndSetStatus(
                         reservationId, ReservationStatus.RESERVED, ReservationStatus.CANCELLED, now)) {
@@ -333,6 +414,133 @@ public class ExposureServiceImpl implements ExposureService {
         return campaignRepository.findById(campaignId)
                 .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
                         "campaign not found: " + campaignId));
+    }
+
+    /**
+     * 缺额轮转选择（在持幂等键的事务内执行）。行锁池行串行化同池选择；
+     * 全部成员先按权重加到临时缺额，仅当天仍有额度的成员参与竞选，
+     * 取缺额最大者（同分取公告号字典序小者），选中者减去所有成员权重之和。
+     */
+    private PoolSelectionResponse doSelectFromPool(String poolId, SelectFromPoolRequest request) {
+        long now = clock.millis();
+        LocalDate utcDate = LocalDate.now(clock);
+        Pool pool = poolRepository.lockPoolById(poolId)
+                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                        "pool not found: " + poolId));
+        if (request.expectedVersion() != null && request.expectedVersion() != pool.poolVersion()) {
+            throw new ApiException(HttpStatus.CONFLICT,
+                    "pool version mismatch: expected " + request.expectedVersion()
+                            + ", actual " + pool.poolVersion());
+        }
+        List<PoolMember> members = poolRepository.findMembers(poolId);
+
+        // 先结算各成员公告的过期预占：释放两级额度并使其临时缺额被丢弃
+        for (PoolMember member : members) {
+            settleExpired(member.campaignId(), now);
+        }
+
+        // RESERVED 期间池禁止另一轮转选择
+        if (poolRepository.findActiveSelection(poolId).isPresent()) {
+            throw new ApiException(HttpStatus.CONFLICT,
+                    "pool " + poolId + " has an active reserved selection");
+        }
+
+        // 固定加锁顺序：按公告号字典序逐公告 总账 -> 访客账，与申请/结算路径一致
+        Map<String, Campaign> campaigns = new LinkedHashMap<>();
+        Map<String, Integer> usedTotals = new LinkedHashMap<>();
+        Map<String, Integer> usedVisitors = new LinkedHashMap<>();
+        for (PoolMember member : members) {
+            Campaign campaign = requireCampaign(member.campaignId());
+            campaigns.put(member.campaignId(), campaign);
+            ledgerRepository.ensureTotalRow(member.campaignId(), utcDate);
+            ledgerRepository.ensureVisitorRow(member.campaignId(), request.visitorId(), utcDate);
+            usedTotals.put(member.campaignId(),
+                    ledgerRepository.lockUsedTotal(member.campaignId(), utcDate));
+            usedVisitors.put(member.campaignId(),
+                    ledgerRepository.lockUsedVisitor(member.campaignId(), request.visitorId(), utcDate));
+        }
+
+        // 全部成员按权重加到临时缺额（精确整数）；仅该访客与公告当天仍有额度的成员参与竞选
+        Map<String, Long> tempDeficits = new LinkedHashMap<>();
+        long totalWeight = 0L;
+        for (PoolMember member : members) {
+            tempDeficits.put(member.campaignId(), member.committedDeficit() + member.weight());
+            totalWeight += member.weight();
+        }
+        String winner = null;
+        for (PoolMember member : members) {
+            Campaign campaign = campaigns.get(member.campaignId());
+            boolean eligible = usedTotals.get(member.campaignId()) + 1 <= campaign.dailyTotalCap()
+                    && usedVisitors.get(member.campaignId()) + 1 <= campaign.perVisitorDailyCap();
+            // 成员按字典序遍历且严格大于才替换：同分时公告号小者胜出
+            if (eligible && (winner == null
+                    || tempDeficits.get(member.campaignId()) > tempDeficits.get(winner))) {
+                winner = member.campaignId();
+            }
+        }
+        if (winner == null) {
+            // 全部不可选：429，临时增加的缺额不保存
+            throw new ApiException(HttpStatus.TOO_MANY_REQUESTS,
+                    "no eligible campaign in pool " + poolId);
+        }
+        // 选中者减去所有成员权重之和
+        tempDeficits.put(winner, tempDeficits.get(winner) - totalWeight);
+
+        // 原子创建原 60 秒预占并保存新缺额（占用两级额度 + 预占单 + 选择记录 + 缺额快照）
+        ledgerRepository.addTotal(winner, utcDate, 1);
+        ledgerRepository.addVisitor(winner, request.visitorId(), utcDate, 1);
+        String reservationId = UUID.randomUUID().toString().replace("-", "");
+        Reservation reservation = new Reservation(
+                reservationId,
+                winner,
+                request.visitorId(),
+                java.sql.Date.valueOf(utcDate),
+                ReservationStatus.RESERVED,
+                now,
+                now + RESERVATION_TTL_MILLIS,
+                null);
+        reservationRepository.insert(reservation);
+        poolRepository.insertSelection(new PoolSelection(
+                reservationId, poolId, winner, request.visitorId(), now));
+        for (Map.Entry<String, Long> entry : tempDeficits.entrySet()) {
+            poolRepository.insertDeficit(new PoolRepository.DeficitRow(
+                    reservationId, entry.getKey(), entry.getValue()));
+        }
+        return PoolSelectionResponse.from(reservation, poolId, tempDeficits);
+    }
+
+    /** 预占确认时，将选择时冻结的临时缺额正式提交为池成员缺额；非池选择的预占无操作。 */
+    private void commitPoolDeficitsIfAny(String reservationId) {
+        var selection = poolRepository.findSelectionByReservation(reservationId);
+        if (selection.isEmpty()) {
+            return;
+        }
+        for (PoolRepository.DeficitRow row : poolRepository.findDeficits(reservationId)) {
+            poolRepository.updateCommittedDeficit(
+                    selection.get().poolId(), row.campaignId(), row.pendingDeficit());
+        }
+    }
+
+    /** 组装选择池视图：成员按公告号字典序，含已提交缺额。 */
+    private PoolResponse poolResponse(Pool pool, String activeReservationId) {
+        List<PoolResponse.Member> members = poolRepository.findMembers(pool.poolId()).stream()
+                .map(member -> new PoolResponse.Member(
+                        member.campaignId(), member.weight(), member.committedDeficit()))
+                .toList();
+        return new PoolResponse(pool.poolId(), pool.poolVersion(), members,
+                activeReservationId, pool.createdAtUtc());
+    }
+
+    /**
+     * 结构化请求指纹：JSON 序列化保证各参数边界清晰、字段无碰撞；
+     * 十进制同值同参、文本原样比对。
+     */
+    private String structuredFingerprint(Object... parts) {
+        try {
+            return objectMapper.writeValueAsString(Arrays.asList(parts));
+        } catch (Exception e) {
+            throw new IllegalStateException("failed to build request fingerprint", e);
+        }
     }
 
     private Reservation requireReservation(String reservationId) {

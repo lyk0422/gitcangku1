@@ -54,3 +54,44 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
     created_at_utc      BIGINT       NOT NULL,
     PRIMARY KEY (request_id)
 );
+
+-- 缺额轮转选择池：pool_version 当前恒为 1（池创建后成员与权重不可变），created_by 为创建操作者
+CREATE TABLE IF NOT EXISTS selection_pool (
+    pool_id         VARCHAR(64) NOT NULL,
+    pool_version    INT         NOT NULL,
+    created_by      VARCHAR(64) NOT NULL,
+    created_at_utc  BIGINT      NOT NULL,
+    PRIMARY KEY (pool_id)
+);
+
+-- 池成员：weight 为轮转权重（正整数 1～10）；committed_deficit 为已正式提交的缺额
+-- （精确整数，可正可负），初始 0，仅在关联预占确认时提交，取消/到期不推进，跨 UTC 日不清零
+CREATE TABLE IF NOT EXISTS pool_member (
+    pool_id            VARCHAR(64) NOT NULL,
+    campaign_id        VARCHAR(64) NOT NULL,
+    weight             INT         NOT NULL,
+    committed_deficit  BIGINT      NOT NULL DEFAULT 0,
+    PRIMARY KEY (pool_id, campaign_id),
+    CHECK (weight BETWEEN 1 AND 10)
+);
+
+-- 池轮转选择记录：一次选择对应一条曝光预占单，冻结选中公告身份，旧重放不重新选择
+CREATE TABLE IF NOT EXISTS pool_selection (
+    reservation_id  VARCHAR(64) NOT NULL,
+    pool_id         VARCHAR(64) NOT NULL,
+    campaign_id     VARCHAR(64) NOT NULL,
+    visitor_id      VARCHAR(64) NOT NULL,
+    created_at_utc  BIGINT      NOT NULL,
+    PRIMARY KEY (reservation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pool_selection_pool
+    ON pool_selection (pool_id);
+
+-- 选择时冻结的各成员临时缺额快照：pending_deficit 为选择时计算的临时缺额（含选中者扣减），
+-- 仅在预占确认时写回 pool_member.committed_deficit，取消/到期丢弃
+CREATE TABLE IF NOT EXISTS pool_selection_deficit (
+    reservation_id   VARCHAR(64) NOT NULL,
+    campaign_id      VARCHAR(64) NOT NULL,
+    pending_deficit  BIGINT      NOT NULL,
+    PRIMARY KEY (reservation_id, campaign_id)
+);

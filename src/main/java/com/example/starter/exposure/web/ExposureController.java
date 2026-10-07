@@ -71,4 +71,25 @@ public class ExposureController {
                                     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate utcDate) {
         return exposureService.queryQuota(campaignId, visitorId, utcDate);
     }
+
+    /** 创建缺额轮转选择池（成员与权重创建时固定）。 */
+    @PostMapping("/pools")
+    public ResponseEntity<PoolResponse> createPool(@Valid @RequestBody CreatePoolRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.createPool(request));
+    }
+
+    /** 选择池明细：成员、已提交缺额与当前活动选择。 */
+    @GetMapping("/pools/{poolId}")
+    public PoolResponse getPool(@PathVariable String poolId) {
+        return exposureService.getPool(poolId);
+    }
+
+    /** 池轮转选择：确定性地选出公告并创建 60 秒预占。 */
+    @PostMapping("/pools/{poolId}/selections")
+    public ResponseEntity<PoolSelectionResponse> selectFromPool(
+            @PathVariable String poolId,
+            @Valid @RequestBody SelectFromPoolRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(exposureService.selectFromPool(poolId, request));
+    }
 }
