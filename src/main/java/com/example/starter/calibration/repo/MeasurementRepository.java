@@ -1,5 +1,6 @@
 package com.example.starter.calibration.repo;
 
+import java.math.BigInteger;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.LocalDateTime;
@@ -13,10 +14,12 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import com.example.starter.calibration.model.Measurement;
+import com.example.starter.calibration.model.MeasurementMode;
 import com.example.starter.calibration.model.MeasurementStatus;
 
 /**
  * 测量记录持久化。measurement_key 全局唯一作为幂等键；状态流转由放行事务在行锁内完成。
+ * DRIFT 模式的校正值以精确有理数（分子/分母字符串）保存，不丢精度。
  */
 @Repository
 public class MeasurementRepository {
@@ -31,10 +34,19 @@ public class MeasurementRepository {
             rs.getBigDecimal("upper_limit"),
             rs.getString("submitted_by"),
             rs.getLong("certificate_id"),
+            MeasurementMode.valueOf(rs.getString("mode")),
+            rs.getObject("profile_t0_id", Long.class),
+            rs.getObject("profile_t1_id", Long.class),
             rs.getBigDecimal("computed_value"),
+            toBigInteger(rs.getString("computed_num")),
+            toBigInteger(rs.getString("computed_den")),
             rs.getBoolean("passed"),
             MeasurementStatus.valueOf(rs.getString("status")),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
+
+    private static BigInteger toBigInteger(String value) {
+        return value == null ? null : new BigInteger(value);
+    }
 
     private final JdbcTemplate jdbc;
 
@@ -51,8 +63,9 @@ public class MeasurementRepository {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO measurement "
                             + "(measurement_key, instrument_id, measured_at, raw_reading, lower_limit, upper_limit, "
-                            + "submitted_by, certificate_id, computed_value, passed, status, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            + "submitted_by, certificate_id, mode, profile_t0_id, profile_t1_id, "
+                            + "computed_value, computed_num, computed_den, passed, status, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, measurement.measurementKey());
             ps.setString(2, measurement.instrumentId());
@@ -62,10 +75,24 @@ public class MeasurementRepository {
             ps.setBigDecimal(6, measurement.upperLimit());
             ps.setString(7, measurement.submittedBy());
             ps.setLong(8, measurement.certificateId());
-            ps.setBigDecimal(9, measurement.computedValue());
-            ps.setBoolean(10, measurement.passed());
-            ps.setString(11, measurement.status().name());
-            ps.setObject(12, JdbcTimes.toDb(measurement.createdAt()));
+            ps.setString(9, measurement.mode().name());
+            if (measurement.profileT0Id() == null) {
+                ps.setNull(10, java.sql.Types.BIGINT);
+                ps.setNull(11, java.sql.Types.BIGINT);
+            } else {
+                ps.setLong(10, measurement.profileT0Id());
+                ps.setLong(11, measurement.profileT1Id());
+            }
+            if (measurement.computedValue() == null) {
+                ps.setNull(12, java.sql.Types.DECIMAL);
+            } else {
+                ps.setBigDecimal(12, measurement.computedValue());
+            }
+            ps.setString(13, measurement.computedNum() == null ? null : measurement.computedNum().toString());
+            ps.setString(14, measurement.computedDen() == null ? null : measurement.computedDen().toString());
+            ps.setBoolean(15, measurement.passed());
+            ps.setString(16, measurement.status().name());
+            ps.setObject(17, JdbcTimes.toDb(measurement.createdAt()));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -96,12 +123,16 @@ public class MeasurementRepository {
     }
 
     /**
-     * 查询当前可用结果：已放行且证书未撤销。instrumentId 为 null 时不过滤仪器。
+     * 查询当前可用结果：已放行且全部证据（证书及 DRIFT 模式的两份漂移档案）未撤销。
+     * instrumentId 为 null 时不过滤仪器。
      */
     public List<Measurement> findUsable(String instrumentId) {
         String base = "SELECT m.* FROM measurement m "
                 + "JOIN calibration_certificate c ON c.id = m.certificate_id "
-                + "WHERE m.status = 'RELEASED' AND c.revoked = FALSE ";
+                + "LEFT JOIN drift_profile p0 ON p0.id = m.profile_t0_id "
+                + "LEFT JOIN drift_profile p1 ON p1.id = m.profile_t1_id "
+                + "WHERE m.status = 'RELEASED' AND c.revoked = FALSE "
+                + "AND (m.mode <> 'DRIFT' OR (p0.revoked = FALSE AND p1.revoked = FALSE)) ";
         if (instrumentId == null) {
             return jdbc.query(base + "ORDER BY m.id", MAPPER);
         }

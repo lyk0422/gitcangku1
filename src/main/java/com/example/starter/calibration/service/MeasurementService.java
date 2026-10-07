@@ -12,9 +12,12 @@ import com.example.starter.calibration.api.ApiException;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.SubmitMeasurementRequest;
 import com.example.starter.calibration.model.Certificate;
+import com.example.starter.calibration.model.DriftProfile;
 import com.example.starter.calibration.model.Measurement;
+import com.example.starter.calibration.model.MeasurementMode;
 import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.repo.CertificateRepository;
+import com.example.starter.calibration.repo.DriftProfileRepository;
 import com.example.starter.calibration.repo.MeasurementRepository;
 import com.example.starter.calibration.repo.ReleaseRepository;
 
@@ -26,13 +29,16 @@ public class MeasurementService {
 
     private final MeasurementRepository measurements;
     private final CertificateRepository certificates;
+    private final DriftProfileRepository profiles;
     private final ReleaseRepository releases;
 
     public MeasurementService(MeasurementRepository measurements,
                               CertificateRepository certificates,
+                              DriftProfileRepository profiles,
                               ReleaseRepository releases) {
         this.measurements = measurements;
         this.certificates = certificates;
+        this.profiles = profiles;
         this.releases = releases;
     }
 
@@ -63,7 +69,8 @@ public class MeasurementService {
 
         Measurement measurement = new Measurement(
                 0L, key, instrumentId, measuredAt, reading, lower, upper, submittedBy,
-                cert.id(), computed, passed, MeasurementStatus.PENDING, Instant.now());
+                cert.id(), MeasurementMode.STANDARD, null, null, computed, null, null,
+                passed, MeasurementStatus.PENDING, Instant.now());
         try {
             measurements.insert(measurement);
         } catch (DuplicateKeyException ex) {
@@ -83,7 +90,8 @@ public class MeasurementService {
     }
 
     /**
-     * 当前可用结果：已放行且证书未撤销。instrumentId 为 null 时返回全部仪器。
+     * 当前可用结果：已放行且全部证据（证书及 DRIFT 模式的两份漂移档案）未撤销。
+     * instrumentId 为 null 时返回全部仪器。
      */
     @Transactional(readOnly = true)
     public List<MeasurementResponse> usable(String instrumentId) {
@@ -94,10 +102,24 @@ public class MeasurementService {
     }
 
     private MeasurementResponse toDetail(Measurement measurement) {
+        return DtoMapper.toResponse(measurement, evidenceRevoked(measurement),
+                releases.findByMeasurementId(measurement.id()));
+    }
+
+    /**
+     * 核对全部证据：原证书 + DRIFT 模式的两份漂移档案；任一撤销或缺失即视为证据失效。
+     */
+    private boolean evidenceRevoked(Measurement measurement) {
         boolean certRevoked = certificates.findById(measurement.certificateId())
                 .map(Certificate::revoked)
                 .orElse(true);
-        return DtoMapper.toResponse(measurement, certRevoked,
-                releases.findByMeasurementId(measurement.id()));
+        if (certRevoked || measurement.mode() != MeasurementMode.DRIFT) {
+            return certRevoked;
+        }
+        return profileRevoked(measurement.profileT0Id()) || profileRevoked(measurement.profileT1Id());
+    }
+
+    private boolean profileRevoked(long profileId) {
+        return profiles.findById(profileId).map(DriftProfile::revoked).orElse(true);
     }
 }

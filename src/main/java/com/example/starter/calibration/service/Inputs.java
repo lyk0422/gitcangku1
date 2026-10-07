@@ -44,4 +44,21 @@ final class Inputs {
             throw ApiException.badRequest(field + " 必须为带时区的 ISO-8601 时间");
         }
     }
+
+    /** 漂移档案与漂移测量的时刻：UTC 毫秒精度，超出毫秒精度视为超精度输入（400）。 */
+    static Instant requireMillisInstant(String value, String field) {
+        Instant instant = requireInstant(value, field);
+        if (instant.getNano() % 1_000_000 != 0) {
+            throw ApiException.badRequest(field + " 必须为毫秒精度时刻");
+        }
+        return instant;
+    }
+
+    /** 必填长整型 ID。 */
+    static long requireId(Long value, String field) {
+        if (value == null) {
+            throw ApiException.badRequest(field + " 不能为空");
+        }
+        return value;
+    }
 }

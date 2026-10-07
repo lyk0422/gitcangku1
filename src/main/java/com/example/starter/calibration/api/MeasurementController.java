@@ -16,7 +16,9 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRequest;
 import com.example.starter.calibration.api.dto.ReleaseResponse;
+import com.example.starter.calibration.api.dto.SubmitDriftMeasurementRequest;
 import com.example.starter.calibration.api.dto.SubmitMeasurementRequest;
+import com.example.starter.calibration.service.DriftMeasurementService;
 import com.example.starter.calibration.service.MeasurementService;
 import com.example.starter.calibration.service.ReleaseService;
 
@@ -28,10 +30,14 @@ import com.example.starter.calibration.service.ReleaseService;
 public class MeasurementController {
 
     private final MeasurementService measurements;
+    private final DriftMeasurementService driftMeasurements;
     private final ReleaseService releases;
 
-    public MeasurementController(MeasurementService measurements, ReleaseService releases) {
+    public MeasurementController(MeasurementService measurements,
+                                 DriftMeasurementService driftMeasurements,
+                                 ReleaseService releases) {
         this.measurements = measurements;
+        this.driftMeasurements = driftMeasurements;
         this.releases = releases;
     }
 
@@ -41,6 +47,15 @@ public class MeasurementController {
     @PostMapping
     public ResponseEntity<MeasurementResponse> submit(@RequestBody SubmitMeasurementRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(measurements.submit(request));
+    }
+
+    /**
+     * 提交参考漂移模式测量：201；输入超精度 400；仪器不符、档案撤销或区间非法 422；
+     * requestId 异参冲突、测量键重复 409。
+     */
+    @PostMapping("/drift")
+    public ResponseEntity<MeasurementResponse> submitDrift(@RequestBody SubmitDriftMeasurementRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(driftMeasurements.submit(request));
     }
 
     /**

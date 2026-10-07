@@ -15,9 +15,12 @@ import com.example.starter.calibration.api.BatchRejectedException;
 import com.example.starter.calibration.api.ItemFailure;
 import com.example.starter.calibration.api.dto.ReleaseResponse;
 import com.example.starter.calibration.model.Certificate;
+import com.example.starter.calibration.model.DriftProfile;
 import com.example.starter.calibration.model.Measurement;
+import com.example.starter.calibration.model.MeasurementMode;
 import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.repo.CertificateRepository;
+import com.example.starter.calibration.repo.DriftProfileRepository;
 import com.example.starter.calibration.repo.MeasurementRepository;
 import com.example.starter.calibration.repo.ReleaseRepository;
 
@@ -32,13 +35,16 @@ public class ReleaseService {
 
     private final MeasurementRepository measurements;
     private final CertificateRepository certificates;
+    private final DriftProfileRepository profiles;
     private final ReleaseRepository releases;
 
     public ReleaseService(MeasurementRepository measurements,
                           CertificateRepository certificates,
+                          DriftProfileRepository profiles,
                           ReleaseRepository releases) {
         this.measurements = measurements;
         this.certificates = certificates;
+        this.profiles = profiles;
         this.releases = releases;
     }
 
@@ -81,6 +87,17 @@ public class ReleaseService {
                             "测量关联的证书不存在: " + measurement.certificateId()));
             if (cert.revoked()) {
                 reasons.add("CERTIFICATE_REVOKED");
+            }
+            if (measurement.mode() == MeasurementMode.DRIFT) {
+                // 原子核对两份漂移档案：行锁使撤销与放行按事务提交顺序生效
+                for (long profileId : new long[]{measurement.profileT0Id(), measurement.profileT1Id()}) {
+                    DriftProfile profile = profiles.findByIdForUpdate(profileId)
+                            .orElseThrow(() -> ApiException.conflict("DRIFT_PROFILE_MISSING",
+                                    "测量关联的漂移档案不存在: " + profileId));
+                    if (profile.revoked()) {
+                        reasons.add("DRIFT_PROFILE_REVOKED");
+                    }
+                }
             }
             if (measurement.submittedBy().equals(releaser)) {
                 reasons.add("SAME_ACTOR");

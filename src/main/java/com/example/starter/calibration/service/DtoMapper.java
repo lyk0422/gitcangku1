@@ -4,9 +4,11 @@ import java.math.BigDecimal;
 import java.util.List;
 
 import com.example.starter.calibration.api.dto.CertificateResponse;
+import com.example.starter.calibration.api.dto.DriftProfileResponse;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRecordResponse;
 import com.example.starter.calibration.model.Certificate;
+import com.example.starter.calibration.model.DriftProfile;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
 import com.example.starter.calibration.model.ReleaseRecord;
@@ -41,9 +43,23 @@ final class DtoMapper {
                 cert.createdAt());
     }
 
-    static MeasurementResponse toResponse(Measurement m, boolean certificateRevoked,
+    static DriftProfileResponse toResponse(DriftProfile profile) {
+        return new DriftProfileResponse(
+                profile.id(),
+                profile.instrumentId(),
+                profile.profiledAt(),
+                format(profile.referenceOffset()),
+                profile.revoked(),
+                profile.revokedAt(),
+                profile.createdAt());
+    }
+
+    /**
+     * 测量明细。evidenceRevoked 为全部证据（证书及 DRIFT 模式的两份漂移档案）是否任一已撤销。
+     */
+    static MeasurementResponse toResponse(Measurement m, boolean evidenceRevoked,
                                           List<ReleaseRecord> releases) {
-        boolean usable = m.status() == MeasurementStatus.RELEASED && !certificateRevoked;
+        boolean usable = m.status() == MeasurementStatus.RELEASED && !evidenceRevoked;
         return new MeasurementResponse(
                 m.id(),
                 m.measurementKey(),
@@ -54,7 +70,10 @@ final class DtoMapper {
                 format(m.upperLimit()),
                 m.submittedBy(),
                 m.certificateId(),
-                format(m.computedValue()),
+                m.mode().name(),
+                m.profileT0Id(),
+                m.profileT1Id(),
+                m.exactValue().toExactString(),
                 m.displayValue().toPlainString(),
                 m.passed(),
                 m.status().name(),
