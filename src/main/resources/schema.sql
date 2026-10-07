@@ -59,3 +59,36 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
 );
+
+-- 4x4 二值栅格观测当前状态表：每条栅格观测一行，格值保存在 mask_version_cell 中（按版本存全部 16 格）。
+CREATE TABLE IF NOT EXISTS mask_observation_current (
+    observation_id VARCHAR(64) NOT NULL COMMENT '栅格观测唯一标识',
+    version INT NOT NULL COMMENT '当前版本号，从 1 开始单调递增',
+    deleted BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已删除：TRUE 表示当前状态为删除墓碑，不允许合并',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次变更时间（服务器时区）',
+    PRIMARY KEY (observation_id)
+);
+
+-- 4x4 二值栅格观测版本元数据表：每次成功变更（创建/合并/删除）追加一行，历史永不删除。
+CREATE TABLE IF NOT EXISTS mask_observation_version (
+    observation_id VARCHAR(64) NOT NULL COMMENT '栅格观测唯一标识',
+    version INT NOT NULL COMMENT '版本号，从 1 开始',
+    base_version INT NULL COMMENT '合并请求所基于的基版号；创建版本为 NULL，删除墓碑为 NULL',
+    operator VARCHAR(128) NOT NULL COMMENT '写入该版本的操作者标识（客户端来源），非空',
+    deleted BOOLEAN NOT NULL COMMENT '该版本是否为删除墓碑：TRUE 时无格值',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '该版本生成时间（服务器时区）',
+    PRIMARY KEY (observation_id, version)
+);
+
+-- 4x4 栅格版本格值表：每个非墓碑版本固定 16 行，按行优先逐格存储 0/1，不把格值编码成易碰撞字符串。
+CREATE TABLE IF NOT EXISTS mask_version_cell (
+    observation_id VARCHAR(64) NOT NULL COMMENT '栅格观测唯一标识',
+    version INT NOT NULL COMMENT '所属版本号，与 mask_observation_version.version 对应',
+    row_index TINYINT NOT NULL COMMENT '行下标，0-3，从上到下',
+    col_index TINYINT NOT NULL COMMENT '列下标，0-3，从左到右',
+    cell_value TINYINT NOT NULL COMMENT '格值：0 未勾选，1 勾选',
+    PRIMARY KEY (observation_id, version, row_index, col_index),
+    CHECK (row_index BETWEEN 0 AND 3),
+    CHECK (col_index BETWEEN 0 AND 3),
+    CHECK (cell_value IN (0, 1))
+);

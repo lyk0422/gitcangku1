@@ -63,6 +63,15 @@ public class ApiException extends RuntimeException {
     }
 
     /**
+     * 422：栅格三方合并成功但合并结果的勾选格不满足四邻接单连通，服务端版本与格值不变。
+     */
+    public static ApiException disconnected(int currentVersion) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY,
+                "merged mask cells are not connected via 4-neighborhood",
+                null, currentVersion);
+    }
+
+    /**
      * 410：记录已删除，拒绝新的修改和删除。
      */
     public static ApiException gone(String message) {
