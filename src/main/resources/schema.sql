@@ -6,6 +6,8 @@ CREATE TABLE IF NOT EXISTS batch (
     batch_no VARCHAR(64) NOT NULL COMMENT '批号，创建后不可修改',
     produced_at VARCHAR(40) NOT NULL COMMENT '生产时间，ISO-8601 UTC  instant 字符串',
     status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT',
+    spec_key VARCHAR(64) NULL COMMENT '绑定的特性规范标识；NULL 表示未绑定规范，批次不要求测量向量',
+    spec_version INT NULL COMMENT '绑定的规范版本号；NULL 表示未绑定规范；换版仅允许未放行且无任何批准的批次',
     created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_batch_key UNIQUE (batch_key)
 );
@@ -65,4 +67,65 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
+);
+
+-- 特性规范：无量纲合成特性的线性不等式约束集合，按 (spec_key, version) 只追加新版本，旧版本不可修改。
+CREATE TABLE IF NOT EXISTS spec_version (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    spec_key VARCHAR(64) NOT NULL COMMENT '规范标识，同一标识下版本只追加',
+    version INT NOT NULL COMMENT '规范版本号，从 1 开始，新版本必须严格大于已有最大版本',
+    created_by VARCHAR(64) NOT NULL COMMENT '创建人标识，非空',
+    created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_spec_version UNIQUE (spec_key, version)
+);
+
+CREATE TABLE IF NOT EXISTS spec_feature (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    spec_key VARCHAR(64) NOT NULL COMMENT '规范标识',
+    version INT NOT NULL COMMENT '规范版本号',
+    seq INT NOT NULL COMMENT '特性在测量向量中的顺序，从 1 开始',
+    feature_name VARCHAR(64) NOT NULL COMMENT '无量纲合成特性名称，同一版本内唯一',
+    CONSTRAINT uk_spec_feature UNIQUE (spec_key, version, feature_name)
+);
+
+CREATE TABLE IF NOT EXISTS spec_constraint (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为系数行关联键',
+    spec_key VARCHAR(64) NOT NULL COMMENT '规范标识',
+    version INT NOT NULL COMMENT '规范版本号',
+    seq INT NOT NULL COMMENT '约束在规范中的顺序，从 1 开始',
+    upper_bound VARCHAR(64) NOT NULL COMMENT '精确十进制上界原文；等号合格，判断精确不依赖显示舍入'
+);
+
+CREATE TABLE IF NOT EXISTS spec_constraint_coeff (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    constraint_id BIGINT NOT NULL COMMENT '所属约束 spec_constraint.id',
+    feature_seq INT NOT NULL COMMENT '特性顺序，对应 spec_feature.seq，从 1 开始',
+    coefficient INT NOT NULL COMMENT '整数系数，范围 -100～100；单条约束的系数不得全零'
+);
+
+-- 测量向量检验：针对批次提交时绑定的规范版本整体求值；换版后旧向量保留但不再作为放行依据。
+CREATE TABLE IF NOT EXISTS spec_measurement (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键',
+    measurement_key VARCHAR(64) NOT NULL COMMENT '测量幂等键，同一批次内唯一；同内容重放返回原结果，不同内容返回 409',
+    spec_key VARCHAR(64) NOT NULL COMMENT '提交时批次绑定的规范标识',
+    spec_version INT NOT NULL COMMENT '提交时批次绑定的规范版本',
+    outcome VARCHAR(8) NOT NULL COMMENT '检验结论：PASS/FAIL；FAIL 立即使批次 REJECTED',
+    batch_status VARCHAR(32) NOT NULL COMMENT '该测量落定后的批次状态快照，不随后续换版改写',
+    operator VARCHAR(64) NOT NULL COMMENT '提交人标识，非空',
+    vector_json TEXT NOT NULL COMMENT '完整测量向量 JSON 数组，十进制原文，顺序对应特性 seq；各值最多 6 位小数',
+    created_at VARCHAR(40) NOT NULL COMMENT '提交时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_measurement_key UNIQUE (batch_key, measurement_key)
+);
+
+-- 放行冻结：最终批准（RELEASED）时快照完整系数、上界与 PASS 向量，此后规范换版不影响已放行结论。
+CREATE TABLE IF NOT EXISTS release_freeze (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键，一批次仅一条冻结记录',
+    spec_key VARCHAR(64) NOT NULL COMMENT '冻结的规范标识',
+    spec_version INT NOT NULL COMMENT '冻结的规范版本',
+    constraints_json TEXT NOT NULL COMMENT '冻结的完整约束快照：整数系数与精确十进制上界',
+    vector_json TEXT NOT NULL COMMENT '冻结的 PASS 测量向量快照',
+    created_at VARCHAR(40) NOT NULL COMMENT '冻结时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_freeze_batch UNIQUE (batch_key)
 );

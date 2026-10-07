@@ -9,6 +9,8 @@ import java.util.List;
 
 /**
  * 创建批次请求。producedAt 为 ISO-8601 UTC 时间；requiredTests 为 1～5 个必做检验项。
+ * specKey/specVersion 可选，须同时提供或同时缺省；提供时批次绑定该版特性规范，
+ * 放行前必须提交该版本的 PASS 测量向量。
  */
 public record CreateBatchRequest(
         @NotBlank(message = "commandKey 不能为空") String commandKey,
@@ -18,6 +20,8 @@ public record CreateBatchRequest(
         @NotNull(message = "producedAt 不能为空") Instant producedAt,
         @NotNull(message = "requiredTests 不能为空")
         @Size(min = 1, max = 5, message = "requiredTests 必须包含 1～5 个检验项")
-        List<@NotBlank(message = "检验项不能为空") String> requiredTests
+        List<@NotBlank(message = "检验项不能为空") String> requiredTests,
+        String specKey,
+        Integer specVersion
 ) {
 }

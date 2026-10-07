@@ -17,7 +17,7 @@ public record SplitResponse(
 ) {
 
     /**
-     * 拆分产生的子批概要。
+     * 拆分产生的子批概要。specKey/specVersion 继承父批绑定，null 表示父批未绑定规范。
      */
     public record SplitChild(
             String batchKey,
@@ -26,7 +26,9 @@ public record SplitResponse(
             Instant producedAt,
             BatchStatus status,
             List<String> requiredTests,
-            Instant createdAt
+            Instant createdAt,
+            String specKey,
+            Integer specVersion
     ) {
     }
 }

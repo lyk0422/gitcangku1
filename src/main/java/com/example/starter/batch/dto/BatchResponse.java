@@ -7,6 +7,7 @@ import java.util.List;
 
 /**
  * 批次概要响应。producedAt/createdAt 为 UTC instant。
+ * specKey/specVersion 为当前绑定的特性规范版本，null 表示未绑定规范。
  */
 public record BatchResponse(
         String batchKey,
@@ -15,6 +16,8 @@ public record BatchResponse(
         Instant producedAt,
         BatchStatus status,
         List<String> requiredTests,
-        Instant createdAt
+        Instant createdAt,
+        String specKey,
+        Integer specVersion
 ) {
 }
