@@ -19,8 +19,11 @@ final class DtoMapper {
     private DtoMapper() {
     }
 
-    /** 十进制输出：去掉多余尾零，零统一输出 "0"。 */
+    /** 十进制输出：去掉多余尾零，零统一输出 "0"；null 原样返回。 */
     static String format(BigDecimal value) {
+        if (value == null) {
+            return null;
+        }
         BigDecimal stripped = value.stripTrailingZeros();
         if (stripped.compareTo(BigDecimal.ZERO) == 0) {
             return "0";
@@ -34,8 +37,12 @@ final class DtoMapper {
                 cert.instrumentId(),
                 cert.validFrom(),
                 cert.validTo(),
+                cert.mode().name(),
                 format(cert.a()),
                 format(cert.b()),
+                format(cert.c()),
+                format(cert.domainLo()),
+                format(cert.domainHi()),
                 cert.revoked(),
                 cert.revokedAt(),
                 cert.createdAt());
@@ -49,6 +56,7 @@ final class DtoMapper {
                 m.measurementKey(),
                 m.instrumentId(),
                 m.measuredAt(),
+                m.mode().name(),
                 format(m.rawReading()),
                 format(m.lowerLimit()),
                 format(m.upperLimit()),
@@ -57,6 +65,11 @@ final class DtoMapper {
                 format(m.computedValue()),
                 m.displayValue().toPlainString(),
                 m.passed(),
+                m.branch() == null ? null : m.branch().name(),
+                format(m.rootLower()),
+                format(m.rootUpper()),
+                format(m.evalLower()),
+                format(m.evalUpper()),
                 m.status().name(),
                 usable,
                 m.createdAt(),

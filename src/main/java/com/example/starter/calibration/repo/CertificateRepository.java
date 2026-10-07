@@ -14,6 +14,7 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import com.example.starter.calibration.model.Certificate;
+import com.example.starter.calibration.model.CertificateMode;
 
 /**
  * 校准证书持久化。证书创建后不可修改，仅可撤销；
@@ -27,8 +28,12 @@ public class CertificateRepository {
             rs.getString("instrument_id"),
             JdbcTimes.fromDb(rs.getObject("valid_from", LocalDateTime.class)),
             JdbcTimes.fromDb(rs.getObject("valid_to", LocalDateTime.class)),
+            CertificateMode.valueOf(rs.getString("mode")),
             rs.getBigDecimal("coeff_a"),
             rs.getBigDecimal("offset_b"),
+            rs.getBigDecimal("coeff_c"),
+            rs.getBigDecimal("domain_lo"),
+            rs.getBigDecimal("domain_hi"),
             rs.getBoolean("revoked"),
             JdbcTimes.fromDb(rs.getObject("revoked_at", LocalDateTime.class)),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
@@ -54,23 +59,29 @@ public class CertificateRepository {
     }
 
     /**
-     * 插入证书并返回生成的证书 ID。
+     * 插入证书并返回生成的证书 ID。线性模式 c/domainLo/domainHi 传 null。
      */
-    public long insert(String instrumentId, Instant validFrom, Instant validTo,
-                       java.math.BigDecimal a, java.math.BigDecimal b, Instant createdAt) {
+    public long insert(String instrumentId, Instant validFrom, Instant validTo, CertificateMode mode,
+                       java.math.BigDecimal a, java.math.BigDecimal b, java.math.BigDecimal c,
+                       java.math.BigDecimal domainLo, java.math.BigDecimal domainHi, Instant createdAt) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO calibration_certificate "
-                            + "(instrument_id, valid_from, valid_to, coeff_a, offset_b, revoked, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, FALSE, ?)",
+                            + "(instrument_id, valid_from, valid_to, mode, coeff_a, offset_b, coeff_c, "
+                            + "domain_lo, domain_hi, revoked, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, instrumentId);
             ps.setObject(2, JdbcTimes.toDb(validFrom));
             ps.setObject(3, JdbcTimes.toDb(validTo));
-            ps.setBigDecimal(4, a);
-            ps.setBigDecimal(5, b);
-            ps.setObject(6, JdbcTimes.toDb(createdAt));
+            ps.setString(4, mode.name());
+            ps.setBigDecimal(5, a);
+            ps.setBigDecimal(6, b);
+            ps.setBigDecimal(7, c);
+            ps.setBigDecimal(8, domainLo);
+            ps.setBigDecimal(9, domainHi);
+            ps.setObject(10, JdbcTimes.toDb(createdAt));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();

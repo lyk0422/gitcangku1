@@ -12,6 +12,8 @@ import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
+import com.example.starter.calibration.model.Branch;
+import com.example.starter.calibration.model.CertificateMode;
 import com.example.starter.calibration.model.Measurement;
 import com.example.starter.calibration.model.MeasurementStatus;
 
@@ -26,6 +28,7 @@ public class MeasurementRepository {
             rs.getString("measurement_key"),
             rs.getString("instrument_id"),
             JdbcTimes.fromDb(rs.getObject("measured_at", LocalDateTime.class)),
+            CertificateMode.valueOf(rs.getString("mode")),
             rs.getBigDecimal("raw_reading"),
             rs.getBigDecimal("lower_limit"),
             rs.getBigDecimal("upper_limit"),
@@ -33,6 +36,11 @@ public class MeasurementRepository {
             rs.getLong("certificate_id"),
             rs.getBigDecimal("computed_value"),
             rs.getBoolean("passed"),
+            rs.getString("branch") == null ? null : Branch.valueOf(rs.getString("branch")),
+            rs.getBigDecimal("root_lower"),
+            rs.getBigDecimal("root_upper"),
+            rs.getBigDecimal("eval_lower"),
+            rs.getBigDecimal("eval_upper"),
             MeasurementStatus.valueOf(rs.getString("status")),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
 
@@ -50,22 +58,29 @@ public class MeasurementRepository {
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO measurement "
-                            + "(measurement_key, instrument_id, measured_at, raw_reading, lower_limit, upper_limit, "
-                            + "submitted_by, certificate_id, computed_value, passed, status, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            + "(measurement_key, instrument_id, measured_at, mode, raw_reading, lower_limit, "
+                            + "upper_limit, submitted_by, certificate_id, computed_value, passed, branch, "
+                            + "root_lower, root_upper, eval_lower, eval_upper, status, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, measurement.measurementKey());
             ps.setString(2, measurement.instrumentId());
             ps.setObject(3, JdbcTimes.toDb(measurement.measuredAt()));
-            ps.setBigDecimal(4, measurement.rawReading());
-            ps.setBigDecimal(5, measurement.lowerLimit());
-            ps.setBigDecimal(6, measurement.upperLimit());
-            ps.setString(7, measurement.submittedBy());
-            ps.setLong(8, measurement.certificateId());
-            ps.setBigDecimal(9, measurement.computedValue());
-            ps.setBoolean(10, measurement.passed());
-            ps.setString(11, measurement.status().name());
-            ps.setObject(12, JdbcTimes.toDb(measurement.createdAt()));
+            ps.setString(4, measurement.mode().name());
+            ps.setBigDecimal(5, measurement.rawReading());
+            ps.setBigDecimal(6, measurement.lowerLimit());
+            ps.setBigDecimal(7, measurement.upperLimit());
+            ps.setString(8, measurement.submittedBy());
+            ps.setLong(9, measurement.certificateId());
+            ps.setBigDecimal(10, measurement.computedValue());
+            ps.setBoolean(11, measurement.passed());
+            ps.setString(12, measurement.branch() == null ? null : measurement.branch().name());
+            ps.setBigDecimal(13, measurement.rootLower());
+            ps.setBigDecimal(14, measurement.rootUpper());
+            ps.setBigDecimal(15, measurement.evalLower());
+            ps.setBigDecimal(16, measurement.evalUpper());
+            ps.setString(17, measurement.status().name());
+            ps.setObject(18, JdbcTimes.toDb(measurement.createdAt()));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
