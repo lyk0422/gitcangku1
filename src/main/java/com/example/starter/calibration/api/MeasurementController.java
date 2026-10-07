@@ -3,6 +3,7 @@ package com.example.starter.calibration.api;
 import java.util.List;
 
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -16,7 +17,9 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.calibration.api.dto.MeasurementResponse;
 import com.example.starter.calibration.api.dto.ReleaseRequest;
 import com.example.starter.calibration.api.dto.ReleaseResponse;
+import com.example.starter.calibration.api.dto.SubmitInverseMeasurementRequest;
 import com.example.starter.calibration.api.dto.SubmitMeasurementRequest;
+import com.example.starter.calibration.service.IdemOutcome;
 import com.example.starter.calibration.service.MeasurementService;
 import com.example.starter.calibration.service.ReleaseService;
 
@@ -41,6 +44,18 @@ public class MeasurementController {
     @PostMapping
     public ResponseEntity<MeasurementResponse> submit(@RequestBody SubmitMeasurementRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(measurements.submit(request));
+    }
+
+    /**
+     * 提交二次反解测量（幂等）：201；参数非法 400；测量键重复或改参 409；
+     * 无匹配有效证书或信号不在端点函数值之间 422。requestId 重放返回首次完整响应。
+     */
+    @PostMapping("/inverse")
+    public ResponseEntity<String> submitInverse(@RequestBody SubmitInverseMeasurementRequest request) {
+        IdemOutcome outcome = measurements.submitInverse(request);
+        return ResponseEntity.status(outcome.status())
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(outcome.body());
     }
 
     /**

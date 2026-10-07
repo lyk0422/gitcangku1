@@ -30,6 +30,11 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.BAD_REQUEST, "BAD_REQUEST", message);
     }
 
+    /** 400：参数非法（自定义业务错误码，如 NON_MONOTONE_CERTIFICATE）。 */
+    public static ApiException badRequest(String code, String message) {
+        return new ApiException(HttpStatus.BAD_REQUEST, code, message);
+    }
+
     /** 404：资源不存在。 */
     public static ApiException notFound(String message) {
         return new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", message);
@@ -43,5 +48,10 @@ public class ApiException extends RuntimeException {
     /** 422：测量时刻无匹配的有效证书。 */
     public static ApiException unprocessable(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, "NO_MATCHING_CERTIFICATE", message);
+    }
+
+    /** 422：业务规则不满足（自定义业务错误码，如 SIGNAL_OUT_OF_RANGE）。 */
+    public static ApiException unprocessable(String code, String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, code, message);
     }
 }

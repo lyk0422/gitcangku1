@@ -1,11 +1,13 @@
 spring:
   application:
     name: gitcangku1
-  config:
-    import: "optional:configtree:/run/secrets/"
   datasource:
-    url: ${DB_URL}
-    username: ${DB_USER}
+    # 默认使用 H2 内存库（MySQL 兼容模式），随 JVM 退出释放，不依赖外部数据库；
+    # DB_CLOSE_DELAY=-1 保证同 JVM 内状态保留（替代旧跨进程恢复）。
+    url: jdbc:h2:mem:calibration;MODE=MySQL;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1

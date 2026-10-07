@@ -34,6 +34,10 @@ public class MeasurementRepository {
             rs.getBigDecimal("computed_value"),
             rs.getBoolean("passed"),
             MeasurementStatus.valueOf(rs.getString("status")),
+            rs.getBigDecimal("eval_lo"),
+            rs.getBigDecimal("eval_hi"),
+            rs.getBigDecimal("root_lower"),
+            rs.getBigDecimal("root_upper"),
             JdbcTimes.fromDb(rs.getObject("created_at", LocalDateTime.class)));
 
     private final JdbcTemplate jdbc;
@@ -51,8 +55,9 @@ public class MeasurementRepository {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO measurement "
                             + "(measurement_key, instrument_id, measured_at, raw_reading, lower_limit, upper_limit, "
-                            + "submitted_by, certificate_id, computed_value, passed, status, created_at) "
-                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            + "submitted_by, certificate_id, computed_value, passed, status, "
+                            + "eval_lo, eval_hi, root_lower, root_upper, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     Statement.RETURN_GENERATED_KEYS);
             ps.setString(1, measurement.measurementKey());
             ps.setString(2, measurement.instrumentId());
@@ -65,7 +70,11 @@ public class MeasurementRepository {
             ps.setBigDecimal(9, measurement.computedValue());
             ps.setBoolean(10, measurement.passed());
             ps.setString(11, measurement.status().name());
-            ps.setObject(12, JdbcTimes.toDb(measurement.createdAt()));
+            ps.setBigDecimal(12, measurement.evalLo());
+            ps.setBigDecimal(13, measurement.evalHi());
+            ps.setBigDecimal(14, measurement.rootLower());
+            ps.setBigDecimal(15, measurement.rootUpper());
+            ps.setObject(16, JdbcTimes.toDb(measurement.createdAt()));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
