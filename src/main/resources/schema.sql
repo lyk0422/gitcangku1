@@ -63,6 +63,19 @@ CREATE TABLE IF NOT EXISTS release_resume_record (
   PRIMARY KEY (id)
 ) COMMENT='发布单人工恢复记录，历史不可改';
 
+CREATE TABLE IF NOT EXISTS task_lease (
+  task_id BIGINT NOT NULL COMMENT '任务ID，与 rollout_task 一一对应；无租约行表示尚未进入租约模式的既有任务',
+  current_token INT NOT NULL COMMENT '当前租约令牌序号，从1开始，每次到期被接管时加一',
+  current_agent_id VARCHAR(64) NOT NULL COMMENT '当前持有代理ID（非空）；有效期内其他代理不能抢占',
+  expires_at_utc VARCHAR(40) NOT NULL COMMENT '当前租约到期时刻，UTC，ISO-8601格式；有效期左闭右开，到达该时刻即失效',
+  terminal TINYINT NOT NULL DEFAULT 0 COMMENT '任务是否已一次终结：0否，1是（SUCCESS/FAILED）；终结后不可再领取或续租',
+  terminal_agent_id VARCHAR(64) NULL COMMENT '首次终结回执的实际代理ID，终结时冻结，未终结为NULL',
+  terminal_token INT NULL COMMENT '首次终结回执实际使用的令牌，终结时冻结，未终结为NULL',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '首次领取时间',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近接管或续租时间',
+  PRIMARY KEY (task_id)
+) COMMENT='任务执行租约：代理显式领取后凭 agentId 与 token 写回安装结果';
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
   request_id VARCHAR(64) NOT NULL COMMENT '全局唯一请求ID',
   api VARCHAR(64) NOT NULL COMMENT '接口标识',
