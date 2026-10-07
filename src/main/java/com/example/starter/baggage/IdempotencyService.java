@@ -1,14 +1,18 @@
 package com.example.starter.baggage;
 
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.Supplier;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -50,7 +54,7 @@ public class IdempotencyService {
      */
     public <T> T execute(String requestId, String operation, int successStatus,
                          Object payload, Class<T> resultType, Supplier<T> action) {
-        String hash = sha256(writeJson(payload));
+        String hash = sha256(operation + "\n" + canonicalJson(payload));
         Object lock = locks.computeIfAbsent(requestId, key -> new Object());
         synchronized (lock) {
             try {
@@ -105,6 +109,50 @@ public class IdempotencyService {
             return objectMapper.writeValueAsString(value);
         } catch (Exception ex) {
             throw new IllegalArgumentException("请求参数无法序列化", ex);
+        }
+    }
+
+    /**
+     * 结构化规范化摘要：对象键排序、数组保序、十进制按值（1 与 1.0 相同）、文本原样，
+     * 避免不同结构的参数序列化后碰撞。
+     */
+    private String canonicalJson(Object payload) {
+        StringBuilder out = new StringBuilder();
+        writeCanonical(objectMapper.valueToTree(payload), out);
+        return out.toString();
+    }
+
+    private void writeCanonical(JsonNode node, StringBuilder out) {
+        if (node == null || node.isNull()) {
+            out.append("null");
+        } else if (node.isObject()) {
+            List<String> names = new ArrayList<>();
+            node.fieldNames().forEachRemaining(names::add);
+            Collections.sort(names);
+            out.append('{');
+            for (int i = 0; i < names.size(); i++) {
+                if (i > 0) {
+                    out.append(',');
+                }
+                out.append(writeJson(names.get(i))).append(':');
+                writeCanonical(node.get(names.get(i)), out);
+            }
+            out.append('}');
+        } else if (node.isArray()) {
+            out.append('[');
+            for (int i = 0; i < node.size(); i++) {
+                if (i > 0) {
+                    out.append(',');
+                }
+                writeCanonical(node.get(i), out);
+            }
+            out.append(']');
+        } else if (node.isNumber()) {
+            out.append(new BigDecimal(node.asText()).stripTrailingZeros().toPlainString());
+        } else if (node.isTextual()) {
+            out.append(writeJson(node.asText()));
+        } else {
+            out.append(node.asText());
         }
     }
 

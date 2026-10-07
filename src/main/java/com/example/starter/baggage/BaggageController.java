@@ -25,6 +25,8 @@ import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
 import com.example.starter.baggage.BaggageDtos.RegisterLegRequest;
+import com.example.starter.baggage.BaggageDtos.RetagRequest;
+import com.example.starter.baggage.BaggageDtos.RetagResponse;
 import com.example.starter.baggage.BaggageDtos.SealRequest;
 import com.example.starter.baggage.BaggageDtos.SealResponse;
 import com.example.starter.baggage.BaggageDtos.ShortListResponse;
@@ -85,7 +87,13 @@ public class BaggageController {
         return baggageService.recover(request);
     }
 
-    /** 行李完整轨迹查询。 */
+    /** 换标：未装舱、非短卸、未交付时以全局未用新标签替换当前标签，代次加一，旧标签永久保留别名。 */
+    @PostMapping("/bags/retag")
+    public RetagResponse retag(@Valid @RequestBody RetagRequest request) {
+        return baggageService.retag(request);
+    }
+
+    /** 行李完整轨迹查询：接受任一历史标签，返回稳定 ID、当前标签与代次。 */
     @GetMapping("/bags/{bagTag}/trace")
     public BagResponse getBagTrace(@PathVariable String bagTag) {
         return baggageService.getBagTrace(bagTag);

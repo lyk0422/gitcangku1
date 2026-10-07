@@ -67,6 +67,7 @@ class BaggageShortUnloadTest {
         jdbcTemplate.update("DELETE FROM bag_event");
         jdbcTemplate.update("DELETE FROM load_record");
         jdbcTemplate.update("DELETE FROM bag_itinerary");
+        jdbcTemplate.update("DELETE FROM bag_tag_alias");
         jdbcTemplate.update("DELETE FROM bag");
         jdbcTemplate.update("DELETE FROM leg");
         jdbcTemplate.update("DELETE FROM request_log");
