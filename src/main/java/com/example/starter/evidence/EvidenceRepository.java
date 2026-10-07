@@ -77,6 +77,19 @@ public class EvidenceRepository {
     }
 
     /**
+     * 将证物标记为 CONTAMINATED（污染隔离）。SEAL_BROKEN 为既有终态，保留不覆盖，
+     * 污染状态与封条异常分别保存；其余状态（含 TRANSFER_PENDING/BORROWED）一律冻结为隔离。
+     *
+     * @return 实际置为 CONTAMINATED 的行数（0 表示该证物为 SEAL_BROKEN 终态）
+     */
+    public int markContaminated(String evidenceKey, LocalDateTime nowUtc) {
+        return jdbc.update(
+                "UPDATE evidence SET status = ?, updated_at = ? WHERE evidence_key = ? AND status <> ?",
+                EvidenceStatus.CONTAMINATED.name(), nowUtc, evidenceKey,
+                EvidenceStatus.SEAL_BROKEN.name());
+    }
+
+    /**
      * 查询指定保管人当前可交接的证物（本人保管且状态 SEALED）。
      */
     public List<Evidence> findTransferable(String custodianId) {

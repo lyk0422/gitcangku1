@@ -104,6 +104,7 @@ public class EvidenceService {
             throw ApiException.badRequest("接收人不能与发起保管人相同");
         }
         requireSealIntact(evidence);
+        requireNotContaminated(evidence, "交接相关操作");
         requireCustodian(evidence, actorId);
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("证物已存在待接收交接: " + evidenceKey);
@@ -241,6 +242,7 @@ public class EvidenceService {
         if (evidence.status() == EvidenceStatus.SEAL_BROKEN) {
             throw ApiException.unprocessable("封条已异常，禁止借出: " + evidenceKey);
         }
+        requireNotContaminated(evidence, "借出");
         if (evidence.status() == EvidenceStatus.TRANSFER_PENDING) {
             throw ApiException.conflict("待接收交接期间禁止借出: " + evidenceKey);
         }
@@ -359,6 +361,13 @@ public class EvidenceService {
     private void requireSealIntact(Evidence evidence) {
         if (evidence.status() == EvidenceStatus.SEAL_BROKEN) {
             throw ApiException.unprocessable("封条已异常，禁止交接相关操作: " + evidence.evidenceKey());
+        }
+    }
+
+    private void requireNotContaminated(Evidence evidence, String action) {
+        if (evidence.status() == EvidenceStatus.CONTAMINATED) {
+            throw ApiException.unprocessable(
+                    "证物已污染隔离，禁止" + action + ": " + evidence.evidenceKey());
         }
     }
 
