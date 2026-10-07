@@ -1,6 +1,9 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.CoordinationGroupRequest;
+import com.example.starter.api.dto.CoordinationGroupResponse;
+import com.example.starter.api.dto.CoordinationHitResponse;
 import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.DependencyView;
 import com.example.starter.api.dto.LockEntryResponse;
@@ -8,11 +11,15 @@ import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
 import com.example.starter.api.dto.RegisterArtifactRequest;
 import com.example.starter.domain.ArtifactVersion;
+import com.example.starter.domain.CoordinationGroup;
+import com.example.starter.domain.CoordinationTuples;
 import com.example.starter.domain.DependencyRange;
 import com.example.starter.domain.LockResolver;
 import com.example.starter.domain.RepositorySnapshot;
 import com.example.starter.repo.RepositoryDao;
+import com.example.starter.repo.RepositoryDao.CoordinationGroupRow;
 import com.example.starter.repo.RepositoryDao.IdempotentRecord;
+import com.example.starter.repo.RepositoryDao.LockCoordinationHitRow;
 import com.example.starter.repo.RepositoryDao.LockEntryRow;
 import com.example.starter.repo.RepositoryDao.LockFileRow;
 import com.example.starter.support.ApiException;
@@ -27,6 +34,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -45,10 +53,12 @@ public class ArtifactServiceImpl implements ArtifactService {
 
     private static final int MAX_NAMES = 20;
     private static final int MAX_VERSIONS_PER_NAME = 5;
+    private static final int MAX_COORDINATION_GROUPS = 3;
 
     private static final String OP_REGISTER = "REGISTER_ARTIFACT";
     private static final String OP_WITHDRAW = "WITHDRAW_ARTIFACT";
     private static final String OP_LOCK = "CREATE_LOCK";
+    private static final String OP_REGISTER_GROUP = "REGISTER_COORDINATION_GROUP";
 
     private final RepositoryDao repositoryDao;
     private final TransactionTemplate transactionTemplate;
@@ -102,7 +112,8 @@ public class ArtifactServiceImpl implements ArtifactService {
     public List<LockFileResponse> listLocks() {
         List<LockFileResponse> result = new ArrayList<>();
         for (LockFileRow row : repositoryDao.listLockFiles()) {
-            result.add(toLockResponse(row, repositoryDao.listLockEntries(row.id())));
+            result.add(toLockResponse(row, repositoryDao.listLockEntries(row.id()),
+                    repositoryDao.listLockCoordinationHits(row.id())));
         }
         return result;
     }
@@ -113,7 +124,18 @@ public class ArtifactServiceImpl implements ArtifactService {
         if (row == null) {
             throw ApiException.notFound("锁文件不存在: " + id);
         }
-        return toLockResponse(row, repositoryDao.listLockEntries(id));
+        return toLockResponse(row, repositoryDao.listLockEntries(id),
+                repositoryDao.listLockCoordinationHits(id));
+    }
+
+    @Override
+    public CoordinationGroupResponse registerCoordinationGroup(String requestId,
+                                                               CoordinationGroupRequest request) {
+        requireRequestId(requestId);
+        validateCoordinationGroupRequest(request);
+        String hash = coordinationGroupHash(request);
+        return executeIdempotent(requestId, OP_REGISTER_GROUP, hash, 201,
+                () -> doRegisterCoordinationGroup(request), CoordinationGroupResponse.class);
     }
 
     // ------------------------------------------------------------------
@@ -200,7 +222,42 @@ public class ArtifactServiceImpl implements ArtifactService {
 
         List<LockEntryResponse> entries = new ArrayList<>();
         solution.forEach((n, v) -> entries.add(new LockEntryResponse(n, v)));
-        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now, entries);
+        List<CoordinationHitResponse> hits =
+                freezeCoordinationHits(lockFileId, snapshot.coordinationGroups(), solution);
+        return new LockFileResponse(lockFileId, rootName, rootVersion, currentVersion, now,
+                entries, hits);
+    }
+
+    /**
+     * 冻结本次锁定命中的协调组依据：锁图中含某组至少 2 名成员时，
+     * 记录该组当前修订号、允许元组全集与命中元组；解析器已保证必有命中元组。
+     */
+    private List<CoordinationHitResponse> freezeCoordinationHits(
+            long lockFileId, List<CoordinationGroup> groups, Map<String, Integer> solution) {
+        List<CoordinationHitResponse> hits = new ArrayList<>();
+        for (CoordinationGroup group : groups) {
+            Map<String, Integer> chosenInGroup = new TreeMap<>();
+            for (String member : group.members()) {
+                Integer version = solution.get(member);
+                if (version != null) {
+                    chosenInGroup.put(member, version);
+                }
+            }
+            if (chosenInGroup.size() < 2) {
+                continue;
+            }
+            Map<String, Integer> matched = LockResolver.matchedTuple(group, chosenInGroup);
+            if (matched == null) {
+                // 解析结果必然满足投影约束，此处为防御性检查。
+                throw new IllegalStateException("锁定结果未命中协调组 " + group.name() + " 的任何允许元组");
+            }
+            repositoryDao.insertLockCoordinationHit(lockFileId, group.name(), group.revision(),
+                    CoordinationTuples.canonicalTuple(matched),
+                    CoordinationTuples.canonicalTuples(group.allowedTuples()));
+            hits.add(new CoordinationHitResponse(group.name(), group.revision(),
+                    new TreeMap<>(matched), group.allowedTuples()));
+        }
+        return List.copyOf(hits);
     }
 
     // ------------------------------------------------------------------
@@ -317,12 +374,18 @@ public class ArtifactServiceImpl implements ArtifactService {
         return List.copyOf(sorted.values());
     }
 
-    private LockFileResponse toLockResponse(LockFileRow row, List<LockEntryRow> entries) {
+    private LockFileResponse toLockResponse(LockFileRow row, List<LockEntryRow> entries,
+                                            List<LockCoordinationHitRow> hitRows) {
         List<LockEntryResponse> entryViews = entries.stream()
                 .map(e -> new LockEntryResponse(e.name(), e.version()))
                 .toList();
+        List<CoordinationHitResponse> hits = hitRows.stream()
+                .map(h -> new CoordinationHitResponse(h.groupName(), h.groupRevision(),
+                        CoordinationTuples.parseTuple(h.matchedTuple()),
+                        CoordinationTuples.parseTuples(h.allowedTuples())))
+                .toList();
         return new LockFileResponse(row.id(), row.rootName(), row.rootVersion(),
-                row.repositoryVersion(), row.createdAt(), entryViews);
+                row.repositoryVersion(), row.createdAt(), entryViews, hits);
     }
 
     private void requireRequestId(String requestId) {
@@ -360,5 +423,163 @@ public class ArtifactServiceImpl implements ArtifactService {
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException(e);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 协调组登记/修订
+    // ------------------------------------------------------------------
+
+    /**
+     * 登记或修订协调组（运行在已加行锁的写事务内）：
+     * 同一仓库版本视图下校验期望版本、元组引用存在性，再整体替换组规则并推进仓库版本。
+     */
+    private CoordinationGroupResponse doRegisterCoordinationGroup(CoordinationGroupRequest request) {
+        long currentVersion = repositoryDao.lockRepositoryState();
+        if (currentVersion != request.expectedRepositoryVersion()) {
+            throw ApiException.conflict("仓库版本不匹配：expected="
+                    + request.expectedRepositoryVersion() + ", actual=" + currentVersion);
+        }
+
+        String groupName = request.groupName().trim();
+        List<String> members = sortedMembers(request);
+        List<Map<String, Integer>> tuples = canonicalGroupTuples(request);
+
+        // 允许元组引用的制品版本必须已登记（撤回版本可保留在历史元组中）。
+        for (Map<String, Integer> tuple : tuples) {
+            for (Map.Entry<String, Integer> entry : tuple.entrySet()) {
+                if (!repositoryDao.artifactExists(entry.getKey(), entry.getValue())) {
+                    throw ApiException.notFound("允许元组引用的制品版本不存在: "
+                            + entry.getKey() + ":" + entry.getValue());
+                }
+            }
+        }
+
+        Instant now = Instant.now(clock);
+        CoordinationGroupRow existing = repositoryDao.findCoordinationGroup(groupName);
+        long groupId;
+        int revision;
+        if (existing == null) {
+            if (repositoryDao.countCoordinationGroups() >= MAX_COORDINATION_GROUPS) {
+                throw ApiException.unprocessable(
+                        "协调组数量已达上限 " + MAX_COORDINATION_GROUPS);
+            }
+            groupId = repositoryDao.insertCoordinationGroup(groupName, now);
+            revision = 1;
+        } else {
+            groupId = existing.id();
+            revision = existing.revision() + 1;
+            repositoryDao.reviseCoordinationGroup(groupId, revision, now);
+            repositoryDao.deleteGroupMembersAndTuples(groupId);
+        }
+        for (String member : members) {
+            repositoryDao.insertGroupMember(groupId, member);
+        }
+        int tupleNo = 1;
+        for (Map<String, Integer> tuple : tuples) {
+            for (Map.Entry<String, Integer> entry : tuple.entrySet()) {
+                repositoryDao.insertGroupTuple(groupId, tupleNo, entry.getKey(), entry.getValue());
+            }
+            tupleNo++;
+        }
+        long repositoryVersion = repositoryDao.incrementRepositoryVersion();
+        return new CoordinationGroupResponse(groupName, revision, repositoryVersion,
+                members, tuples, now);
+    }
+
+    /**
+     * 协调组请求校验：成员 2 至 4 个不同制品名，允许元组 1 至 5 条、
+     * 每条完整覆盖全部成员且不重复。
+     */
+    private void validateCoordinationGroupRequest(CoordinationGroupRequest request) {
+        if (request.groupName() == null || request.groupName().isBlank()) {
+            throw ApiException.badRequest("groupName 不能为空");
+        }
+        if (request.operator() == null || request.operator().isBlank()) {
+            throw ApiException.badRequest("operator 不能为空");
+        }
+        List<String> rawMembers = request.members();
+        if (rawMembers == null || rawMembers.size() < 2 || rawMembers.size() > 4) {
+            throw ApiException.badRequest("协调组成员数量须为 2 至 4");
+        }
+        Set<String> memberSet = new HashSet<>();
+        for (String raw : rawMembers) {
+            if (raw == null || raw.isBlank()) {
+                throw ApiException.badRequest("成员名称不能为空");
+            }
+            String name = raw.trim();
+            if (name.chars().anyMatch(c -> c == ',' || c == ';' || c == '=')) {
+                throw ApiException.badRequest("成员名称不能包含 , ; = 字符: " + name);
+            }
+            if (!memberSet.add(name)) {
+                throw ApiException.badRequest("成员名称重复: " + name);
+            }
+        }
+        List<Map<String, Integer>> rawTuples = request.allowedTuples();
+        if (rawTuples == null || rawTuples.isEmpty() || rawTuples.size() > 5) {
+            throw ApiException.badRequest("允许元组数量须为 1 至 5");
+        }
+        Set<String> seenTuples = new HashSet<>();
+        for (Map<String, Integer> tuple : rawTuples) {
+            if (tuple == null) {
+                throw ApiException.badRequest("允许元组不能为 null");
+            }
+            Map<String, Integer> normalized = new TreeMap<>();
+            for (Map.Entry<String, Integer> entry : tuple.entrySet()) {
+                if (entry.getKey() == null || entry.getKey().isBlank()) {
+                    throw ApiException.badRequest("允许元组的成员名称不能为空");
+                }
+                if (entry.getValue() == null || entry.getValue() < 1) {
+                    throw ApiException.badRequest("允许元组的版本必须为正整数");
+                }
+                normalized.put(entry.getKey().trim(), entry.getValue());
+            }
+            if (!normalized.keySet().equals(memberSet)) {
+                throw ApiException.badRequest("每条允许元组必须完整列出全部成员版本");
+            }
+            if (!seenTuples.add(CoordinationTuples.canonicalTuple(normalized))) {
+                throw ApiException.badRequest("允许元组重复: "
+                        + CoordinationTuples.canonicalTuple(normalized));
+            }
+        }
+    }
+
+    /** 成员名称去空白并升序，换序书写视为同参。 */
+    private static List<String> sortedMembers(CoordinationGroupRequest request) {
+        return request.members().stream().map(String::trim).sorted().toList();
+    }
+
+    /** 允许元组规范化：成员键去空白、组内按键升序、元组间按规范化文本升序，换序书写视为同参。 */
+    private static List<Map<String, Integer>> canonicalGroupTuples(CoordinationGroupRequest request) {
+        return request.allowedTuples().stream()
+                .map(tuple -> {
+                    Map<String, Integer> normalized = new TreeMap<>();
+                    tuple.forEach((name, version) -> normalized.put(name.trim(), version));
+                    return normalized;
+                })
+                .sorted(Comparator.comparing(CoordinationTuples::canonicalTuple))
+                .toList();
+    }
+
+    /**
+     * 协调组幂等身份：操作、非空操作者、组名、规范化成员与元组、期望仓库版本，
+     * 长度前缀结构化拼接防碰撞；版本按十进制值、文本原样。
+     */
+    private static String coordinationGroupHash(CoordinationGroupRequest request) {
+        StringBuilder sb = new StringBuilder();
+        appendHashPart(sb, OP_REGISTER_GROUP);
+        appendHashPart(sb, request.operator().trim());
+        appendHashPart(sb, request.groupName().trim());
+        for (String member : sortedMembers(request)) {
+            appendHashPart(sb, member);
+        }
+        for (Map<String, Integer> tuple : canonicalGroupTuples(request)) {
+            appendHashPart(sb, CoordinationTuples.canonicalTuple(tuple));
+        }
+        appendHashPart(sb, String.valueOf(request.expectedRepositoryVersion()));
+        return sha256(sb.toString());
+    }
+
+    private static void appendHashPart(StringBuilder sb, String part) {
+        sb.append(part.length()).append(':').append(part).append('\n');
     }
 }

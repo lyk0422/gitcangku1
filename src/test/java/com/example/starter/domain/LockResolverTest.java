@@ -183,4 +183,86 @@ class LockResolverTest {
         assertThat(result).isNotNull();
         assertThat(result.keySet()).containsExactly("alib", "root", "zlib");
     }
+
+    // ------------------------------------------------------------------
+    // 协调组约束
+    // ------------------------------------------------------------------
+
+    private static RepositorySnapshot withGroups(RepositorySnapshot base,
+                                                 CoordinationGroup... groups) {
+        return new RepositorySnapshot(base.repositoryVersion(), base.artifacts(),
+                List.of(groups));
+    }
+
+    @SafeVarargs
+    private static CoordinationGroup group(String name, List<String> members,
+                                           Map<String, Integer>... tuples) {
+        return new CoordinationGroup(name, 1, members, List.of(tuples));
+    }
+
+    @Test
+    void coordinationGroupForcesBacktrackingToMatchingTuple() {
+        // 合成场景：允许 (x1,y2) 与 (x2,y1)；根固定 y2，x 范围 1..2。
+        // 贪心取 x2 与 y2 不在同一元组，必须回退到 x1；也不能强制两者同号。
+        RepositorySnapshot base = snapshot(0,
+                "y", List.of(v(2, dep("x", 1, 2)), v(1)),
+                "x", List.of(v(2), v(1)));
+        RepositorySnapshot s = withGroups(base,
+                group("g", List.of("x", "y"),
+                        Map.of("x", 1, "y", 2), Map.of("x", 2, "y", 1)));
+
+        assertThat(LockResolver.resolve(s, "y", 2))
+                .isEqualTo(Map.of("x", 1, "y", 2));
+    }
+
+    @Test
+    void coordinationConstraintAppliesOnlyWhenTwoMembersLocked() {
+        // 锁图只含组内一名成员时不产生约束，也不把其余成员拉入锁图。
+        RepositorySnapshot base = snapshot(0,
+                "app", List.of(v(1, dep("a", 1, 2))),
+                "a", List.of(v(2), v(1)));
+        RepositorySnapshot s = withGroups(base,
+                group("g", List.of("a", "b"), Map.of("a", 1, "b", 1)));
+
+        assertThat(LockResolver.resolve(s, "app", 1))
+                .isEqualTo(Map.of("app", 1, "a", 2));
+    }
+
+    @Test
+    void coordinationMismatchAcrossAllCandidatesIsInfeasible() {
+        // 允许元组只有 (x1,y1)；根固定 y2 -> x[1,1]，(x1,y2) 无匹配元组。
+        RepositorySnapshot base = snapshot(0,
+                "y", List.of(v(2, dep("x", 1, 1)), v(1)),
+                "x", List.of(v(1)));
+        RepositorySnapshot s = withGroups(base,
+                group("g", List.of("x", "y"), Map.of("x", 1, "y", 1)));
+
+        assertThat(LockResolver.resolve(s, "y", 2)).isNull();
+    }
+
+    @Test
+    void withdrawnVersionInTupleCannotBeSelected() {
+        // 元组 (x2,y1) 中 x2 已撤回：新锁不能选它，应回退到匹配 (x1,y1) 的 x1。
+        RepositorySnapshot base = snapshot(0,
+                "y", List.of(v(1, dep("x", 1, 2))),
+                "x", List.of(w(2), v(1)));
+        RepositorySnapshot s = withGroups(base,
+                group("g", List.of("x", "y"),
+                        Map.of("x", 2, "y", 1), Map.of("x", 1, "y", 1)));
+
+        assertThat(LockResolver.resolve(s, "y", 1))
+                .isEqualTo(Map.of("x", 1, "y", 1));
+    }
+
+    @Test
+    void matchedTupleFindsProjectionOrNull() {
+        CoordinationGroup g = group("g", List.of("x", "y"),
+                Map.of("x", 1, "y", 2), Map.of("x", 2, "y", 1));
+        assertThat(LockResolver.matchedTuple(g, Map.of("x", 1, "y", 2)))
+                .isEqualTo(Map.of("x", 1, "y", 2));
+        // 投影只需覆盖部分成员。
+        assertThat(LockResolver.matchedTuple(g, Map.of("x", 2)))
+                .isEqualTo(Map.of("x", 2, "y", 1));
+        assertThat(LockResolver.matchedTuple(g, Map.of("x", 1, "y", 1))).isNull();
+    }
 }

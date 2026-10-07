@@ -71,6 +71,65 @@ COMMENT ON COLUMN lock_file_entry.version IS '被锁定的精确版本号，正�
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_entry_lock_name ON lock_file_entry (lock_file_id, name);
 
+CREATE TABLE IF NOT EXISTS coordination_group (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name       VARCHAR(128) NOT NULL,
+    revision   INT          NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL
+);
+COMMENT ON TABLE coordination_group IS '协调组：必须按厂商验证组合一起发行的制品集合，全仓库最多 3 组';
+COMMENT ON COLUMN coordination_group.name IS '协调组名称，全仓库唯一';
+COMMENT ON COLUMN coordination_group.revision IS '组内修订号，从 1 开始，每次修订加一';
+COMMENT ON COLUMN coordination_group.updated_at IS '最近一次登记或修订时间，UTC 时间戳';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_coordination_group_name ON coordination_group (name);
+
+CREATE TABLE IF NOT EXISTS coordination_group_member (
+    id       BIGINT AUTO_INCREMENT PRIMARY KEY,
+    group_id BIGINT       NOT NULL,
+    name     VARCHAR(128) NOT NULL,
+    CONSTRAINT fk_member_group FOREIGN KEY (group_id) REFERENCES coordination_group (id)
+);
+COMMENT ON TABLE coordination_group_member IS '协调组当前成员，每组 2 至 4 个不同制品名，修订时整体替换';
+COMMENT ON COLUMN coordination_group_member.group_id IS '所属协调组 ID';
+COMMENT ON COLUMN coordination_group_member.name IS '成员制品名称';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_member_group_name ON coordination_group_member (group_id, name);
+
+CREATE TABLE IF NOT EXISTS coordination_group_tuple (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    group_id    BIGINT       NOT NULL,
+    tuple_no    INT          NOT NULL,
+    member_name VARCHAR(128) NOT NULL,
+    version     INT          NOT NULL,
+    CONSTRAINT fk_tuple_group FOREIGN KEY (group_id) REFERENCES coordination_group (id)
+);
+COMMENT ON TABLE coordination_group_tuple IS '协调组当前允许版本元组，每组 1 至 5 条，每条完整列出全部成员版本';
+COMMENT ON COLUMN coordination_group_tuple.group_id IS '所属协调组 ID';
+COMMENT ON COLUMN coordination_group_tuple.tuple_no IS '元组序号（组内从 1 开始，仅用于存储标识，无顺序语义）';
+COMMENT ON COLUMN coordination_group_tuple.member_name IS '元组覆盖的成员制品名称，每条元组覆盖全部成员';
+COMMENT ON COLUMN coordination_group_tuple.version IS '该成员在元组中的允许版本号，正整数；撤回版本可保留但新锁不可选';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_tuple_group_no_member ON coordination_group_tuple (group_id, tuple_no, member_name);
+
+CREATE TABLE IF NOT EXISTS lock_coordination_hit (
+    id             BIGINT AUTO_INCREMENT PRIMARY KEY,
+    lock_file_id   BIGINT        NOT NULL,
+    group_name     VARCHAR(128)  NOT NULL,
+    group_revision INT           NOT NULL,
+    matched_tuple  VARCHAR(1024) NOT NULL,
+    allowed_tuples CHARACTER LARGE OBJECT NOT NULL,
+    CONSTRAINT fk_hit_lock FOREIGN KEY (lock_file_id) REFERENCES lock_file (id)
+);
+COMMENT ON TABLE lock_coordination_hit IS '锁文件命中的协调组依据：冻结锁定时的组修订、允许元组全集与命中元组，后续删改元组不影响历史锁';
+COMMENT ON COLUMN lock_coordination_hit.lock_file_id IS '所属锁文件 ID';
+COMMENT ON COLUMN lock_coordination_hit.group_name IS '命中的协调组名称（锁图中含该组至少 2 名成员）';
+COMMENT ON COLUMN lock_coordination_hit.group_revision IS '锁定时该组的修订号';
+COMMENT ON COLUMN lock_coordination_hit.matched_tuple IS '命中的允许元组，规范化文本：name=version 按名称升序逗号连接';
+COMMENT ON COLUMN lock_coordination_hit.allowed_tuples IS '锁定时该组全部允许元组的规范化快照，分号分隔';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_hit_lock_group ON lock_coordination_hit (lock_file_id, group_name);
+
 CREATE TABLE IF NOT EXISTS idempotent_request (
     request_id     VARCHAR(64)  NOT NULL PRIMARY KEY,
     operation      VARCHAR(32)  NOT NULL,
@@ -81,7 +140,7 @@ CREATE TABLE IF NOT EXISTS idempotent_request (
 );
 COMMENT ON TABLE idempotent_request IS '写操作幂等记录，仅保存成功请求；失败不占键';
 COMMENT ON COLUMN idempotent_request.request_id IS '客户端提供的全局唯一请求 ID';
-COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK';
+COMMENT ON COLUMN idempotent_request.operation IS '操作类型：REGISTER_ARTIFACT/WITHDRAW_ARTIFACT/CREATE_LOCK/REGISTER_COORDINATION_GROUP';
 COMMENT ON COLUMN idempotent_request.request_hash IS '规范化请求参数的 SHA-256 摘要，异参重放用于冲突判定';
 COMMENT ON COLUMN idempotent_request.http_status IS '原成功响应 HTTP 状态码';
 COMMENT ON COLUMN idempotent_request.response_json IS '原成功响应 JSON，重放时原样返回';

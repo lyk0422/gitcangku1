@@ -10,6 +10,10 @@ import java.util.TreeMap;
  * <p>规则：根版本固定；其余名称按字典序选择下一个尚未解析的依赖，
  * 候选版本从高到低尝试，遇冲突回退，取首个完整可行结果。
  * 已选制品之间必须互相满足区间约束，因此依赖图存在环时也会被正确校验。
+ *
+ * <p>协调组约束：锁图中包含某组至少 2 名成员时，已选成员版本必须能投影到
+ * 该组的同一允许元组，否则回退原候选版本继续尝试；约束只裁剪候选，
+ * 不会把组内其余不可达成员拉入锁图。
  */
 public final class LockResolver {
 
@@ -43,7 +47,7 @@ public final class LockResolver {
         if (!satisfiesChosen(root, chosen)) {
             return null;
         }
-        if (solve(all, chosen)) {
+        if (solve(all, snapshot.coordinationGroups(), chosen)) {
             TreeMap<String, Integer> result = new TreeMap<>();
             chosen.forEach((name, artifact) -> result.put(name, artifact.version()));
             return result;
@@ -55,6 +59,7 @@ public final class LockResolver {
      * 递归回溯：选出字典序最小的未解析依赖名称，从高到低尝试候选版本。
      */
     private static boolean solve(Map<String, List<ArtifactVersion>> all,
+                                 List<CoordinationGroup> groups,
                                  TreeMap<String, ArtifactVersion> chosen) {
         // 汇总所有已选制品对“尚未解析名称”的区间约束，取交集。
         String next = null;
@@ -96,12 +101,58 @@ public final class LockResolver {
                 continue;
             }
             chosen.put(next, candidate);
-            if (solve(all, chosen)) {
+            // 协调组投影不满足时回退该候选，继续尝试其余版本而非直接失败。
+            if (coordinationFeasible(groups, chosen) && solve(all, groups, chosen)) {
                 return true;
             }
             chosen.remove(next);
         }
         return false;
+    }
+
+    /**
+     * 协调组可行性：任一组内已选成员达到 2 名时，已选版本必须能投影到同一允许元组。
+     */
+    private static boolean coordinationFeasible(List<CoordinationGroup> groups,
+                                                Map<String, ArtifactVersion> chosen) {
+        for (CoordinationGroup group : groups) {
+            Map<String, Integer> chosenInGroup = new TreeMap<>();
+            for (String member : group.members()) {
+                ArtifactVersion selected = chosen.get(member);
+                if (selected != null) {
+                    chosenInGroup.put(member, selected.version());
+                }
+            }
+            if (chosenInGroup.size() >= 2 && matchedTuple(group, chosenInGroup) == null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 在组的允许元组中查找与给定成员版本投影一致的元组，无匹配返回 null。
+     *
+     * @param group          协调组
+     * @param memberVersions 成员名 -> 已选版本（只需覆盖部分成员，按投影匹配）
+     * @return 首个匹配元组（成员名 -> 版本，覆盖全部成员）
+     */
+    public static Map<String, Integer> matchedTuple(CoordinationGroup group,
+                                                    Map<String, Integer> memberVersions) {
+        for (Map<String, Integer> tuple : group.allowedTuples()) {
+            boolean matches = true;
+            for (Map.Entry<String, Integer> chosen : memberVersions.entrySet()) {
+                Integer allowed = tuple.get(chosen.getKey());
+                if (allowed == null || !allowed.equals(chosen.getValue())) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) {
+                return tuple;
+            }
+        }
+        return null;
     }
 
     /**

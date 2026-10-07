@@ -35,8 +35,12 @@ class ArtifactControllerHttpTest {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_coordination_hit");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM coordination_group_tuple");
+        jdbcTemplate.update("DELETE FROM coordination_group_member");
+        jdbcTemplate.update("DELETE FROM coordination_group");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -217,5 +221,117 @@ class ArtifactControllerHttpTest {
                 new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
                 JsonNode.class);
         assertThat(lockOnWithdrawn.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    // ------------------------------------------------------------------
+    // 协调组 HTTP 入口
+    // ------------------------------------------------------------------
+
+    private String groupBody(String groupName, String operator, long expectedVersion,
+                             List<String> members, List<Map<String, Integer>> tuples) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("groupName", groupName);
+        body.put("operator", operator);
+        body.put("members", members);
+        body.put("allowedTuples", tuples);
+        body.put("expectedRepositoryVersion", expectedVersion);
+        return toJson(body);
+    }
+
+    private void registerViaHttp(String name, int version, Object... dependencies) {
+        ResponseEntity<JsonNode> response = restTemplate.postForEntity("/api/artifacts",
+                new HttpEntity<>(registerBody(name, version, dependencies),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+    }
+
+    @Test
+    void coordinationGroupWorkflowViaHttp() {
+        registerViaHttp("x", 1);
+        registerViaHttp("y", 2);
+
+        String rid = UUID.randomUUID().toString();
+        String body = groupBody("g1", "release-bot", 2L, List.of("x", "y"),
+                List.of(Map.of("x", 1, "y", 2)));
+        ResponseEntity<JsonNode> created = restTemplate.postForEntity(
+                "/api/artifacts/coordination-groups",
+                new HttpEntity<>(body, jsonHeaders(rid)), JsonNode.class);
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(created.getBody().path("revision").asInt()).isEqualTo(1);
+        assertThat(created.getBody().path("repositoryVersion").asLong()).isEqualTo(3L);
+        assertThat(created.getBody().path("members")).hasSize(2);
+
+        // 同 requestId 同参重放：返回首次完整响应。
+        ResponseEntity<JsonNode> replay = restTemplate.postForEntity(
+                "/api/artifacts/coordination-groups",
+                new HttpEntity<>(body, jsonHeaders(rid)), JsonNode.class);
+        assertThat(replay.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(replay.getBody().path("updatedAt").asText())
+                .isEqualTo(created.getBody().path("updatedAt").asText());
+
+        // 期望版本过期 → 409。
+        ResponseEntity<JsonNode> stale = restTemplate.postForEntity(
+                "/api/artifacts/coordination-groups",
+                new HttpEntity<>(groupBody("g1", "release-bot", 2L, List.of("x", "y"),
+                        List.of(Map.of("x", 1, "y", 2))), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(stale.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+
+        // 元组引用不存在版本 → 404。
+        ResponseEntity<JsonNode> missing = restTemplate.postForEntity(
+                "/api/artifacts/coordination-groups",
+                new HttpEntity<>(groupBody("g2", "release-bot", 3L, List.of("x", "y"),
+                        List.of(Map.of("x", 1, "y", 9))), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(missing.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+
+        // 缺少操作者 → 400。
+        Map<String, Object> noOperator = new LinkedHashMap<>();
+        noOperator.put("groupName", "g2");
+        noOperator.put("members", List.of("x", "y"));
+        noOperator.put("allowedTuples", List.of(Map.of("x", 1, "y", 2)));
+        noOperator.put("expectedRepositoryVersion", 3);
+        ResponseEntity<JsonNode> badRequest = restTemplate.postForEntity(
+                "/api/artifacts/coordination-groups",
+                new HttpEntity<>(toJson(noOperator), jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(badRequest.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void lockResponseContainsFrozenCoordinationHits() {
+        // 合成场景：允许 (x1,y2) 与 (x2,y1)，根固定 y2、x 范围 1..2，应回退 x1。
+        registerViaHttp("x", 1);
+        registerViaHttp("x", 2);
+        registerViaHttp("y", 1);
+        registerViaHttp("y", 2, dependency("x", 1, 2));
+        ResponseEntity<JsonNode> group = restTemplate.postForEntity(
+                "/api/artifacts/coordination-groups",
+                new HttpEntity<>(groupBody("g1", "release-bot", 4L, List.of("x", "y"),
+                        List.of(Map.of("x", 1, "y", 2), Map.of("x", 2, "y", 1))),
+                        jsonHeaders(UUID.randomUUID().toString())), JsonNode.class);
+        assertThat(group.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+
+        String lockBody = "{\"rootName\":\"y\",\"rootVersion\":2,\"expectedRepositoryVersion\":5}";
+        ResponseEntity<JsonNode> lock = restTemplate.postForEntity("/api/artifacts/locks",
+                new HttpEntity<>(lockBody, jsonHeaders(UUID.randomUUID().toString())),
+                JsonNode.class);
+        assertThat(lock.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(lock.getBody().path("entries")).hasSize(2);
+        assertThat(lock.getBody().path("entries").get(0).path("name").asText()).isEqualTo("x");
+        assertThat(lock.getBody().path("entries").get(0).path("version").asInt()).isEqualTo(1);
+        JsonNode hits = lock.getBody().path("coordinationHits");
+        assertThat(hits).hasSize(1);
+        assertThat(hits.get(0).path("groupName").asText()).isEqualTo("g1");
+        assertThat(hits.get(0).path("groupRevision").asInt()).isEqualTo(1);
+        assertThat(hits.get(0).path("matchedTuple").path("x").asInt()).isEqualTo(1);
+        assertThat(hits.get(0).path("matchedTuple").path("y").asInt()).isEqualTo(2);
+        assertThat(hits.get(0).path("allowedTuples")).hasSize(2);
+
+        // 历史查询同样返回冻结依据。
+        long lockId = lock.getBody().path("id").asLong();
+        ResponseEntity<JsonNode> one = restTemplate.getForEntity(
+                "/api/artifacts/locks/{id}", JsonNode.class, lockId);
+        assertThat(one.getBody().path("coordinationHits")).hasSize(1);
     }
 }

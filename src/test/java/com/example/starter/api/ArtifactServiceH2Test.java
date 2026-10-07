@@ -1,6 +1,9 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.ArtifactResponse;
+import com.example.starter.api.dto.CoordinationGroupRequest;
+import com.example.starter.api.dto.CoordinationGroupResponse;
+import com.example.starter.api.dto.CoordinationHitResponse;
 import com.example.starter.api.dto.DependencySpec;
 import com.example.starter.api.dto.LockFileResponse;
 import com.example.starter.api.dto.LockRequest;
@@ -14,6 +17,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CyclicBarrier;
@@ -41,8 +45,12 @@ class ArtifactServiceH2Test {
 
     @BeforeEach
     void cleanDatabase() {
+        jdbcTemplate.update("DELETE FROM lock_coordination_hit");
         jdbcTemplate.update("DELETE FROM lock_file_entry");
         jdbcTemplate.update("DELETE FROM lock_file");
+        jdbcTemplate.update("DELETE FROM coordination_group_tuple");
+        jdbcTemplate.update("DELETE FROM coordination_group_member");
+        jdbcTemplate.update("DELETE FROM coordination_group");
         jdbcTemplate.update("DELETE FROM artifact_dependency");
         jdbcTemplate.update("DELETE FROM artifact");
         jdbcTemplate.update("DELETE FROM idempotent_request");
@@ -451,5 +459,349 @@ class ArtifactServiceH2Test {
         assertThat(replay.id()).isEqualTo(first.id());
         assertThat(replay.repositoryVersion()).isEqualTo(2L);
         assertThat(replay.entries()).isEqualTo(first.entries());
+    }
+
+    // ------------------------------------------------------------------
+    // 协调组：登记/修订
+    // ------------------------------------------------------------------
+
+    private static CoordinationGroupRequest groupRequest(String groupName, long expectedVersion,
+                                                         List<String> members,
+                                                         List<Map<String, Integer>> tuples) {
+        return new CoordinationGroupRequest(groupName, "tester", members, tuples,
+                expectedVersion);
+    }
+
+    private long repositoryVersion() {
+        return jdbcTemplate.queryForObject(
+                "SELECT version FROM repository_state WHERE id = 1", Long.class);
+    }
+
+    @Test
+    void registerCoordinationGroupAdvancesVersionAndRevision() {
+        service.registerArtifact(requestId(), artifact("x", 1));
+        service.registerArtifact(requestId(), artifact("y", 2));
+
+        CoordinationGroupResponse created = service.registerCoordinationGroup(requestId(),
+                groupRequest("g1", 2L, List.of("x", "y"), List.of(Map.of("x", 1, "y", 2))));
+        assertThat(created.revision()).isEqualTo(1);
+        assertThat(created.repositoryVersion()).isEqualTo(3L);
+        assertThat(created.members()).containsExactly("x", "y");
+        assertThat(created.allowedTuples()).containsExactly(Map.of("x", 1, "y", 2));
+
+        // 修订：成员与元组换序书写视为同规则，修订号与仓库版本推进。
+        CoordinationGroupResponse revised = service.registerCoordinationGroup(requestId(),
+                groupRequest("g1", 3L, List.of("y", "x"), List.of(Map.of("y", 2, "x", 1))));
+        assertThat(revised.revision()).isEqualTo(2);
+        assertThat(revised.repositoryVersion()).isEqualTo(4L);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM coordination_group", Integer.class)).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM coordination_group_tuple", Integer.class)).isEqualTo(2);
+    }
+
+    @Test
+    void staleExpectedVersionOnGroupReturns409AndKeepsRules() {
+        service.registerArtifact(requestId(), artifact("x", 1));
+        service.registerArtifact(requestId(), artifact("y", 2));
+        service.registerCoordinationGroup(requestId(),
+                groupRequest("g1", 2L, List.of("x", "y"), List.of(Map.of("x", 1, "y", 2))));
+
+        assertThatThrownBy(() -> service.registerCoordinationGroup(requestId(),
+                groupRequest("g1", 2L, List.of("x", "y"), List.of(Map.of("x", 1, "y", 1)))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(409));
+        // 规则与仓库版本均未改变。
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT revision FROM coordination_group WHERE name = 'g1'", Integer.class))
+                .isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT version FROM coordination_group_tuple WHERE member_name = 'y'",
+                Integer.class)).isEqualTo(2);
+        assertThat(repositoryVersion()).isEqualTo(3L);
+    }
+
+    @Test
+    void tupleReferencingMissingVersionReturns404() {
+        service.registerArtifact(requestId(), artifact("x", 1));
+        assertThatThrownBy(() -> service.registerCoordinationGroup(requestId(),
+                groupRequest("g1", 1L, List.of("x", "y"), List.of(Map.of("x", 1, "y", 9)))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(404));
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM coordination_group", Integer.class)).isZero();
+    }
+
+    @Test
+    void groupValidationRejectsBadShape() {
+        service.registerArtifact(requestId(), artifact("x", 1));
+        service.registerArtifact(requestId(), artifact("y", 2));
+        // 成员不足 2 个。
+        assertThatThrownBy(() -> service.registerCoordinationGroup(requestId(),
+                groupRequest("g", 2L, List.of("x"), List.of(Map.of("x", 1)))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(400));
+        // 成员重复。
+        assertThatThrownBy(() -> service.registerCoordinationGroup(requestId(),
+                groupRequest("g", 2L, List.of("x", "x"), List.of(Map.of("x", 1)))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(400));
+        // 元组未完整列出成员。
+        assertThatThrownBy(() -> service.registerCoordinationGroup(requestId(),
+                groupRequest("g", 2L, List.of("x", "y"), List.of(Map.of("x", 1)))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(400));
+        // 重复元组（键序不同也视为同一元组）。
+        assertThatThrownBy(() -> service.registerCoordinationGroup(requestId(),
+                groupRequest("g", 2L, List.of("x", "y"),
+                        List.of(Map.of("x", 1, "y", 2), Map.of("y", 2, "x", 1)))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(400));
+        // 元组超过 5 条。
+        List<Map<String, Integer>> six = new ArrayList<>();
+        for (int i = 0; i < 6; i++) {
+            six.add(Map.of("x", 1, "y", 2));
+        }
+        assertThatThrownBy(() -> service.registerCoordinationGroup(requestId(),
+                groupRequest("g", 2L, List.of("x", "y"), six)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(400));
+        // 操作者为空。
+        assertThatThrownBy(() -> service.registerCoordinationGroup(requestId(),
+                new CoordinationGroupRequest("g", " ", List.of("x", "y"),
+                        List.of(Map.of("x", 1, "y", 2)), 2L)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(400));
+    }
+
+    @Test
+    void fourthCoordinationGroupReturns422() {
+        service.registerArtifact(requestId(), artifact("x", 1));
+        service.registerArtifact(requestId(), artifact("y", 2));
+        for (int i = 1; i <= 3; i++) {
+            service.registerCoordinationGroup(requestId(),
+                    groupRequest("g" + i, 1L + i, List.of("x", "y"),
+                            List.of(Map.of("x", 1, "y", 2))));
+        }
+        assertThatThrownBy(() -> service.registerCoordinationGroup(requestId(),
+                groupRequest("g4", 5L, List.of("x", "y"), List.of(Map.of("x", 1, "y", 2)))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(422));
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM coordination_group", Integer.class)).isEqualTo(3);
+    }
+
+    @Test
+    void uniqueConstraintOnGroupNameIsEnforcedByDatabase() {
+        jdbcTemplate.update("INSERT INTO coordination_group (name, revision, updated_at) "
+                + "VALUES ('g', 1, CURRENT_TIMESTAMP(6))");
+        assertThatThrownBy(() -> jdbcTemplate.update(
+                "INSERT INTO coordination_group (name, revision, updated_at) "
+                        + "VALUES ('g', 1, CURRENT_TIMESTAMP(6))"))
+                .isInstanceOf(org.springframework.dao.DuplicateKeyException.class);
+    }
+
+    // ------------------------------------------------------------------
+    // 协调组：幂等
+    // ------------------------------------------------------------------
+
+    @Test
+    void reorderedMembersAndTuplesReplaySameResult() {
+        service.registerArtifact(requestId(), artifact("x", 1));
+        service.registerArtifact(requestId(), artifact("x", 2));
+        service.registerArtifact(requestId(), artifact("y", 1));
+        service.registerArtifact(requestId(), artifact("y", 2));
+
+        String rid = requestId();
+        CoordinationGroupResponse first = service.registerCoordinationGroup(rid,
+                groupRequest("g1", 4L, List.of("x", "y"),
+                        List.of(Map.of("x", 1, "y", 2), Map.of("x", 2, "y", 1))));
+        // 成员与元组列表换序：同参重放，返回首次完整响应。
+        CoordinationGroupResponse replay = service.registerCoordinationGroup(rid,
+                groupRequest("g1", 4L, List.of("y", "x"),
+                        List.of(Map.of("y", 1, "x", 2), Map.of("x", 1, "y", 2))));
+
+        assertThat(replay.revision()).isEqualTo(1);
+        assertThat(replay.repositoryVersion()).isEqualTo(first.repositoryVersion());
+        assertThat(replay.updatedAt()).isEqualTo(first.updatedAt());
+        assertThat(repositoryVersion()).isEqualTo(5L);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM coordination_group", Integer.class)).isEqualTo(1);
+        // 换序同参重放不新增幂等记录：4 次登记 + 1 次组登记。
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM idempotent_request", Integer.class)).isEqualTo(5);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM idempotent_request WHERE request_id = ?",
+                Integer.class, rid)).isEqualTo(1);
+    }
+
+    @Test
+    void sameRequestIdDifferentGroupParamsReturns409() {
+        service.registerArtifact(requestId(), artifact("x", 1));
+        service.registerArtifact(requestId(), artifact("y", 2));
+        String rid = requestId();
+        service.registerCoordinationGroup(rid,
+                groupRequest("g1", 2L, List.of("x", "y"), List.of(Map.of("x", 1, "y", 2))));
+        assertThatThrownBy(() -> service.registerCoordinationGroup(rid,
+                groupRequest("g1", 2L, List.of("x", "y"), List.of(Map.of("x", 1, "y", 1)))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(409));
+    }
+
+    @Test
+    void failedGroupRegistrationDoesNotConsumeRequestId() {
+        service.registerArtifact(requestId(), artifact("x", 1));
+        String rid = requestId();
+        // 引用不存在版本失败（404），不占键。
+        assertThatThrownBy(() -> service.registerCoordinationGroup(rid,
+                groupRequest("g1", 1L, List.of("x", "y"), List.of(Map.of("x", 1, "y", 9)))))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(404));
+
+        service.registerArtifact(requestId(), artifact("y", 9));
+        CoordinationGroupResponse later = service.registerCoordinationGroup(rid,
+                groupRequest("g1", 2L, List.of("x", "y"), List.of(Map.of("x", 1, "y", 9))));
+        assertThat(later.revision()).isEqualTo(1);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM idempotent_request WHERE request_id = ?",
+                Integer.class, rid)).isEqualTo(1);
+    }
+
+    // ------------------------------------------------------------------
+    // 协调组：锁定裁决与冻结
+    // ------------------------------------------------------------------
+
+    @Test
+    void lockWithCoordinationBacktracksToMatchingTuple() {
+        // 合成场景：允许 (x1,y2) 与 (x2,y1)，根固定 y2、x 范围 1..2，应回退 x1。
+        service.registerArtifact(requestId(), artifact("x", 1));
+        service.registerArtifact(requestId(), artifact("x", 2));
+        service.registerArtifact(requestId(), artifact("y", 1));
+        service.registerArtifact(requestId(), artifact("y", 2, dep("x", 1, 2)));
+        service.registerCoordinationGroup(requestId(),
+                groupRequest("g1", 4L, List.of("x", "y"),
+                        List.of(Map.of("x", 1, "y", 2), Map.of("x", 2, "y", 1))));
+
+        LockFileResponse lock = service.createLock(requestId(), new LockRequest("y", 2, 5L));
+        assertThat(lock.entries()).extracting("name", "version")
+                .containsExactly(tuple("x", 1), tuple("y", 2));
+        assertThat(lock.coordinationHits()).hasSize(1);
+        CoordinationHitResponse hit = lock.coordinationHits().get(0);
+        assertThat(hit.groupName()).isEqualTo("g1");
+        assertThat(hit.groupRevision()).isEqualTo(1);
+        assertThat(hit.matchedTuple()).isEqualTo(Map.of("x", 1, "y", 2));
+        assertThat(hit.allowedTuples()).containsExactlyInAnyOrder(
+                Map.of("x", 1, "y", 2), Map.of("x", 2, "y", 1));
+
+        // 历史查询返回同一冻结依据。
+        assertThat(service.getLock(lock.id()).coordinationHits())
+                .isEqualTo(lock.coordinationHits());
+    }
+
+    @Test
+    void coordinationInfeasibleLockReturns422WithoutPersisting() {
+        service.registerArtifact(requestId(), artifact("x", 1));
+        service.registerArtifact(requestId(), artifact("y", 1));
+        service.registerArtifact(requestId(), artifact("y", 2, dep("x", 1, 1)));
+        service.registerCoordinationGroup(requestId(),
+                groupRequest("g1", 3L, List.of("x", "y"), List.of(Map.of("x", 1, "y", 1))));
+
+        assertThatThrownBy(() -> service.createLock(requestId(), new LockRequest("y", 2, 4L)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        e -> assertThat(e.getStatus()).isEqualTo(422));
+        assertThat(jdbcTemplate.queryForObject("SELECT COUNT(1) FROM lock_file", Integer.class))
+                .isZero();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(1) FROM lock_coordination_hit", Integer.class)).isZero();
+        assertThat(repositoryVersion()).isEqualTo(4L);
+    }
+
+    @Test
+    void withdrawnVersionMayStayInTupleButCannotBeLocked() {
+        service.registerArtifact(requestId(), artifact("x", 1));
+        service.registerArtifact(requestId(), artifact("x", 2));
+        service.registerArtifact(requestId(), artifact("y", 1, dep("x", 1, 2)));
+        // 撤回版本仍保留在历史元组中：登记成功。
+        service.registerCoordinationGroup(requestId(),
+                groupRequest("g1", 3L, List.of("x", "y"),
+                        List.of(Map.of("x", 2, "y", 1), Map.of("x", 1, "y", 1))));
+        service.withdrawArtifact(requestId(), "x", 2);
+
+        // 新锁不能选撤回的 x2，回退到匹配 (x1,y1) 的 x1。
+        LockFileResponse lock = service.createLock(requestId(), new LockRequest("y", 1, 5L));
+        assertThat(lock.entries()).extracting("name", "version")
+                .containsExactly(tuple("x", 1), tuple("y", 1));
+        assertThat(lock.coordinationHits().get(0).matchedTuple())
+                .isEqualTo(Map.of("x", 1, "y", 1));
+    }
+
+    @Test
+    void historicalLockKeepsFrozenHitAfterGroupRevision() {
+        service.registerArtifact(requestId(), artifact("x", 1));
+        service.registerArtifact(requestId(), artifact("x", 2));
+        service.registerArtifact(requestId(), artifact("y", 1));
+        service.registerArtifact(requestId(), artifact("y", 2, dep("x", 1, 2)));
+        service.registerCoordinationGroup(requestId(),
+                groupRequest("g1", 4L, List.of("x", "y"),
+                        List.of(Map.of("x", 1, "y", 2), Map.of("x", 2, "y", 1))));
+        LockFileResponse lock = service.createLock(requestId(), new LockRequest("y", 2, 5L));
+        assertThat(lock.coordinationHits().get(0).matchedTuple())
+                .isEqualTo(Map.of("x", 1, "y", 2));
+
+        // 修订组：删除原命中元组。历史锁的命中依据不变（锁定不推进仓库版本）。
+        service.registerCoordinationGroup(requestId(),
+                groupRequest("g1", 5L, List.of("x", "y"), List.of(Map.of("x", 2, "y", 2))));
+        LockFileResponse historical = service.getLock(lock.id());
+        assertThat(historical.coordinationHits()).isEqualTo(lock.coordinationHits());
+        assertThat(historical.coordinationHits().get(0).groupRevision()).isEqualTo(1);
+        assertThat(historical.coordinationHits().get(0).allowedTuples())
+                .containsExactlyInAnyOrder(Map.of("x", 1, "y", 2), Map.of("x", 2, "y", 1));
+    }
+
+    @Test
+    void concurrentLockAndGroupRevisionShareSingleRepositoryView() throws Exception {
+        service.registerArtifact(requestId(), artifact("x", 1));
+        service.registerArtifact(requestId(), artifact("y", 1, dep("x", 1, 1)));
+        service.registerCoordinationGroup(requestId(),
+                groupRequest("g1", 2L, List.of("x", "y"), List.of(Map.of("x", 1, "y", 1))));
+        long versionBefore = 3L;
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CyclicBarrier barrier = new CyclicBarrier(2);
+        Callable<Object> lockTask = () -> {
+            barrier.await(5, TimeUnit.SECONDS);
+            try {
+                return service.createLock(requestId(), new LockRequest("y", 1, versionBefore));
+            } catch (ApiException e) {
+                return e;
+            }
+        };
+        Callable<Object> reviseTask = () -> {
+            barrier.await(5, TimeUnit.SECONDS);
+            return service.registerCoordinationGroup(requestId(),
+                    groupRequest("g1", versionBefore, List.of("x", "y"),
+                            List.of(Map.of("x", 1, "y", 1))));
+        };
+
+        List<Future<Object>> futures = pool.invokeAll(List.of(lockTask, reviseTask));
+        pool.shutdown();
+        Object lockOutcome = futures.get(0).get(30, TimeUnit.SECONDS);
+        Object reviseOutcome = futures.get(1).get(30, TimeUnit.SECONDS);
+
+        // 组修订总是成功并推进仓库版本到 4。
+        assertThat(reviseOutcome).isInstanceOf(CoordinationGroupResponse.class);
+        assertThat(repositoryVersion()).isEqualTo(versionBefore + 1);
+
+        if (lockOutcome instanceof LockFileResponse lock) {
+            // 锁先裁决：读取到版本 3 的视图并冻结当时命中依据。
+            assertThat(lock.repositoryVersion()).isEqualTo(versionBefore);
+            assertThat(service.getLock(lock.id()).coordinationHits())
+                    .isEqualTo(lock.coordinationHits());
+        } else {
+            // 修订先提交：期望版本过期，锁 409 且无半成品。
+            assertThat(lockOutcome).isInstanceOf(ApiException.class);
+            assertThat(((ApiException) lockOutcome).getStatus()).isEqualTo(409);
+            assertThat(service.listLocks()).isEmpty();
+        }
     }
 }
