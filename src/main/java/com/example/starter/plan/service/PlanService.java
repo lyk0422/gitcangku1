@@ -1,10 +1,12 @@
 package com.example.starter.plan.service;
 
+import com.example.starter.plan.model.ActualStatus;
 import com.example.starter.plan.model.DayPlan;
 import com.example.starter.plan.model.Occupancy;
 import com.example.starter.plan.model.PlanStatus;
 import com.example.starter.plan.model.PublishedSlot;
 import com.example.starter.plan.model.RescheduleLink;
+import com.example.starter.plan.repo.ActualRepository;
 import com.example.starter.plan.repo.IdempotencyRepository;
 import com.example.starter.plan.repo.PlanRepository;
 import com.example.starter.plan.web.ApiException;
@@ -60,13 +62,16 @@ public class PlanService {
 
     private final PlanRepository planRepo;
     private final IdempotencyRepository idemRepo;
+    private final ActualRepository actualRepo;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate tx;
 
     public PlanService(PlanRepository planRepo, IdempotencyRepository idemRepo,
-                       ObjectMapper objectMapper, PlatformTransactionManager txManager) {
+                       ActualRepository actualRepo, ObjectMapper objectMapper,
+                       PlatformTransactionManager txManager) {
         this.planRepo = planRepo;
         this.idemRepo = idemRepo;
+        this.actualRepo = actualRepo;
         this.objectMapper = objectMapper;
         this.tx = new TransactionTemplate(txManager);
     }
@@ -174,6 +179,8 @@ public class PlanService {
 
     /**
      * 取消已发布计划：时隙立即释放，历史计划与占用保留不改写。
+     * 与进入/退出/改签共用全局发布锁串行校验；含 INSIDE 占用的计划不能取消；
+     * 含 EXITED 的计划可取消，仅撤销未进入部分，实际轨迹保留不删除。
      */
     public PlanResponse cancel(String scheduleKey, String requestKey) {
         String hash = hashAction(OP_CANCEL, scheduleKey);
@@ -183,11 +190,16 @@ public class PlanService {
         }
         try {
             return tx.execute(status -> {
+                planRepo.acquirePublishLock();
                 DayPlan plan = planRepo.findByKeyForUpdate(scheduleKey)
                         .orElseThrow(() -> notFound(scheduleKey));
                 if (plan.status() != PlanStatus.PUBLISHED) {
                     throw conflict("PLAN_STATE_CONFLICT",
                             "仅已发布计划可取消，当前状态: " + plan.status());
+                }
+                if (actualRepo.countByPlanAndStatus(plan.id(), ActualStatus.INSIDE) > 0) {
+                    throw conflict("PLAN_HAS_INSIDE",
+                            "计划存在未退出占用，不能取消: " + scheduleKey);
                 }
                 long now = System.currentTimeMillis();
                 planRepo.updateStatus(plan.id(), PlanStatus.CANCELLED, now);
@@ -203,6 +215,7 @@ public class PlanService {
     /**
      * 原子改签：全局发布锁内校验新草稿（列车内部重叠与跨计划区段冲突，仅排除旧计划占用），
      * 通过后同一事务取消旧计划、发布新计划并追加不可变前后继关联。
+     * 含 INSIDE 或 EXITED 实际轨迹的旧计划不能改签。
      * 任一步失败整体回滚：旧计划仍发布、新计划仍草稿，版本、占用与关联均不改变。
      */
     public RescheduleResponse reschedule(String oldScheduleKey, RescheduleRequest req) {
@@ -249,6 +262,14 @@ public class PlanService {
                 }
                 if (planRepo.findLinkBySuccessor(newPlan.id()).isPresent()) {
                     throw conflict("LINK_CONFLICT", "新计划已存在直接前驱: " + req.newScheduleKey());
+                }
+                if (actualRepo.countByPlanAndStatus(oldPlan.id(), ActualStatus.INSIDE) > 0) {
+                    throw conflict("PLAN_HAS_INSIDE",
+                            "旧计划存在未退出占用，不能改签: " + oldScheduleKey);
+                }
+                if (actualRepo.countByPlanAndStatus(oldPlan.id(), ActualStatus.EXITED) > 0) {
+                    throw conflict("PLAN_HAS_EXITED",
+                            "旧计划存在已退出轨迹，不能改签: " + oldScheduleKey);
                 }
                 List<Occupancy> occupancies = planRepo.findOccupancies(newPlan.id());
                 List<Map<String, Object>> conflicts = new ArrayList<>();

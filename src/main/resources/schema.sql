@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS rail_plan_occupancy (
     section_id VARCHAR(64) NOT NULL,
     start_utc BIGINT NOT NULL,
     end_utc BIGINT NOT NULL,
+    actual_status VARCHAR(16) NOT NULL DEFAULT 'NOT_ENTERED',
     PRIMARY KEY (id)
 );
 COMMENT ON TABLE rail_plan_occupancy IS '计划区段占用明细，区间左闭右开；取消计划后历史占用保留不删除';
@@ -39,6 +40,7 @@ COMMENT ON COLUMN rail_plan_occupancy.train_no IS '列车编号';
 COMMENT ON COLUMN rail_plan_occupancy.section_id IS '区段 ID';
 COMMENT ON COLUMN rail_plan_occupancy.start_utc IS '占用开始时刻（含），UTC 毫秒';
 COMMENT ON COLUMN rail_plan_occupancy.end_utc IS '占用结束时刻（不含），UTC 毫秒，必须大于 start_utc';
+COMMENT ON COLUMN rail_plan_occupancy.actual_status IS '实际状态：NOT_ENTERED 未进入 / INSIDE 在区间内 / EXITED 已退出；同区段至多一条 INSIDE';
 CREATE INDEX IF NOT EXISTS idx_rail_plan_occupancy_plan ON rail_plan_occupancy (plan_id);
 CREATE INDEX IF NOT EXISTS idx_rail_plan_occupancy_section ON rail_plan_occupancy (section_id, start_utc, end_utc);
 
@@ -54,7 +56,7 @@ CREATE TABLE IF NOT EXISTS idempotency_record (
 );
 COMMENT ON TABLE idempotency_record IS '写操作幂等记录，仅缓存成功结果，失败不缓存可重试';
 COMMENT ON COLUMN idempotency_record.id IS '主键';
-COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE';
+COMMENT ON COLUMN idempotency_record.op_type IS '操作类型：CREATE / UPDATE / PUBLISH / CANCEL / RESCHEDULE / ENTER / EXIT';
 COMMENT ON COLUMN idempotency_record.request_key IS '客户端幂等键，同一操作类型内唯一';
 COMMENT ON COLUMN idempotency_record.request_hash IS '请求参数规范化后的 SHA-256，同键不同参判定 409';
 COMMENT ON COLUMN idempotency_record.response_json IS '首次成功响应快照（JSON），重放原样返回';
@@ -74,6 +76,33 @@ COMMENT ON COLUMN rail_plan_reschedule_link.id IS '主键';
 COMMENT ON COLUMN rail_plan_reschedule_link.predecessor_plan_id IS '直接前驱（被改签取消的旧计划）id，关联 rail_day_plan.id，全表唯一';
 COMMENT ON COLUMN rail_plan_reschedule_link.successor_plan_id IS '直接后继（改签发布的新计划）id，关联 rail_day_plan.id，全表唯一';
 COMMENT ON COLUMN rail_plan_reschedule_link.created_at IS '关联创建时刻，UTC 毫秒';
+
+CREATE TABLE IF NOT EXISTS rail_actual_event (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    plan_id BIGINT NOT NULL,
+    occupancy_id BIGINT NOT NULL,
+    seq INT NOT NULL,
+    event_type VARCHAR(8) NOT NULL,
+    server_utc BIGINT NOT NULL,
+    plan_version INT NOT NULL,
+    operator VARCHAR(64) NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (id)
+);
+COMMENT ON TABLE rail_actual_event IS '实际进出轨迹，追加后不可变；计划取消不删除本表记录';
+COMMENT ON COLUMN rail_actual_event.id IS '主键';
+COMMENT ON COLUMN rail_actual_event.plan_id IS '所属计划 id，关联 rail_day_plan.id';
+COMMENT ON COLUMN rail_actual_event.occupancy_id IS '占用 id，关联 rail_plan_occupancy.id';
+COMMENT ON COLUMN rail_actual_event.seq IS '占用在计划内的序号，冗余便于查询';
+COMMENT ON COLUMN rail_actual_event.event_type IS '事件类型：ENTER 进入 / EXIT 退出';
+COMMENT ON COLUMN rail_actual_event.server_utc IS '服务端确认时刻（UTC 毫秒），由服务器时钟产生，调用方不可指定';
+COMMENT ON COLUMN rail_actual_event.plan_version IS '事件发生时原计划版本';
+COMMENT ON COLUMN rail_actual_event.operator IS '操作者，非空';
+COMMENT ON COLUMN rail_actual_event.request_id IS '全局幂等请求 id';
+COMMENT ON COLUMN rail_actual_event.created_at IS '记录创建时刻，UTC 毫秒';
+CREATE INDEX IF NOT EXISTS idx_rail_actual_event_plan ON rail_actual_event (plan_id);
+CREATE INDEX IF NOT EXISTS idx_rail_actual_event_occupancy ON rail_actual_event (occupancy_id);
 
 CREATE TABLE IF NOT EXISTS publish_lock (
     id INT NOT NULL,
