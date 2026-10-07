@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS quota_visitor_ledger (
 );
 
 -- 曝光预占单：utc_date 固定为申请时刻的 UTC 日期，expires_at_utc 为到期时刻（epoch 毫秒）
+-- group_id 为所属组合编号；NULL 表示普通单条预占，非空时只能随整组确认/取消/过期
 CREATE TABLE IF NOT EXISTS exposure_reservation (
     reservation_id  VARCHAR(64) NOT NULL,
     campaign_id     VARCHAR(64) NOT NULL,
@@ -38,12 +39,30 @@ CREATE TABLE IF NOT EXISTS exposure_reservation (
     created_at_utc  BIGINT      NOT NULL,
     expires_at_utc  BIGINT      NOT NULL,
     terminal_at_utc BIGINT,
+    group_id        VARCHAR(64),
     PRIMARY KEY (reservation_id)
 );
 CREATE INDEX IF NOT EXISTS idx_reservation_campaign_day
     ON exposure_reservation (campaign_id, utc_date, status);
 CREATE INDEX IF NOT EXISTS idx_reservation_expiry
     ON exposure_reservation (campaign_id, status, expires_at_utc);
+CREATE INDEX IF NOT EXISTS idx_reservation_group
+    ON exposure_reservation (group_id);
+
+-- 组合预占组：一次组合申请对应一组（2～5 个不同公告），整组共用到期时刻与 UTC 日；
+-- 状态机与单条一致（RESERVED/CONFIRMED/CANCELLED/EXPIRED），终态整组一次转换
+CREATE TABLE IF NOT EXISTS exposure_group (
+    group_id        VARCHAR(64) NOT NULL,
+    visitor_id      VARCHAR(64) NOT NULL,
+    utc_date        DATE        NOT NULL,
+    status          VARCHAR(16) NOT NULL,
+    created_at_utc  BIGINT      NOT NULL,
+    expires_at_utc  BIGINT      NOT NULL,
+    terminal_at_utc BIGINT,
+    PRIMARY KEY (group_id)
+);
+CREATE INDEX IF NOT EXISTS idx_group_expiry
+    ON exposure_group (status, expires_at_utc);
 
 -- 写操作幂等记录：request_id 全局唯一，异参重放返回 409，失败不占键
 CREATE TABLE IF NOT EXISTS idempotency_record (

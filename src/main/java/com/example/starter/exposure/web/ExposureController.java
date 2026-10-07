@@ -60,6 +60,32 @@ public class ExposureController {
         return exposureService.cancel(reservationId, request);
     }
 
+    /** 组合申请：一个访客一次申请 2～5 个不同公告，整组共用 60 秒截止；任一额度不足整组不建。 */
+    @PostMapping("/bundles")
+    public ResponseEntity<BundleResponse> applyBundle(@Valid @RequestBody ApplyBundleRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(exposureService.applyBundle(request));
+    }
+
+    /** 组合组明细（含全部成员）。 */
+    @GetMapping("/bundles/{groupId}")
+    public BundleResponse getBundle(@PathVariable String groupId) {
+        return exposureService.getBundle(groupId);
+    }
+
+    /** 整组确认：必须在到期时刻之前，一次确认全部成员。 */
+    @PostMapping("/bundles/{groupId}/confirm")
+    public BundleResponse confirmBundle(@PathVariable String groupId,
+                                        @Valid @RequestBody ReservationActionRequest request) {
+        return exposureService.confirmBundle(groupId, request);
+    }
+
+    /** 整组取消：仅 RESERVED 可取消，一次释放全部成员两级额度。 */
+    @PostMapping("/bundles/{groupId}/cancel")
+    public BundleResponse cancelBundle(@PathVariable String groupId,
+                                       @Valid @RequestBody ReservationActionRequest request) {
+        return exposureService.cancelBundle(groupId, request);
+    }
+
     /**
      * 按公告/访客/UTC 日查询额度；visitorId 缺省仅返回公告当日总额度。
      * utcDate 缺省使用服务端当前 UTC 日。

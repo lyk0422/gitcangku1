@@ -12,6 +12,8 @@ package com.example.starter.exposure.domain;
  * @param createdAtUtc  创建（申请）时刻，epoch 毫秒，UTC
  * @param expiresAtUtc  到期时刻，创建时刻 + 60 秒，epoch 毫秒，UTC；当前时刻达到该值即过期
  * @param terminalAtUtc 进入终态（CONFIRMED/CANCELLED/EXPIRED）的时刻，未到终态为 null
+ * @param groupId       所属组合预占组编号；null 表示普通单条预占，
+ *                      非空时只能随整组确认/取消/过期，单条入口对其返回 409
  */
 public record Reservation(
         String reservationId,
@@ -21,6 +23,7 @@ public record Reservation(
         ReservationStatus status,
         long createdAtUtc,
         long expiresAtUtc,
-        Long terminalAtUtc
+        Long terminalAtUtc,
+        String groupId
 ) {
 }

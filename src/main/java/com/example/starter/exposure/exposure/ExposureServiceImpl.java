@@ -2,14 +2,18 @@ package com.example.starter.exposure.exposure;
 
 import com.example.starter.exposure.domain.Campaign;
 import com.example.starter.exposure.domain.Reservation;
+import com.example.starter.exposure.domain.ReservationGroup;
 import com.example.starter.exposure.domain.ReservationStatus;
 import com.example.starter.exposure.repo.CampaignRepository;
+import com.example.starter.exposure.repo.GroupRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository;
 import com.example.starter.exposure.repo.IdempotencyRepository.IdempotencyRecord;
 import com.example.starter.exposure.repo.LedgerRepository;
 import com.example.starter.exposure.repo.ReservationRepository;
 import com.example.starter.exposure.web.ApiException;
+import com.example.starter.exposure.web.ApplyBundleRequest;
 import com.example.starter.exposure.web.ApplyExposureRequest;
+import com.example.starter.exposure.web.BundleResponse;
 import com.example.starter.exposure.web.CampaignResponse;
 import com.example.starter.exposure.web.CreateCampaignRequest;
 import com.example.starter.exposure.web.QuotaResponse;
@@ -23,6 +27,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 import java.time.LocalDate;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.function.Supplier;
@@ -45,6 +50,7 @@ public class ExposureServiceImpl implements ExposureService {
     private final Clock clock;
     private final CampaignRepository campaignRepository;
     private final ReservationRepository reservationRepository;
+    private final GroupRepository groupRepository;
     private final LedgerRepository ledgerRepository;
     private final IdempotencyRepository idempotencyRepository;
     private final ObjectMapper objectMapper;
@@ -53,6 +59,7 @@ public class ExposureServiceImpl implements ExposureService {
     public ExposureServiceImpl(Clock clock,
                                CampaignRepository campaignRepository,
                                ReservationRepository reservationRepository,
+                               GroupRepository groupRepository,
                                LedgerRepository ledgerRepository,
                                IdempotencyRepository idempotencyRepository,
                                ObjectMapper objectMapper,
@@ -60,6 +67,7 @@ public class ExposureServiceImpl implements ExposureService {
         this.clock = clock;
         this.campaignRepository = campaignRepository;
         this.reservationRepository = reservationRepository;
+        this.groupRepository = groupRepository;
         this.ledgerRepository = ledgerRepository;
         this.idempotencyRepository = idempotencyRepository;
         this.objectMapper = objectMapper;
@@ -129,6 +137,7 @@ public class ExposureServiceImpl implements ExposureService {
                             ReservationStatus.RESERVED,
                             now,
                             now + RESERVATION_TTL_MILLIS,
+                            null,
                             null);
                     reservationRepository.insert(reservation);
                     return ReservationResponse.from(reservation);
@@ -152,10 +161,17 @@ public class ExposureServiceImpl implements ExposureService {
     @Override
     public ReservationResponse getReservation(String reservationId) {
         return txTemplate.execute(status -> {
-            Reservation locked = reservationRepository.lockById(reservationId)
+            Reservation found = reservationRepository.findById(reservationId)
                     .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
                             "reservation not found: " + reservationId));
-            expireIfDue(locked, clock.millis());
+            long now = clock.millis();
+            if (found.groupId() != null) {
+                // 组合成员：整组结算过期后再读取，保证状态与组一致
+                settleGroupIfDue(found.groupId(), now);
+            } else {
+                Reservation locked = reservationRepository.lockById(reservationId).orElseThrow();
+                expireIfDue(locked, now);
+            }
             return ReservationResponse.from(
                     reservationRepository.lockById(reservationId).orElseThrow());
         });
@@ -189,6 +205,45 @@ public class ExposureServiceImpl implements ExposureService {
         });
     }
 
+    @Override
+    public BundleResponse applyBundle(ApplyBundleRequest request) {
+        // 集合换序同参：去重排序后作为结构化指纹（含操作者与全参数）
+        List<String> sorted = request.campaignIds().stream().distinct().sorted().toList();
+        if (sorted.size() != request.campaignIds().size()) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "campaignIds must be distinct");
+        }
+        String fingerprint = writeJson(List.of(request.visitorId(), sorted));
+        return runIdempotent(request.requestId(), Operation.APPLY_BUNDLE, fingerprint,
+                BundleResponse.class, () -> doApplyBundle(request.visitorId(), sorted));
+    }
+
+    @Override
+    public BundleResponse confirmBundle(String groupId, ReservationActionRequest request) {
+        return runIdempotent(request.requestId(), Operation.CONFIRM_BUNDLE, groupId,
+                BundleResponse.class, () -> transitionBundle(groupId, true));
+    }
+
+    @Override
+    public BundleResponse cancelBundle(String groupId, ReservationActionRequest request) {
+        return runIdempotent(request.requestId(), Operation.CANCEL_BUNDLE, groupId,
+                BundleResponse.class, () -> transitionBundle(groupId, false));
+    }
+
+    @Override
+    public BundleResponse getBundle(String groupId) {
+        return txTemplate.execute(status -> {
+            ReservationGroup group = groupRepository.lockById(groupId)
+                    .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                            "bundle group not found: " + groupId));
+            if (group.status() == ReservationStatus.RESERVED
+                    && clock.millis() >= group.expiresAtUtc()) {
+                expireGroup(group, clock.millis());
+                group = groupRepository.lockById(groupId).orElseThrow();
+            }
+            return BundleResponse.from(group, reservationRepository.findByGroupId(groupId));
+        });
+    }
+
     // ---- 内部辅助（作用域末尾） ----
 
     /** 幂等操作类型，同时标识存储响应的反序列化类型。 */
@@ -196,7 +251,10 @@ public class ExposureServiceImpl implements ExposureService {
         CREATE_CAMPAIGN,
         APPLY,
         CONFIRM,
-        CANCEL
+        CANCEL,
+        APPLY_BUNDLE,
+        CONFIRM_BUNDLE,
+        CANCEL_BUNDLE
     }
 
     /**
@@ -255,6 +313,13 @@ public class ExposureServiceImpl implements ExposureService {
                 .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
                         "reservation not found: " + reservationId));
 
+        // 组合成员不允许走单条确认/取消入口，必须使用整组入口
+        if (current.groupId() != null) {
+            throw new ApiException(HttpStatus.CONFLICT,
+                    "reservation belongs to bundle group " + current.groupId()
+                            + "; use bundle endpoints");
+        }
+
         // 仅结算本单（本事务已持其行锁，加锁顺序保持为 预占单 -> 总账 -> 访客账，避免死锁）
         expireIfDue(current, now);
         current = reservationRepository.lockById(reservationId).orElseThrow();
@@ -299,12 +364,44 @@ public class ExposureServiceImpl implements ExposureService {
 
     /**
      * 结算某公告当前已到期（now &gt;= expiresAt）但仍为 RESERVED 的预占：
-     * 行锁查出后逐个 CAS 为 EXPIRED，仅 CAS 成功者释放两级额度，杜绝重复释放。
+     * 先整组结算涉及该公告的到期组合组，再逐条结算普通单条预占；
+     * 仅 CAS 成功者释放两级额度，杜绝重复释放。
      */
     private void settleExpired(String campaignId, long now) {
+        for (String groupId : reservationRepository.findGroupIdsByCampaign(campaignId)) {
+            settleGroupIfDue(groupId, now);
+        }
         List<Reservation> expired = reservationRepository.lockExpiredReserved(campaignId, now);
         for (Reservation reservation : expired) {
             expireIfDue(reservation, now);
+        }
+    }
+
+    /**
+     * 若组合组已到期且仍为 RESERVED，则整组过期：CAS 组状态成功后，
+     * 逐个将成员 CAS 为 EXPIRED 并释放各自两级额度（仅 CAS 成功者释放）。
+     */
+    private void settleGroupIfDue(String groupId, long now) {
+        groupRepository.lockExpiredReserved(groupId, now).ifPresent(group -> expireGroup(group, now));
+    }
+
+    /**
+     * 整组过期（调用方已确认组已到期且持有组行锁）。
+     */
+    private void expireGroup(ReservationGroup group, long now) {
+        boolean won = groupRepository.compareAndSetStatus(
+                group.groupId(), ReservationStatus.RESERVED, ReservationStatus.EXPIRED, now);
+        if (!won) {
+            return;
+        }
+        for (Reservation member : reservationRepository.lockByGroupId(group.groupId())) {
+            boolean memberWon = reservationRepository.compareAndSetStatus(
+                    member.reservationId(), ReservationStatus.RESERVED, ReservationStatus.EXPIRED, now);
+            if (memberWon) {
+                LocalDate utcDate = member.utcDate().toLocalDate();
+                ledgerRepository.releaseTotal(member.campaignId(), utcDate);
+                ledgerRepository.releaseVisitor(member.campaignId(), member.visitorId(), utcDate);
+            }
         }
     }
 
@@ -327,6 +424,127 @@ public class ExposureServiceImpl implements ExposureService {
                         reservation.campaignId(), reservation.visitorId(), utcDate);
             }
         }
+    }
+
+    /**
+     * 组合申请主体（事务内，已持幂等键）。sortedCampaignIds 已去重排序。
+     * 先结算所有成员公告的到期项，再按公告排序固定顺序加锁两级账目；
+     * 任一成员额度不足抛 429，整组不建预占、不占额度。
+     */
+    private BundleResponse doApplyBundle(String visitorId, List<String> sortedCampaignIds) {
+        long now = clock.millis();
+        LocalDate utcDate = LocalDate.now(clock);
+
+        List<Campaign> campaigns = new ArrayList<>();
+        for (String campaignId : sortedCampaignIds) {
+            campaigns.add(requireCampaign(campaignId));
+        }
+        for (Campaign campaign : campaigns) {
+            settleExpired(campaign.campaignId(), now);
+        }
+
+        // 固定加锁顺序：按公告编号排序，每条公告先总账后访客账，避免死锁
+        for (Campaign campaign : campaigns) {
+            ledgerRepository.ensureTotalRow(campaign.campaignId(), utcDate);
+            ledgerRepository.ensureVisitorRow(campaign.campaignId(), visitorId, utcDate);
+        }
+        for (Campaign campaign : campaigns) {
+            int usedTotal = ledgerRepository.lockUsedTotal(campaign.campaignId(), utcDate);
+            int usedVisitor = ledgerRepository.lockUsedVisitor(
+                    campaign.campaignId(), visitorId, utcDate);
+            if (usedTotal + 1 > campaign.dailyTotalCap()
+                    || usedVisitor + 1 > campaign.perVisitorDailyCap()) {
+                throw new ApiException(HttpStatus.TOO_MANY_REQUESTS,
+                        "exposure quota exhausted for campaign " + campaign.campaignId()
+                                + "; bundle not reserved");
+            }
+        }
+        for (Campaign campaign : campaigns) {
+            ledgerRepository.addTotal(campaign.campaignId(), utcDate, 1);
+            ledgerRepository.addVisitor(campaign.campaignId(), visitorId, utcDate, 1);
+        }
+
+        String groupId = UUID.randomUUID().toString().replace("-", "");
+        ReservationGroup group = new ReservationGroup(
+                groupId, visitorId, java.sql.Date.valueOf(utcDate),
+                ReservationStatus.RESERVED, now, now + RESERVATION_TTL_MILLIS, null);
+        groupRepository.insert(group);
+
+        List<Reservation> members = new ArrayList<>();
+        for (Campaign campaign : campaigns) {
+            Reservation member = new Reservation(
+                    UUID.randomUUID().toString().replace("-", ""),
+                    campaign.campaignId(),
+                    visitorId,
+                    java.sql.Date.valueOf(utcDate),
+                    ReservationStatus.RESERVED,
+                    now,
+                    now + RESERVATION_TTL_MILLIS,
+                    null,
+                    groupId);
+            reservationRepository.insert(member);
+            members.add(member);
+        }
+        return BundleResponse.from(group, members);
+    }
+
+    /**
+     * 整组确认/取消状态机。调用前已持幂等键；组行锁 + CAS 保证并发只有一个终态。
+     * 确认不改动额度；取消整组一次释放全部成员的两级额度。
+     *
+     * @param isConfirm true=确认，false=取消
+     */
+    private BundleResponse transitionBundle(String groupId, boolean isConfirm) {
+        long now = clock.millis();
+        ReservationGroup group = groupRepository.lockById(groupId)
+                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                        "bundle group not found: " + groupId));
+
+        if (group.status() == ReservationStatus.RESERVED && now >= group.expiresAtUtc()) {
+            expireGroup(group, now);
+            group = groupRepository.lockById(groupId).orElseThrow();
+        }
+
+        if (group.status() == ReservationStatus.RESERVED) {
+            List<Reservation> members = reservationRepository.lockByGroupId(groupId);
+            ReservationStatus target = isConfirm
+                    ? ReservationStatus.CONFIRMED : ReservationStatus.CANCELLED;
+            if (!groupRepository.compareAndSetStatus(
+                    groupId, ReservationStatus.RESERVED, target, now)) {
+                throw new ApiException(HttpStatus.CONFLICT, "bundle group state changed concurrently");
+            }
+            int updated = reservationRepository.compareAndSetStatusByGroup(
+                    groupId, ReservationStatus.RESERVED, target, now);
+            if (updated != members.size()) {
+                throw new ApiException(HttpStatus.CONFLICT, "bundle member state changed concurrently");
+            }
+            if (!isConfirm) {
+                // 取消：整组一次释放全部成员两级额度；固定顺序先总账后访客账
+                for (Reservation member : members) {
+                    LocalDate utcDate = member.utcDate().toLocalDate();
+                    ledgerRepository.releaseTotal(member.campaignId(), utcDate);
+                    ledgerRepository.releaseVisitor(member.campaignId(), member.visitorId(), utcDate);
+                }
+            }
+        } else if (group.status() == ReservationStatus.CONFIRMED
+                || group.status() == ReservationStatus.CANCELLED
+                || group.status() == ReservationStatus.EXPIRED) {
+            boolean sameTerminal = isConfirm
+                    ? group.status() == ReservationStatus.CONFIRMED
+                    : group.status() == ReservationStatus.CANCELLED;
+            if (!sameTerminal) {
+                throw new ApiException(HttpStatus.CONFLICT,
+                        "bundle group is " + group.status() + ", cannot "
+                                + (isConfirm ? "confirm" : "cancel"));
+            }
+            // 重复同类终态操作：返回原状态，不重复释放额度
+        } else {
+            throw new ApiException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "unexpected bundle group status: " + group.status());
+        }
+
+        ReservationGroup result = groupRepository.lockById(groupId).orElseThrow();
+        return BundleResponse.from(result, reservationRepository.findByGroupId(groupId));
     }
 
     private Campaign requireCampaign(String campaignId) {

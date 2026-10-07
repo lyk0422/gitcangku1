@@ -1,6 +1,8 @@
 package com.example.starter.exposure.exposure;
 
+import com.example.starter.exposure.web.ApplyBundleRequest;
 import com.example.starter.exposure.web.ApplyExposureRequest;
+import com.example.starter.exposure.web.BundleResponse;
 import com.example.starter.exposure.web.CampaignResponse;
 import com.example.starter.exposure.web.CreateCampaignRequest;
 import com.example.starter.exposure.web.QuotaResponse;
@@ -25,4 +27,12 @@ public interface ExposureService {
     ReservationResponse getReservation(String reservationId);
 
     QuotaResponse queryQuota(String campaignId, String visitorId, LocalDate utcDate);
+
+    BundleResponse applyBundle(ApplyBundleRequest request);
+
+    BundleResponse confirmBundle(String groupId, ReservationActionRequest request);
+
+    BundleResponse cancelBundle(String groupId, ReservationActionRequest request);
+
+    BundleResponse getBundle(String groupId);
 }

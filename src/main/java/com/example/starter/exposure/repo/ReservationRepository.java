@@ -31,14 +31,15 @@ public class ReservationRepository {
             ReservationStatus.valueOf(rs.getString("status")),
             rs.getLong("created_at_utc"),
             rs.getLong("expires_at_utc"),
-            (Long) rs.getObject("terminal_at_utc"));
+            (Long) rs.getObject("terminal_at_utc"),
+            rs.getString("group_id"));
 
     private static final String COLUMNS =
             "reservation_id, campaign_id, visitor_id, utc_date, status, "
-                    + "created_at_utc, expires_at_utc, terminal_at_utc";
+                    + "created_at_utc, expires_at_utc, terminal_at_utc, group_id";
 
     public void insert(Reservation reservation) {
-        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO exposure_reservation (" + COLUMNS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 reservation.reservationId(),
                 reservation.campaignId(),
                 reservation.visitorId(),
@@ -46,7 +47,8 @@ public class ReservationRepository {
                 reservation.status().name(),
                 reservation.createdAtUtc(),
                 reservation.expiresAtUtc(),
-                reservation.terminalAtUtc());
+                reservation.terminalAtUtc(),
+                reservation.groupId());
     }
 
     public Optional<Reservation> findById(String reservationId) {
@@ -67,12 +69,41 @@ public class ReservationRepository {
     }
 
     /**
-     * 行锁查询某公告下已到期（now &gt;= expires_at_utc）但仍为 RESERVED 的预占单。
+     * 行锁查询某公告下已到期（now &gt;= expires_at_utc）但仍为 RESERVED 的普通单条预占单。
+     * 组合成员由整组过期结算负责，不在此返回。
      */
     public List<Reservation> lockExpiredReserved(String campaignId, long nowUtc) {
         return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
-                        + "WHERE campaign_id = ? AND status = 'RESERVED' AND expires_at_utc <= ? FOR UPDATE",
+                        + "WHERE campaign_id = ? AND status = 'RESERVED' AND expires_at_utc <= ? "
+                        + "AND group_id IS NULL FOR UPDATE",
                 MAPPER, campaignId, nowUtc);
+    }
+
+    /**
+     * 按组编号查询成员预占单，按公告编号排序保证响应稳定。
+     */
+    public List<Reservation> findByGroupId(String groupId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
+                        + "WHERE group_id = ? ORDER BY campaign_id",
+                MAPPER, groupId);
+    }
+
+    /**
+     * 行锁查询某组的全部成员预占单（按公告编号排序）。
+     */
+    public List<Reservation> lockByGroupId(String groupId) {
+        return jdbc.query("SELECT " + COLUMNS + " FROM exposure_reservation "
+                        + "WHERE group_id = ? ORDER BY campaign_id FOR UPDATE",
+                MAPPER, groupId);
+    }
+
+    /**
+     * 查询某公告涉及的组合组编号（用于整组过期结算）。
+     */
+    public List<String> findGroupIdsByCampaign(String campaignId) {
+        return jdbc.queryForList("SELECT DISTINCT group_id FROM exposure_reservation "
+                        + "WHERE campaign_id = ? AND group_id IS NOT NULL",
+                String.class, campaignId);
     }
 
     /**
@@ -86,5 +117,17 @@ public class ReservationRepository {
                         + "WHERE reservation_id = ? AND status = ?",
                 target.name(), terminalAtUtc, reservationId, expect.name());
         return rows == 1;
+    }
+
+    /**
+     * 整组条件 CAS：将某组下所有处于 expect 状态的成员改为 target。
+     *
+     * @return 实际更新的成员数；调用方据此核对是否覆盖全部成员
+     */
+    public int compareAndSetStatusByGroup(String groupId, ReservationStatus expect,
+                                          ReservationStatus target, long terminalAtUtc) {
+        return jdbc.update("UPDATE exposure_reservation SET status = ?, terminal_at_utc = ? "
+                        + "WHERE group_id = ? AND status = ?",
+                target.name(), terminalAtUtc, groupId, expect.name());
     }
 }
