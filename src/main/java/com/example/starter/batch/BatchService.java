@@ -8,8 +8,11 @@ import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.RecallResponse;
+import com.example.starter.batch.dto.SequentialAssayView;
+import com.example.starter.batch.dto.SequentialResultResponse;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
+import com.example.starter.batch.dto.SubmitSequentialResultRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import com.example.starter.batch.dto.TestResultResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -19,6 +22,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -50,6 +55,12 @@ public class BatchService {
     private static final String CMD_APPROVE = "APPROVE";
     private static final String CMD_RECALL = "RECALL";
     private static final String CMD_SPLIT = "SPLIT";
+    private static final String CMD_SEQUENTIAL = "SEQUENTIAL_RESULT";
+
+    /**
+     * 序贯检验每批最大结果数；满 10 次仍未达阈值即 INCONCLUSIVE。
+     */
+    private static final int SEQUENTIAL_MAX_SAMPLES = 10;
 
     /**
      * 指纹拼接分隔符（NUL）：业务参数不可能包含该字符，避免拼接碰撞。
@@ -72,26 +83,30 @@ public class BatchService {
 
     /**
      * 创建批次：初始状态 QUARANTINED；batchKey 全局唯一，重复返回 409。
+     * sequentialAssay 为 true 时启用合成序贯检验（缺省 false，保持原规则）。
      */
     public StoredResponse createBatch(CreateBatchRequest req) {
         List<String> items = req.requiredTests().stream().map(String::trim).toList();
         if (new HashSet<>(items).size() != items.size()) {
             throw ApiException.badRequest("requiredTests 存在重复检验项");
         }
+        boolean sequential = Boolean.TRUE.equals(req.sequentialAssay());
         String fingerprint = fingerprint("create", req.batchKey(), req.productCode(), req.batchNo(),
-                req.producedAt().toString(), String.join(SEP, items));
+                req.producedAt().toString(), String.join(SEP, items), String.valueOf(sequential));
         return executeIdempotent(CMD_CREATE, req.commandKey(), fingerprint, () -> {
             repo.findBatch(req.batchKey()).ifPresent(b -> {
                 throw ApiException.conflict("batchKey 已存在: " + req.batchKey());
             });
             String now = now();
             repo.insertBatch(new BatchRepository.BatchRow(0L, req.batchKey(), req.productCode(),
-                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(), now));
+                    req.batchNo(), req.producedAt().toString(), BatchStatus.QUARANTINED.name(),
+                    sequential, now));
             for (int i = 0; i < items.size(); i++) {
                 repo.insertRequiredTest(req.batchKey(), items.get(i), i + 1);
             }
             BatchResponse body = new BatchResponse(req.batchKey(), req.productCode(), req.batchNo(),
-                    req.producedAt(), BatchStatus.QUARANTINED, items, Instant.parse(now));
+                    req.producedAt(), BatchStatus.QUARANTINED, items, sequential,
+                    Instant.parse(now));
             return new StoredResponse(201, toJson(body));
         });
     }
@@ -156,6 +171,87 @@ public class BatchService {
     }
 
     /**
+     * 提交合成序贯检验结果：初始似然比 1，GOOD 乘 3、BAD 乘 1/3，精确分数落库；
+     * 比值 &gt;= 9 即 PASS、&lt;= 1/9 即 FAIL（同时批次 REJECTED）、满 10 次未到阈值为 INCONCLUSIVE；
+     * 仅 CONTINUE 允许下一结果。编号从 1 连续递增，跳号/覆盖/终止后提交均 409；
+     * 与批准、拆分、祖先召回共用同一套状态与血缘校验。requestId 全局幂等：
+     * 同键同参重放首次完整响应，同键改参 409，失败不占键。
+     */
+    public StoredResponse submitSequentialResult(String batchKey, SubmitSequentialResultRequest req) {
+        String operator = req.operator().trim();
+        // 结构化身份：操作 + 资源（批次）+ 全部参数 + 期望版本（sampleNumber 即期望的下一序号）；
+        // 数值按规范值、文本按原样参与指纹
+        String fingerprint = fingerprint("sequential-result", batchKey,
+                req.sampleNumber().toString(), req.outcome().name(), operator);
+        return executeIdempotent(CMD_SEQUENTIAL, req.requestId(), fingerprint, () -> {
+            BatchRepository.BatchRow batch = repo.findBatchForUpdate(batchKey)
+                    .orElseThrow(() -> ApiException.notFound("批次不存在: " + batchKey));
+            // 行锁后重查命令快照：并发同键请求在锁等待期间可能已由对方提交，须重放首次结果
+            var logged = loggedResponse(CMD_SEQUENTIAL, req.requestId(), fingerprint);
+            if (logged.isPresent()) {
+                return logged.get();
+            }
+            assertNoRecalledAncestor(batchKey);
+            BatchStatus status = BatchStatus.valueOf(batch.status());
+            if (status == BatchStatus.REJECTED || status == BatchStatus.RELEASED
+                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT) {
+                throw ApiException.conflict("批次状态 " + status + " 不允许提交序贯检验结果");
+            }
+            if (!batch.sequentialRequired()) {
+                throw ApiException.unprocessable("该批次未启用合成序贯检验: " + batchKey);
+            }
+            List<BatchRepository.SequentialRow> rows = repo.findSequentialResults(batchKey);
+            if (!rows.isEmpty()) {
+                BatchRepository.SequentialRow last = rows.get(rows.size() - 1);
+                if (!SequentialAssayStatus.CONTINUE.name().equals(last.assayStatus())) {
+                    throw ApiException.conflict("序贯检验已终止（" + last.assayStatus()
+                            + "），完整前缀、分数与结论已冻结，不再接受新结果");
+                }
+            }
+            int expected = rows.size() + 1;
+            if (req.sampleNumber() != expected) {
+                throw ApiException.conflict(req.sampleNumber() < expected
+                        ? "样本编号 " + req.sampleNumber() + " 已存在，样本不可覆盖"
+                        : "样本编号跳号：期望 " + expected + "，收到 " + req.sampleNumber());
+            }
+            long num = rows.isEmpty() ? 1L : rows.get(rows.size() - 1).ratioNum();
+            long den = rows.isEmpty() ? 1L : rows.get(rows.size() - 1).ratioDen();
+            if (req.outcome() == SequentialOutcome.GOOD) {
+                num *= 3L;
+            } else {
+                den *= 3L;
+            }
+            // 约分为最简精确分数（如 3/3 → 1/1），阈值判定与展示均基于约分后的值
+            long gcd = gcd(num, den);
+            num /= gcd;
+            den /= gcd;
+            SequentialAssayStatus assayStatus;
+            if (num >= 9L * den) {
+                assayStatus = SequentialAssayStatus.PASS;
+            } else if (9L * num <= den) {
+                assayStatus = SequentialAssayStatus.FAIL;
+            } else if (expected == SEQUENTIAL_MAX_SAMPLES) {
+                assayStatus = SequentialAssayStatus.INCONCLUSIVE;
+            } else {
+                assayStatus = SequentialAssayStatus.CONTINUE;
+            }
+            String now = now();
+            repo.insertSequentialResult(new BatchRepository.SequentialRow(0L, batchKey, expected,
+                    req.outcome().name(), num, den, assayStatus.name(), operator,
+                    req.requestId(), now));
+            BatchStatus newStatus = status;
+            if (assayStatus == SequentialAssayStatus.FAIL) {
+                newStatus = BatchStatus.REJECTED;
+                repo.updateStatus(batchKey, newStatus.name());
+            }
+            SequentialResultResponse body = new SequentialResultResponse(batchKey, req.requestId(),
+                    expected, req.outcome(), operator, assayStatus, num, den,
+                    ratioDisplay(num, den), newStatus, Instant.parse(now));
+            return new StoredResponse(201, toJson(body));
+        });
+    }
+
+    /**
      * 批准：两步放行。首个有效批准进入 RELEASE_REVIEW，第二个不同角色、不同批准人批准后 RELEASED。
      */
     public StoredResponse approve(String batchKey, String actorId, String roleHeader, ApproveRequest req) {
@@ -175,6 +271,14 @@ public class BatchService {
             }
             if (status != BatchStatus.PENDING_RELEASE && status != BatchStatus.RELEASE_REVIEW) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许批准");
+            }
+            // 启用合成序贯检验的批次：检验必须 PASS 方可批准（INCONCLUSIVE/CONTINUE/未开始均不可）
+            if (batch.sequentialRequired()) {
+                String assay = currentAssayStatus(batchKey);
+                if (!SequentialAssayStatus.PASS.name().equals(assay)) {
+                    throw ApiException.unprocessable(
+                            "合成序贯检验未通过（当前 " + assay + "），不能批准");
+                }
             }
             boolean actorInspected = repo.findTests(batchKey).stream()
                     .anyMatch(t -> t.inspector().equals(actor));
@@ -286,7 +390,59 @@ public class BatchService {
                 .map(r -> new RecallResponse(r.batchKey(), r.actorId(), r.reason(),
                         BatchStatus.RECALLED, Instant.parse(r.createdAt())))
                 .orElse(null);
-        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall);
+        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall,
+                sequentialView(batch));
+    }
+
+    /**
+     * 序贯检验历史视图：未启用该检验类型的批次返回 null；启用批次返回完整前缀、
+     * 精确分数与结论（终止后冻结，不随后代批次变化）。
+     */
+    private SequentialAssayView sequentialView(BatchRepository.BatchRow batch) {
+        if (!batch.sequentialRequired()) {
+            return null;
+        }
+        List<BatchRepository.SequentialRow> rows = repo.findSequentialResults(batch.batchKey());
+        List<SequentialAssayView.Entry> entries = new ArrayList<>(rows.size());
+        for (BatchRepository.SequentialRow r : rows) {
+            entries.add(new SequentialAssayView.Entry(r.sampleNumber(),
+                    SequentialOutcome.valueOf(r.outcome()), r.operator(), r.ratioNum(),
+                    r.ratioDen(), SequentialAssayStatus.valueOf(r.assayStatus()),
+                    Instant.parse(r.createdAt())));
+        }
+        long num = rows.isEmpty() ? 1L : rows.get(rows.size() - 1).ratioNum();
+        long den = rows.isEmpty() ? 1L : rows.get(rows.size() - 1).ratioDen();
+        return new SequentialAssayView(
+                SequentialAssayStatus.valueOf(currentAssayStatus(batch.batchKey())),
+                rows.size() + 1, num, den, ratioDisplay(num, den), entries);
+    }
+
+    /**
+     * 当前序贯检验结论：无结果为 NOT_STARTED，否则取最新一条结果落定后的结论。
+     */
+    private String currentAssayStatus(String batchKey) {
+        List<BatchRepository.SequentialRow> rows = repo.findSequentialResults(batchKey);
+        return rows.isEmpty()
+                ? SequentialAssayStatus.NOT_STARTED.name()
+                : rows.get(rows.size() - 1).assayStatus();
+    }
+
+    /**
+     * 展示用十进制小数（6 位，HALF_UP）；阈值判定只使用精确分数，不用该展示值。
+     */
+    private String ratioDisplay(long num, long den) {
+        return BigDecimal.valueOf(num)
+                .divide(BigDecimal.valueOf(den), 6, RoundingMode.HALF_UP)
+                .toPlainString();
+    }
+
+    private long gcd(long a, long b) {
+        while (b != 0) {
+            long t = a % b;
+            a = b;
+            b = t;
+        }
+        return a;
     }
 
     /**
@@ -343,7 +499,8 @@ public class BatchService {
     private BatchResponse toBatchResponse(BatchRepository.BatchRow row) {
         return new BatchResponse(row.batchKey(), row.productCode(), row.batchNo(),
                 Instant.parse(row.producedAt()), BatchStatus.valueOf(row.status()),
-                repo.findRequiredTests(row.batchKey()), Instant.parse(row.createdAt()));
+                repo.findRequiredTests(row.batchKey()), row.sequentialRequired(),
+                Instant.parse(row.createdAt()));
     }
 
     private TestResultResponse toTestResponse(BatchRepository.TestRow row, String batchStatus) {
@@ -458,8 +615,10 @@ public class BatchService {
             List<SplitResponse.SplitChild> childBodies = new ArrayList<>(children.size());
             for (int i = 0; i < children.size(); i++) {
                 SplitRequest.ChildSpec spec = children.get(i);
+                // 子批继承序贯检验标记但独立重新检验：不继承父批比值与任何结果
                 repo.insertBatch(new BatchRepository.BatchRow(0L, spec.batchKey(), parent.productCode(),
-                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(), now));
+                        spec.batchNo(), parent.producedAt(), BatchStatus.QUARANTINED.name(),
+                        parent.sequentialRequired(), now));
                 for (int j = 0; j < required.size(); j++) {
                     repo.insertRequiredTest(spec.batchKey(), required.get(j), j + 1);
                 }

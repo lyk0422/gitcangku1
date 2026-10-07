@@ -17,7 +17,8 @@ public class BatchRepository {
      * batch 表行记录；id 同时作为同批次事件的提交顺序依据。
      */
     public record BatchRow(long id, String batchKey, String productCode, String batchNo,
-                           String producedAt, String status, String createdAt) {
+                           String producedAt, String status, boolean sequentialRequired,
+                           String createdAt) {
     }
 
     /**
@@ -54,10 +55,19 @@ public class BatchRepository {
     public record LineageRow(long id, String parentKey, String childKey, int seq, String createdAt) {
     }
 
+    /**
+     * sequential_result 表行记录：序贯检验单个样本结果及其落定后的精确分数与结论快照。
+     */
+    public record SequentialRow(long id, String batchKey, int sampleNumber, String outcome,
+                                long ratioNum, long ratioDen, String assayStatus,
+                                String operator, String requestId, String createdAt) {
+    }
+
     private static final RowMapper<BatchRow> BATCH_MAPPER = (rs, n) -> new BatchRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("product_code"),
             rs.getString("batch_no"), rs.getString("produced_at"),
-            rs.getString("status"), rs.getString("created_at"));
+            rs.getString("status"), rs.getBoolean("sequential_required"),
+            rs.getString("created_at"));
 
     private static final RowMapper<TestRow> TEST_MAPPER = (rs, n) -> new TestRow(
             rs.getLong("id"), rs.getString("batch_key"), rs.getString("test_key"),
@@ -81,6 +91,12 @@ public class BatchRepository {
             rs.getLong("id"), rs.getString("parent_key"), rs.getString("child_key"),
             rs.getInt("seq"), rs.getString("created_at"));
 
+    private static final RowMapper<SequentialRow> SEQUENTIAL_MAPPER = (rs, n) -> new SequentialRow(
+            rs.getLong("id"), rs.getString("batch_key"), rs.getInt("sample_number"),
+            rs.getString("outcome"), rs.getLong("ratio_num"), rs.getLong("ratio_den"),
+            rs.getString("assay_status"), rs.getString("operator"),
+            rs.getString("request_id"), rs.getString("created_at"));
+
     private final JdbcTemplate jdbc;
 
     public BatchRepository(JdbcTemplate jdbc) {
@@ -101,10 +117,10 @@ public class BatchRepository {
     }
 
     public void insertBatch(BatchRow row) {
-        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status, created_at)"
-                        + " VALUES (?, ?, ?, ?, ?, ?)",
+        jdbc.update("INSERT INTO batch (batch_key, product_code, batch_no, produced_at, status,"
+                        + " sequential_required, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 row.batchKey(), row.productCode(), row.batchNo(), row.producedAt(),
-                row.status(), row.createdAt());
+                row.status(), row.sequentialRequired(), row.createdAt());
     }
 
     public void insertRequiredTest(String batchKey, String testItem, int seq) {
@@ -208,5 +224,24 @@ public class BatchRepository {
     public List<String> findRecalledKeys() {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
+    }
+
+    /**
+     * 追加一条序贯检验结果；编号由服务层按行锁串行化保证连续，唯一约束兜底。
+     */
+    public void insertSequentialResult(SequentialRow row) {
+        jdbc.update("INSERT INTO sequential_result (batch_key, sample_number, outcome, ratio_num,"
+                        + " ratio_den, assay_status, operator, request_id, created_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.batchKey(), row.sampleNumber(), row.outcome(), row.ratioNum(), row.ratioDen(),
+                row.assayStatus(), row.operator(), row.requestId(), row.createdAt());
+    }
+
+    /**
+     * 某批次全部序贯检验结果，按结果编号升序（即提交顺序，前缀不可改写）。
+     */
+    public List<SequentialRow> findSequentialResults(String batchKey) {
+        return jdbc.query("SELECT * FROM sequential_result WHERE batch_key = ?"
+                + " ORDER BY sample_number", SEQUENTIAL_MAPPER, batchKey);
     }
 }

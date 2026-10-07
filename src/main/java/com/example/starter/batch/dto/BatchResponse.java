@@ -6,7 +6,8 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * 批次概要响应。producedAt/createdAt 为 UTC instant。
+ * 批次概要响应。producedAt/createdAt 为 UTC instant；
+ * sequentialAssay 标识该批次是否启用合成序贯检验。
  */
 public record BatchResponse(
         String batchKey,
@@ -15,6 +16,7 @@ public record BatchResponse(
         Instant producedAt,
         BatchStatus status,
         List<String> requiredTests,
+        boolean sequentialAssay,
         Instant createdAt
 ) {
 }

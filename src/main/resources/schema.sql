@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS batch (
     batch_no VARCHAR(64) NOT NULL COMMENT '批号，创建后不可修改',
     produced_at VARCHAR(40) NOT NULL COMMENT '生产时间，ISO-8601 UTC  instant 字符串',
     status VARCHAR(32) NOT NULL COMMENT '批次状态：QUARANTINED/PENDING_RELEASE/RELEASE_REVIEW/RELEASED/REJECTED/RECALLED/SPLIT',
+    sequential_required BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否启用合成序贯检验：TRUE 时批准前序贯检验必须 PASS；拆分子批继承该标记但不继承检验数据；FALSE 批次保持原规则',
     created_at VARCHAR(40) NOT NULL COMMENT '创建时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_batch_key UNIQUE (batch_key)
 );
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS recall (
 );
 
 CREATE TABLE IF NOT EXISTS command_log (
-    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT',
+    command_type VARCHAR(32) NOT NULL COMMENT '命令类型：CREATE_BATCH/SUBMIT_TEST/APPROVE/RECALL/SPLIT/SEQUENTIAL_RESULT',
     command_key VARCHAR(64) NOT NULL COMMENT '命令幂等键；同类型同键同参重放返回首次结果，同键改参返回 409',
     fingerprint VARCHAR(64) NOT NULL COMMENT '业务参数（不含 commandKey）的 SHA-256 摘要，用于识别同键改参',
     response_status INT NOT NULL COMMENT '首次执行成功的 HTTP 状态码',
@@ -65,4 +66,21 @@ CREATE TABLE IF NOT EXISTS batch_lineage (
     seq INT NOT NULL COMMENT '子批在拆分请求中的顺序，从 1 开始',
     created_at VARCHAR(40) NOT NULL COMMENT '拆分时间，ISO-8601 UTC instant 字符串',
     CONSTRAINT uk_lineage_child UNIQUE (child_key)
+);
+
+-- 合成序贯检验结果：每批最多 10 个连续编号样本，编号从 1 递增、不可跳号不可覆盖；
+-- 初始似然比 1，GOOD 乘 3、BAD 乘 1/3，以精确分数（分子/分母）保存，展示小数不参与阈值判定；
+-- 比值 >= 9 即 PASS、<= 1/9 即 FAIL、满 10 次未到阈值为 INCONCLUSIVE，终止后冻结前缀、分数与结论。
+CREATE TABLE IF NOT EXISTS sequential_result (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为同批次结果提交顺序依据',
+    batch_key VARCHAR(64) NOT NULL COMMENT '所属批次业务键',
+    sample_number INT NOT NULL COMMENT '结果编号，从 1 连续递增，每批最多 10；跳号或覆盖已终止检验均拒绝',
+    outcome VARCHAR(8) NOT NULL COMMENT '样本结论：GOOD（乘 3）/BAD（乘 1/3）',
+    ratio_num BIGINT NOT NULL COMMENT '该结果落定后似然比精确分数的分子',
+    ratio_den BIGINT NOT NULL COMMENT '该结果落定后似然比精确分数的分母',
+    assay_status VARCHAR(16) NOT NULL COMMENT '该结果落定后检验结论：CONTINUE/PASS/FAIL/INCONCLUSIVE；仅 CONTINUE 允许下一结果',
+    operator VARCHAR(64) NOT NULL COMMENT '操作者标识，非空',
+    request_id VARCHAR(64) NOT NULL COMMENT '全局幂等键；同键同参重放首次响应，同键改参 409，失败不占键',
+    created_at VARCHAR(40) NOT NULL COMMENT '提交时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_sequential_sample UNIQUE (batch_key, sample_number)
 );
