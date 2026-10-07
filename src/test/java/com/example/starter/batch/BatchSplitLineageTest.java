@@ -51,6 +51,10 @@ class BatchSplitLineageTest {
         jdbc.update("DELETE FROM test_result");
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
+        jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM batch_certificate_binding");
+        jdbc.update("DELETE FROM certificate_declaration");
+        jdbc.update("DELETE FROM merge_lineage");
         jdbc.update("DELETE FROM batch");
     }
 
@@ -563,7 +567,7 @@ class BatchSplitLineageTest {
     }
 
     /**
-     * 让批次走完 检验 PASS + 双角色批准 进入 RELEASED。
+     * 让批次走完 检验 PASS + 双角色批准 进入 RELEASED；放行前先确保已绑定合格证。
      */
     private void releaseBatch(String batchKey, String inspector) throws Exception {
         MvcResult history = mockMvc.perform(get("/api/batches/" + batchKey + "/history"))
@@ -572,8 +576,52 @@ class BatchSplitLineageTest {
         for (JsonNode item : node.path("batch").path("requiredTests")) {
             submitTest(batchKey, item.asText(), "PASS", inspector, 201);
         }
+        bindIfAbsent(batchKey);
         approve(batchKey, "qa-" + unique(), "QUALITY", "CK-AQ-" + unique(), 201);
         approve(batchKey, "ops-" + unique(), "OPERATIONS", "CK-AO-" + unique(), 201);
+    }
+
+    /**
+     * 本用例共享的合格证声明键（每个用例一份，懒发布；前缀 L 覆盖全部测试批号）。
+     */
+    private String declKey;
+
+    private void ensureDeclaration() throws Exception {
+        if (declKey != null) {
+            return;
+        }
+        declKey = "DECL-" + unique();
+        mockMvc.perform(post("/api/certificates/declarations")
+                        .header("X-Actor-Id", "supplier-1")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"CK-DECL-" + unique()
+                                + "\",\"declarationKey\":\"" + declKey
+                                + "\",\"version\":1,\"materialCode\":\"PROD-1\","
+                                + "\"batchNoPrefix\":\"L\",\"priority\":1,"
+                                + "\"validFrom\":\"2020-01-01T00:00:00Z\","
+                                + "\"validTo\":\"2030-01-01T00:00:00Z\"}"))
+                .andExpect(status().isCreated());
+    }
+
+    /**
+     * 若批次尚未绑定（拆分产物会继承父批绑定）则绑定到本用例声明。
+     */
+    private void bindIfAbsent(String batchKey) throws Exception {
+        ensureDeclaration();
+        MvcResult status = mockMvc.perform(get("/api/batches/" + batchKey + "/certificate"))
+                .andExpect(status().isOk()).andReturn();
+        if (!objectMapper.readTree(status.getResponse().getContentAsString())
+                .path("binding").isNull()) {
+            return;
+        }
+        mockMvc.perform(post("/api/certificates/bindings")
+                        .header("X-Actor-Id", "planner-1")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"CK-BIND-" + unique()
+                                + "\",\"bindings\":[{\"batchKey\":\"" + batchKey
+                                + "\",\"declarationKey\":\"" + declKey
+                                + "\",\"declarationVersion\":1}]}"))
+                .andExpect(status().isCreated());
     }
 
     private void submitTest(String batchKey, String item, String result, String inspector,

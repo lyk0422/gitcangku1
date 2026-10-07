@@ -57,6 +57,59 @@ CREATE TABLE IF NOT EXISTS command_log (
     CONSTRAINT pk_command_log PRIMARY KEY (command_type, command_key)
 );
 
+-- 供应商合格证声明：版本化；有效区间为 UTC 左闭右开 [valid_from, valid_to)。
+CREATE TABLE IF NOT EXISTS certificate_declaration (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    declaration_key VARCHAR(64) NOT NULL COMMENT '声明业务键，与版本号共同唯一',
+    version INT NOT NULL COMMENT '声明版本号，从 1 开始；同一声明键的各版本不可改写',
+    material_code VARCHAR(64) NOT NULL COMMENT '适用物料代码，与批次 product_code 精确匹配',
+    batch_no_prefix VARCHAR(64) NOT NULL COMMENT '允许的批号前缀，批次 batch_no 以该前缀开头方可匹配',
+    priority INT NOT NULL COMMENT '匹配优先级；同物料下不同声明键的前缀重叠且优先级相同则拒绝发布',
+    valid_from VARCHAR(40) NOT NULL COMMENT '有效区间起点（含），ISO-8601 UTC instant 字符串',
+    valid_to VARCHAR(40) NOT NULL COMMENT '有效区间终点（不含），ISO-8601 UTC instant 字符串，必须晚于起点',
+    status VARCHAR(16) NOT NULL COMMENT '声明状态：ACTIVE/WITHDRAWN；撤回只影响后续绑定与放行，不改写历史',
+    published_by VARCHAR(64) NOT NULL COMMENT '发布操作人标识',
+    created_at VARCHAR(40) NOT NULL COMMENT '发布时间，ISO-8601 UTC instant 字符串',
+    withdrawn_at VARCHAR(40) NULL COMMENT '撤回时间，ISO-8601 UTC instant 字符串；NULL 表示未撤回',
+    withdrawn_by VARCHAR(64) NULL COMMENT '撤回操作人标识；NULL 表示未撤回',
+    withdraw_reason VARCHAR(512) NULL COMMENT '撤回原因；NULL 表示未撤回',
+    CONSTRAINT uk_declaration_version UNIQUE (declaration_key, version)
+);
+
+-- 批次合格证绑定：每批最多一条，创建后不可改写；拆分产物继承同一引用。
+CREATE TABLE IF NOT EXISTS batch_certificate_binding (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '批次业务键，全表唯一（每批至多一条有效绑定）',
+    declaration_key VARCHAR(64) NOT NULL COMMENT '绑定的声明业务键',
+    declaration_version INT NOT NULL COMMENT '绑定的声明版本号',
+    matched_prefix VARCHAR(64) NOT NULL COMMENT '绑定时匹配成功的批号前缀快照',
+    bound_by VARCHAR(64) NOT NULL COMMENT '绑定操作人标识',
+    created_at VARCHAR(40) NOT NULL COMMENT '绑定时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_binding_batch UNIQUE (batch_key)
+);
+
+-- 放行快照：放行时点固化的声明版本、匹配前缀与时点；此后声明撤回不改写本快照。
+CREATE TABLE IF NOT EXISTS release_snapshot (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    batch_key VARCHAR(64) NOT NULL COMMENT '批次业务键，全表唯一（每批至多放行一次）',
+    declaration_key VARCHAR(64) NOT NULL COMMENT '放行时校验通过的声明业务键',
+    declaration_version INT NOT NULL COMMENT '放行时校验通过的声明版本号',
+    matched_prefix VARCHAR(64) NOT NULL COMMENT '放行时匹配成功的批号前缀',
+    released_at VARCHAR(40) NOT NULL COMMENT '放行时点，ISO-8601 UTC instant 字符串',
+    created_at VARCHAR(40) NOT NULL COMMENT '快照写入时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_release_batch UNIQUE (batch_key)
+);
+
+-- 合批血缘：一个合批产物可有多个父批；每个父批至多参与一次合批；关系创建后不可改写。
+CREATE TABLE IF NOT EXISTS merge_lineage (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为合批关系创建顺序依据',
+    child_key VARCHAR(64) NOT NULL COMMENT '合批产物业务键',
+    parent_key VARCHAR(64) NOT NULL COMMENT '父批业务键，合批后置为 MERGED；每个父批至多参与一次合批',
+    seq INT NOT NULL COMMENT '父批在合批请求中的顺序，从 1 开始',
+    created_at VARCHAR(40) NOT NULL COMMENT '合批时间，ISO-8601 UTC instant 字符串',
+    CONSTRAINT uk_merge_parent UNIQUE (parent_key)
+);
+
 -- 拆分血缘：仅记录父子追溯关系，不涉及数量分摊；关系创建后不可改写。
 CREATE TABLE IF NOT EXISTS batch_lineage (
     id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键，同时作为拆分关系创建顺序依据',

@@ -50,6 +50,10 @@ class BatchFlowTest {
         jdbc.update("DELETE FROM test_result");
         jdbc.update("DELETE FROM batch_required_test");
         jdbc.update("DELETE FROM batch_lineage");
+        jdbc.update("DELETE FROM release_snapshot");
+        jdbc.update("DELETE FROM batch_certificate_binding");
+        jdbc.update("DELETE FROM certificate_declaration");
+        jdbc.update("DELETE FROM merge_lineage");
         jdbc.update("DELETE FROM batch");
     }
 
@@ -59,6 +63,7 @@ class BatchFlowTest {
     void happyFlow_quarantineToReleasedThenRecalled() throws Exception {
         String batchKey = "BK-HAPPY-" + unique();
         createBatch(batchKey, List.of("外观", "含量", "无菌"), 201);
+        bind(batchKey);
 
         // 初始隔离，出现在可用列表
         assertEquals("QUARANTINED", currentStatus(batchKey));
@@ -129,6 +134,7 @@ class BatchFlowTest {
     void approvalConstraints_duplicateRole_sameActor_inspectorRejected() throws Exception {
         String batchKey = "BK-CONSTRAINT-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
+        bind(batchKey);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "inspector-1"), null, null, 201);
 
         // 检验人不能批准
@@ -283,6 +289,7 @@ class BatchFlowTest {
     void approvalAndRecall_commandKeyReplayAndConflict() throws Exception {
         String batchKey = "BK-CMD-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
+        bind(batchKey);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
 
         String body = "{\"commandKey\":\"CK-A1\"}";
@@ -402,6 +409,7 @@ class BatchFlowTest {
     void concurrentRecallAndFinalApproval_cannotReleaseAfterRecall() throws Exception {
         String batchKey = "BK-RACE-RC-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
+        bind(batchKey);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
         approve(batchKey, "qa", "QUALITY", "CK-Q", 201);
 
@@ -443,6 +451,7 @@ class BatchFlowTest {
     void dataIsPersistedInTables() throws Exception {
         String batchKey = "BK-PERSIST-" + unique();
         createBatch(batchKey, List.of("t1"), 201);
+        bind(batchKey);
         submitTest(batchKey, testReq("TK-1", "t1", "PASS", "insp"), null, null, 201);
         approve(batchKey, "qa", "QUALITY", "CK-A1", 201);
         approve(batchKey, "ops", "OPERATIONS", "CK-A2", 201);
@@ -494,6 +503,49 @@ class BatchFlowTest {
     }
 
     // ---------- helpers ----------
+
+    /**
+     * 本测试用例共享的合格证声明键（每个用例一份，懒发布）。
+     */
+    private String declKey;
+
+    private record DeclCmd(String commandKey, String declarationKey, int version,
+                           String materialCode, String batchNoPrefix, int priority,
+                           Instant validFrom, Instant validTo) {
+    }
+
+    /**
+     * 发布本用例的合格证声明：物料 PROD-1、前缀 LOT、区间覆盖测试时钟。
+     */
+    private void ensureDeclaration() throws Exception {
+        if (declKey != null) {
+            return;
+        }
+        declKey = "DECL-" + unique();
+        mockMvc.perform(post("/api/certificates/declarations")
+                        .header("X-Actor-Id", "supplier-1")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new DeclCmd("CK-DECL-" + unique(),
+                                declKey, 1, "PROD-1", "LOT", 1,
+                                Instant.parse("2020-01-01T00:00:00Z"),
+                                Instant.parse("2030-01-01T00:00:00Z")))))
+                .andExpect(status().isCreated());
+    }
+
+    /**
+     * 绑定批次到本用例声明（放行门禁前置条件）。
+     */
+    private void bind(String batchKey) throws Exception {
+        ensureDeclaration();
+        mockMvc.perform(post("/api/certificates/bindings")
+                        .header("X-Actor-Id", "planner-1")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"commandKey\":\"CK-BIND-" + unique()
+                                + "\",\"bindings\":[{\"batchKey\":\"" + batchKey
+                                + "\",\"declarationKey\":\"" + declKey
+                                + "\",\"declarationVersion\":1}]}"))
+                .andExpect(status().isCreated());
+    }
 
     private record CreateCmd(String commandKey, String batchKey, String productCode, String batchNo,
                              Instant producedAt, List<String> requiredTests) {

@@ -8,6 +8,11 @@ import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
+import com.example.starter.certificate.CertificateService;
+import com.example.starter.certificate.MergeService;
+import com.example.starter.certificate.dto.CertificateDiagnosticsResponse;
+import com.example.starter.certificate.dto.CertificateStatusResponse;
+import com.example.starter.certificate.dto.MergeBatchesRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -30,9 +35,14 @@ import java.util.List;
 public class BatchController {
 
     private final BatchService service;
+    private final CertificateService certificateService;
+    private final MergeService mergeService;
 
-    public BatchController(BatchService service) {
+    public BatchController(BatchService service, CertificateService certificateService,
+                           MergeService mergeService) {
         this.service = service;
+        this.certificateService = certificateService;
+        this.mergeService = mergeService;
     }
 
     /**
@@ -112,6 +122,33 @@ public class BatchController {
     @GetMapping("/{batchKey}/descendants")
     public List<LineageEntryResponse> descendants(@PathVariable String batchKey) {
         return service.listDescendants(batchKey);
+    }
+
+    /**
+     * 合批：2～5 个当前可用的 RELEASED 父批合并为一个全新子批，父批置为 MERGED；
+     * 重新校验所有父批物料与绑定声明，任一失效整次回滚。
+     */
+    @PostMapping("/merge")
+    public ResponseEntity<String> merge(
+            @RequestHeader(name = "X-Actor-Id", required = false) String actorId,
+            @Valid @RequestBody MergeBatchesRequest request) {
+        return stored(mergeService.merge(actorId, request));
+    }
+
+    /**
+     * 批次合格证状态：绑定（未绑定为 null）与放行快照（未放行为 null）。
+     */
+    @GetMapping("/{batchKey}/certificate")
+    public CertificateStatusResponse certificate(@PathVariable String batchKey) {
+        return certificateService.certificateStatus(batchKey);
+    }
+
+    /**
+     * 批次合格证匹配诊断：对全部声明版本逐一评估，稳定排序，只读。
+     */
+    @GetMapping("/{batchKey}/certificate/diagnostics")
+    public CertificateDiagnosticsResponse certificateDiagnostics(@PathVariable String batchKey) {
+        return certificateService.diagnostics(batchKey);
     }
 
     private ResponseEntity<String> stored(StoredResponse response) {

@@ -12,6 +12,9 @@ import com.example.starter.batch.dto.SplitRequest;
 import com.example.starter.batch.dto.SplitResponse;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import com.example.starter.batch.dto.TestResultResponse;
+import com.example.starter.certificate.CertificateRepository;
+import com.example.starter.certificate.dto.BindingResponse;
+import com.example.starter.certificate.dto.ReleaseSnapshotResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -59,13 +62,16 @@ public class BatchService {
     private static final int IDEMPOTENCY_MAX_ATTEMPTS = 3;
 
     private final BatchRepository repo;
+    private final CertificateRepository certRepo;
     private final TransactionTemplate tx;
     private final ObjectMapper objectMapper;
 
     public BatchService(BatchRepository repo,
+                        CertificateRepository certRepo,
                         PlatformTransactionManager transactionManager,
                         ObjectMapper objectMapper) {
         this.repo = repo;
+        this.certRepo = certRepo;
         this.tx = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -123,7 +129,8 @@ public class BatchService {
             BatchStatus status = BatchStatus.valueOf(batch.status());
             assertNoRecalledAncestor(batchKey);
             if (status == BatchStatus.REJECTED || status == BatchStatus.RELEASED
-                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT) {
+                    || status == BatchStatus.RECALLED || status == BatchStatus.SPLIT
+                    || status == BatchStatus.MERGED) {
                 throw ApiException.conflict("批次状态 " + status + " 不允许提交检验");
             }
             List<String> required = repo.findRequiredTests(batchKey);
@@ -202,6 +209,11 @@ public class BatchService {
             }
             repo.insertApproval(new BatchRepository.ApprovalRow(0L, batchKey, req.commandKey(),
                     actor, role.name(), seq, now));
+            if (newStatus == BatchStatus.RELEASED) {
+                // 放行门禁：必须已绑定与物料、批号匹配且在放行时点有效的声明版本；
+                // 同事务固化放行快照（声明版本、匹配前缀、时点），此后声明撤回不改写
+                enforceCertificateGate(batchKey, batch, now);
+            }
             repo.updateStatus(batchKey, newStatus.name());
             ApprovalResponse body = new ApprovalResponse(batchKey, actor, role, seq, newStatus,
                     Instant.parse(now));
@@ -245,7 +257,7 @@ public class BatchService {
     }
 
     /**
-     * 当前可用批次：排除已召回（RECALLED）、已拆分（SPLIT）批次，
+     * 当前可用批次：排除已召回（RECALLED）、已拆分（SPLIT）、已合批（MERGED）批次，
      * 以及任一祖先被召回的后代批次；后代自身状态不改写。
      */
     public List<BatchResponse> listAvailable() {
@@ -253,6 +265,7 @@ public class BatchService {
         Set<String> recalled = new HashSet<>(repo.findRecalledKeys());
         return repo.findAvailableBatches().stream()
                 .filter(b -> !BatchStatus.SPLIT.name().equals(b.status()))
+                .filter(b -> !BatchStatus.MERGED.name().equals(b.status()))
                 .filter(b -> recalledAncestor(b.batchKey(), parentOf, recalled).isEmpty())
                 .map(this::toBatchResponse)
                 .toList();
@@ -286,7 +299,17 @@ public class BatchService {
                 .map(r -> new RecallResponse(r.batchKey(), r.actorId(), r.reason(),
                         BatchStatus.RECALLED, Instant.parse(r.createdAt())))
                 .orElse(null);
-        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall);
+        BindingResponse binding = certRepo.findBinding(batchKey)
+                .map(b -> new BindingResponse(b.batchKey(), b.declarationKey(),
+                        b.declarationVersion(), b.matchedPrefix(), b.boundBy(),
+                        Instant.parse(b.createdAt())))
+                .orElse(null);
+        ReleaseSnapshotResponse releaseSnapshot = certRepo.findReleaseSnapshot(batchKey)
+                .map(s -> new ReleaseSnapshotResponse(s.batchKey(), s.declarationKey(),
+                        s.declarationVersion(), s.matchedPrefix(), Instant.parse(s.releasedAt())))
+                .orElse(null);
+        return new BatchHistoryResponse(toBatchResponse(batch), tests, approvals, recall,
+                binding, releaseSnapshot);
     }
 
     /**
@@ -465,6 +488,8 @@ public class BatchService {
                 }
                 repo.insertLineage(new BatchRepository.LineageRow(0L, parentKey, spec.batchKey(),
                         i + 1, now));
+                // 拆分产物继承父批合格证绑定引用（不重新校验）；合批产物须重新绑定
+                repo.copyBinding(parentKey, spec.batchKey());
                 childBodies.add(new SplitResponse.SplitChild(spec.batchKey(), spec.batchNo(),
                         parent.productCode(), Instant.parse(parent.producedAt()),
                         BatchStatus.QUARANTINED, required, Instant.parse(now)));
@@ -574,5 +599,42 @@ public class BatchService {
         return new LineageEntryResponse(row.batchKey(), row.batchNo(),
                 BatchStatus.valueOf(row.status()),
                 recalledAncestor(batchKey, parentOf, recalled).orElse(null));
+    }
+
+    /**
+     * 放行门禁：批次必须已绑定合格证声明；声明必须 ACTIVE（未撤回）、物料与批号前缀匹配、
+     * 且放行时点处于有效区间 [validFrom, validTo)（UTC 左闭右开）。校验通过后同事务写入
+     * 放行快照（声明版本、匹配前缀、放行时点）；声明行 SELECT ... FOR UPDATE，
+     * 与并发撤回按事务提交顺序裁决，放行读取一致声明。
+     */
+    private void enforceCertificateGate(String batchKey, BatchRepository.BatchRow batch,
+                                        String now) {
+        CertificateRepository.BindingRow binding = certRepo.findBinding(batchKey)
+                .orElseThrow(() -> ApiException.unprocessable(
+                        "批次未绑定合格证声明，不能放行: " + batchKey));
+        CertificateRepository.DeclarationRow decl = certRepo
+                .findDeclarationForUpdate(binding.declarationKey(), binding.declarationVersion())
+                .orElseThrow(() -> ApiException.unprocessable("绑定的声明版本不存在: "
+                        + binding.declarationKey() + " v" + binding.declarationVersion()));
+        if (!"ACTIVE".equals(decl.status())) {
+            throw ApiException.unprocessable("绑定的声明已撤回（失效）: " + decl.declarationKey()
+                    + " v" + decl.version() + "，不能放行");
+        }
+        if (!decl.materialCode().equals(batch.productCode())) {
+            throw ApiException.unprocessable("批次物料不匹配：批次物料 " + batch.productCode()
+                    + "，声明要求 " + decl.materialCode());
+        }
+        if (!batch.batchNo().startsWith(decl.batchNoPrefix())) {
+            throw ApiException.unprocessable("批号不匹配：批号 " + batch.batchNo()
+                    + " 不以声明允许前缀 " + decl.batchNoPrefix() + " 开头");
+        }
+        Instant at = Instant.parse(now);
+        if (at.isBefore(Instant.parse(decl.validFrom()))
+                || !at.isBefore(Instant.parse(decl.validTo()))) {
+            throw ApiException.unprocessable("放行时点 " + now + " 不在声明有效区间 ["
+                    + decl.validFrom() + ", " + decl.validTo() + ") 内，不能放行");
+        }
+        certRepo.insertReleaseSnapshot(new CertificateRepository.ReleaseSnapshotRow(0L, batchKey,
+                decl.declarationKey(), decl.version(), decl.batchNoPrefix(), now, now));
     }
 }

@@ -209,4 +209,16 @@ public class BatchRepository {
         return jdbc.queryForList("SELECT batch_key FROM batch WHERE status = 'RECALLED'",
                 String.class);
     }
+
+    /**
+     * 拆分产物继承父批合格证绑定引用：若父批存在绑定，则为子批复制同一声明版本、
+     * 匹配前缀、操作人与绑定时间（业务证据不改写）；父批无绑定时不产生任何记录。
+     */
+    public void copyBinding(String parentKey, String childKey) {
+        jdbc.update("INSERT INTO batch_certificate_binding (batch_key, declaration_key,"
+                        + " declaration_version, matched_prefix, bound_by, created_at)"
+                        + " SELECT ?, declaration_key, declaration_version, matched_prefix,"
+                        + " bound_by, created_at FROM batch_certificate_binding WHERE batch_key = ?",
+                childKey, parentKey);
+    }
 }
