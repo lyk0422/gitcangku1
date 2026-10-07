@@ -7,14 +7,15 @@ import java.time.LocalDateTime;
 /**
  * 证物视图。
  *
- * @param evidenceKey 证物业务键
- * @param caseKey     所属案件键
- * @param category    证物类别
- * @param sealNo      封条编号
- * @param custodianId 当前保管人
- * @param status      证物状态
- * @param createdAt   入库时间（Asia/Shanghai）
- * @param updatedAt   最近一次变更时间（Asia/Shanghai）
+ * @param evidenceKey  证物业务键
+ * @param caseKey      所属案件键
+ * @param category     证物类别
+ * @param sealNo       封条编号
+ * @param custodianId  当前保管人
+ * @param status       证物状态
+ * @param contaminated 污染隔离标记：true 已污染（与封条异常分别保存）
+ * @param createdAt    入库时间（Asia/Shanghai）
+ * @param updatedAt    最近一次变更时间（Asia/Shanghai）
  */
 public record EvidenceView(
         String evidenceKey,
@@ -23,6 +24,7 @@ public record EvidenceView(
         String sealNo,
         String custodianId,
         EvidenceStatus status,
+        boolean contaminated,
         LocalDateTime createdAt,
         LocalDateTime updatedAt) {
 }

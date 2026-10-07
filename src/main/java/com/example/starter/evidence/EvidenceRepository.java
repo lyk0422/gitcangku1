@@ -77,6 +77,16 @@ public class EvidenceRepository {
     }
 
     /**
+     * 置位污染隔离标记（不可解除）；与 status 分别保存，不覆盖封条异常。
+     * 调用前必须已通过 {@link #findByKeyForUpdate} 锁定证物行。
+     */
+    public void markContaminated(String evidenceKey, LocalDateTime now) {
+        jdbc.update(
+                "UPDATE evidence SET contaminated = 1, updated_at = ? WHERE evidence_key = ?",
+                now, evidenceKey);
+    }
+
+    /**
      * 查询指定保管人当前可交接的证物（本人保管且状态 SEALED）。
      */
     public List<Evidence> findTransferable(String custodianId) {
@@ -96,6 +106,7 @@ public class EvidenceRepository {
                     rs.getString("seal_no"),
                     rs.getString("custodian_id"),
                     EvidenceStatus.valueOf(rs.getString("status")),
+                    rs.getInt("contaminated") == 1,
                     rs.getObject("created_at", LocalDateTime.class),
                     rs.getObject("updated_at", LocalDateTime.class));
         }

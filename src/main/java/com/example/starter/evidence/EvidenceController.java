@@ -1,6 +1,9 @@
 package com.example.starter.evidence;
 
 import com.example.starter.evidence.dto.CommandRequest;
+import com.example.starter.evidence.dto.ContactBatchRequest;
+import com.example.starter.evidence.dto.ContaminationRequest;
+import com.example.starter.evidence.dto.ContaminationView;
 import com.example.starter.evidence.dto.CustodyChainView;
 import com.example.starter.evidence.dto.EvidenceView;
 import com.example.starter.evidence.dto.IntakeRequest;
@@ -163,6 +166,44 @@ public class EvidenceController {
     @GetMapping("/{evidenceKey}/custody-chain")
     public CustodyChainView custodyChain(@PathVariable String evidenceKey) {
         return evidenceService.custodyChain(evidenceKey);
+    }
+
+    /**
+     * 登记接触批次：当前保管人登记同属自己的 2~5 件 SEALED 未污染证物共用处理台，
+     * 返回全局单调递增的事件序号（作为污染起点引用）。
+     */
+    @PostMapping("/contact-batches")
+    public ResponseEntity<String> registerContactBatch(
+            @RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+            @Valid @RequestBody ContactBatchRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_CONTACT_BATCH, actorId,
+                "contact-batch", request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.registerContactBatch(actorId, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 污染登记：指定一件证物及一个已有事件序号作为污染起点；仅起点证物当前保管人
+     * 可登记（越权 403，先于幂等重放）。按事件序号递增传播，整次原子隔离受影响证物。
+     */
+    @PostMapping("/contaminations")
+    public ResponseEntity<String> registerContamination(
+            @RequestHeader(ACTOR_HEADER) @NotBlank String actorId,
+            @Valid @RequestBody ContaminationRequest request) {
+        String hash = idempotencyAdvisor.hash(EvidenceService.OP_CONTAMINATION_REGISTER, actorId,
+                request.evidenceKey(), request);
+        StoredResponse response = idempotencyAdvisor.guard(request.commandKey(), hash,
+                () -> evidenceService.registerContamination(actorId, request, hash));
+        return toEntity(response);
+    }
+
+    /**
+     * 查询污染事件详情：起点、起点事件序号与冻结的传播路径。
+     */
+    @GetMapping("/contaminations/{contaminationId}")
+    public ContaminationView contaminationDetail(@PathVariable long contaminationId) {
+        return evidenceService.contaminationDetail(contaminationId);
     }
 
     private ResponseEntity<String> toEntity(StoredResponse response) {
