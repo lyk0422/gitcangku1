@@ -8,6 +8,7 @@ import com.example.starter.firmware.api.ReleaseHistoryResponse;
 import com.example.starter.firmware.api.ReleaseView;
 import com.example.starter.firmware.api.ResumeRecordView;
 import com.example.starter.firmware.api.ResumeReleaseRequest;
+import com.example.starter.firmware.domain.MigrationRule;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.error.ApiException;
@@ -20,6 +21,8 @@ import org.springframework.stereotype.Service;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * 发布单生命周期：创建（版本从1开始）、扩量（版本校验+只增不减）、失败率自动暂停、
@@ -53,19 +56,53 @@ public class ReleaseService {
         }
         int sampleFloor = request.effectiveSampleFloor();
         int threshold = request.effectiveFailureThresholdPercent();
+        List<MigrationRule> rules = request.effectiveRules();
+        validateRules(rules);
+        String rulesFingerprint = rules.stream()
+                .map(r -> r.type() + ":" + r.key() + ">" + r.targetKey() + "*" + r.multiplier())
+                .collect(Collectors.joining(";"));
         String fingerprint = String.join("|", "release.create", request.model(), request.fromVersion(),
                 request.toVersion(), String.valueOf(request.ratio()), String.valueOf(sampleFloor),
-                String.valueOf(threshold));
+                String.valueOf(threshold), rulesFingerprint);
         return idempotency.execute(request.requestId(), "release.create", fingerprint, () -> {
             long id;
             try {
                 id = releaseRepository.insert(request.model(), request.fromVersion(), request.toVersion(),
-                        request.ratio(), sampleFloor, threshold);
+                        request.ratio(), sampleFloor, threshold, rules);
             } catch (DuplicateKeyException e) {
                 throw ApiException.conflict("ACTIVE_RELEASE_EXISTS", "型号已存在未终结发布单: " + request.model());
             }
             return ReleaseView.of(findOrder(id));
         }, ReleaseView.class);
+    }
+
+    /**
+     * 迁移规则结构校验：RENAME 需目标键且不得同名、不得带乘数；MULTIPLY 需乘数（1~10）、不得带目标键。
+     */
+    private void validateRules(List<MigrationRule> rules) {
+        for (MigrationRule rule : rules) {
+            switch (rule.type()) {
+                case RENAME -> {
+                    if (rule.targetKey() == null || rule.targetKey().isBlank()) {
+                        throw ApiException.badRequest("INVALID_RULE", "RENAME 规则缺少目标键: " + rule.key());
+                    }
+                    if (rule.targetKey().equals(rule.key())) {
+                        throw ApiException.badRequest("INVALID_RULE", "重命名目标键不得与源键相同: " + rule.key());
+                    }
+                    if (rule.multiplier() != null) {
+                        throw ApiException.badRequest("INVALID_RULE", "RENAME 规则不得携带乘数: " + rule.key());
+                    }
+                }
+                case MULTIPLY -> {
+                    if (rule.multiplier() == null) {
+                        throw ApiException.badRequest("INVALID_RULE", "MULTIPLY 规则缺少乘数: " + rule.key());
+                    }
+                    if (rule.targetKey() != null) {
+                        throw ApiException.badRequest("INVALID_RULE", "MULTIPLY 规则不得携带目标键: " + rule.key());
+                    }
+                }
+            }
+        }
     }
 
     public ReleaseView expand(long releaseId, ExpandReleaseRequest request) {

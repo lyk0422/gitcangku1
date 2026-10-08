@@ -1,8 +1,11 @@
 package com.example.starter.firmware.repo;
 
+import com.example.starter.firmware.domain.MigrationRule;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
@@ -10,6 +13,7 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Repository;
 
 import java.sql.PreparedStatement;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -19,15 +23,22 @@ import java.util.Optional;
 @Repository
 public class ReleaseRepository {
 
+    private static final ObjectMapper JSON = new ObjectMapper();
+
+    private static final TypeReference<List<MigrationRule>> RULE_LIST = new TypeReference<>() {
+    };
+
     private static final RowMapper<ReleaseOrder> MAPPER = (rs, rowNum) -> new ReleaseOrder(
             rs.getLong("id"), rs.getInt("version"), rs.getString("model"),
             rs.getString("from_version"), rs.getString("to_version"),
             rs.getInt("ratio"), ReleaseStatus.valueOf(rs.getString("status")),
             rs.getInt("sample_floor"), rs.getInt("failure_threshold_percent"),
-            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"));
+            rs.getInt("monitor_round"), rs.getInt("round_success"), rs.getInt("round_failed"),
+            parseRules(rs.getString("migration_rules")));
 
     private static final String COLUMNS = "id, version, model, from_version, to_version, ratio, status,"
-            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed";
+            + " sample_floor, failure_threshold_percent, monitor_round, round_success, round_failed,"
+            + " migration_rules";
 
     private final JdbcTemplate jdbc;
 
@@ -36,13 +47,14 @@ public class ReleaseRepository {
     }
 
     public long insert(String model, String fromVersion, String toVersion, int ratio,
-                       int sampleFloor, int failureThresholdPercent) {
+                       int sampleFloor, int failureThresholdPercent, List<MigrationRule> rules) {
         KeyHolder keyHolder = new GeneratedKeyHolder();
         jdbc.update(con -> {
             PreparedStatement ps = con.prepareStatement(
                     "INSERT INTO release_order (version, model, from_version, to_version, ratio, status,"
-                            + " sample_floor, failure_threshold_percent, monitor_round, active_model)"
-                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?)",
+                            + " sample_floor, failure_threshold_percent, monitor_round, active_model,"
+                            + " migration_rules)"
+                            + " VALUES (1, ?, ?, ?, ?, 'ACTIVE', ?, ?, 1, ?, ?)",
                     new String[]{"id"});
             ps.setString(1, model);
             ps.setString(2, fromVersion);
@@ -51,6 +63,7 @@ public class ReleaseRepository {
             ps.setInt(5, sampleFloor);
             ps.setInt(6, failureThresholdPercent);
             ps.setString(7, model);
+            ps.setString(8, writeRules(rules));
             return ps;
         }, keyHolder);
         return keyHolder.getKey().longValue();
@@ -116,5 +129,27 @@ public class ReleaseRepository {
                 + " monitor_round = monitor_round + 1, round_success = 0, round_failed = 0,"
                 + " updated_at = CURRENT_TIMESTAMP"
                 + " WHERE id = ? AND version = ? AND status = 'PAUSED'", id, expectedVersion);
+    }
+
+    private static String writeRules(List<MigrationRule> rules) {
+        if (rules == null || rules.isEmpty()) {
+            return null;
+        }
+        try {
+            return JSON.writeValueAsString(rules);
+        } catch (Exception e) {
+            throw new IllegalStateException("迁移规则序列化失败", e);
+        }
+    }
+
+    private static List<MigrationRule> parseRules(String json) {
+        if (json == null) {
+            return List.of();
+        }
+        try {
+            return JSON.readValue(json, RULE_LIST);
+        } catch (Exception e) {
+            throw new IllegalStateException("迁移规则反序列化失败", e);
+        }
     }
 }

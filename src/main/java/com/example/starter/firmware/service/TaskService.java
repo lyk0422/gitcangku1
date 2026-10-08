@@ -4,13 +4,16 @@ import com.example.starter.firmware.api.PullResponse;
 import com.example.starter.firmware.api.ReceiptRequest;
 import com.example.starter.firmware.api.TaskListResponse;
 import com.example.starter.firmware.api.TaskView;
+import com.example.starter.firmware.domain.ConfigMigration;
 import com.example.starter.firmware.domain.Device;
+import com.example.starter.firmware.domain.MigrationRule;
 import com.example.starter.firmware.domain.ReceiptResult;
 import com.example.starter.firmware.domain.ReleaseOrder;
 import com.example.starter.firmware.domain.ReleaseStatus;
 import com.example.starter.firmware.domain.RolloutTask;
 import com.example.starter.firmware.domain.TaskStatus;
 import com.example.starter.firmware.error.ApiException;
+import com.example.starter.firmware.repo.DeviceConfigRepository;
 import com.example.starter.firmware.repo.DeviceRepository;
 import com.example.starter.firmware.repo.PauseRecordRepository;
 import com.example.starter.firmware.repo.ReleaseRepository;
@@ -21,6 +24,7 @@ import org.springframework.stereotype.Service;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 投放任务：设备拉取与回执。与取消、恢复并发时统一先锁发布单行，再操作任务，形成一致提交顺序。
@@ -32,6 +36,7 @@ public class TaskService {
     private final TaskRepository taskRepository;
     private final ReleaseRepository releaseRepository;
     private final DeviceRepository deviceRepository;
+    private final DeviceConfigRepository deviceConfigRepository;
     private final PauseRecordRepository pauseRecordRepository;
     private final DeviceService deviceService;
     private final ReleaseService releaseService;
@@ -39,12 +44,14 @@ public class TaskService {
     private final Clock clock;
 
     public TaskService(TaskRepository taskRepository, ReleaseRepository releaseRepository,
-                       DeviceRepository deviceRepository, PauseRecordRepository pauseRecordRepository,
+                       DeviceRepository deviceRepository, DeviceConfigRepository deviceConfigRepository,
+                       PauseRecordRepository pauseRecordRepository,
                        DeviceService deviceService, ReleaseService releaseService,
                        IdempotencyService idempotency, Clock clock) {
         this.taskRepository = taskRepository;
         this.releaseRepository = releaseRepository;
         this.deviceRepository = deviceRepository;
+        this.deviceConfigRepository = deviceConfigRepository;
         this.pauseRecordRepository = pauseRecordRepository;
         this.deviceService = deviceService;
         this.releaseService = releaseService;
@@ -55,6 +62,8 @@ public class TaskService {
     /**
      * 设备拉取：已存在任务直接返回；否则仅当型号与当前版本匹配、分桶号小于比例且发布单 ACTIVE 时创建。
      * PAUSED 时不创建新任务，已有任务仍可查看与回执。
+     * 发布单带迁移规则时，在设备行锁内对当前完整配置做预演并冻结配置版本与迁移前后快照；
+     * 预演失败返回 422 且不创建任务。
      */
     public PullResponse pull(String deviceId, String requestId) {
         String fingerprint = String.join("|", "task.pull", deviceId);
@@ -77,7 +86,7 @@ public class TaskService {
             }
             long taskId;
             try {
-                taskId = taskRepository.insert(order.id(), deviceId);
+                taskId = insertWithConfigSnapshot(order, deviceId);
             } catch (DuplicateKeyException e) {
                 RolloutTask task = taskRepository.findByReleaseAndDevice(order.id(), deviceId)
                         .orElseThrow(() -> new IllegalStateException("任务唯一约束冲突后未找到任务"));
@@ -90,8 +99,24 @@ public class TaskService {
     }
 
     /**
-     * 回执：首次回执终结任务并计入完成时所在监控轮次，仅 SUCCESS 更新设备当前版本；
-     * 同结果重复成功（不重复计数），改结果 409；已取消任务的后到回执 409 且不更新设备版本。
+     * 在设备行锁内预演迁移并创建携带冻结快照的任务；无迁移规则时快照为 null。
+     */
+    private long insertWithConfigSnapshot(ReleaseOrder order, String deviceId) {
+        List<MigrationRule> rules = order.rules();
+        if (rules.isEmpty()) {
+            return taskRepository.insert(order.id(), deviceId, null, null, null);
+        }
+        Device lockedDevice = deviceRepository.findByIdForUpdate(deviceId)
+                .orElseThrow(() -> ApiException.notFound("DEVICE_NOT_FOUND", "设备不存在: " + deviceId));
+        Map<String, Integer> before = deviceConfigRepository.findByDevice(deviceId);
+        Map<String, Integer> after = ConfigMigration.preview(before, rules);
+        return taskRepository.insert(order.id(), deviceId, lockedDevice.configVersion(), before, after);
+    }
+
+    /**
+     * 回执：首次回执终结任务并计入完成时所在监控轮次；SUCCESS 同时切换固件与预演后的完整配置
+     * 并推进配置版本，FAILED 不改动二者；同结果重复成功（不重复计数、不重复迁移），改结果 409；
+     * 已取消任务的后到回执 409 且不更新设备版本与配置。
      * 样本达到下限且失败率越限时，同事务将仍为 ACTIVE 的发布单原子转为 PAUSED 并落暂停记录。
      */
     public TaskView receipt(long taskId, ReceiptRequest request) {
@@ -108,7 +133,7 @@ public class TaskService {
                     taskRepository.complete(taskId, request.result());
                     releaseRepository.incrementRoundStats(snapshot.releaseId(), request.result());
                     if (request.result() == ReceiptResult.SUCCESS) {
-                        deviceRepository.updateCurrentVersion(task.deviceId(), lockedOrder.toVersion());
+                        applySuccess(task, lockedOrder);
                     }
                     ReleaseOrder updated = releaseRepository.findById(snapshot.releaseId()).orElseThrow();
                     pauseIfThresholdReached(updated, taskId);
@@ -124,6 +149,19 @@ public class TaskService {
                 case CANCELLED -> throw ApiException.conflict("TASK_CANCELLED", "任务已取消，回执不再受理");
             };
         }, TaskView.class);
+    }
+
+    /**
+     * SUCCESS 回执：在设备行锁内切换固件并整体应用领取时冻结的迁移后配置，配置版本推进到冻结版本+1。
+     */
+    private void applySuccess(RolloutTask task, ReleaseOrder lockedOrder) {
+        deviceRepository.findByIdForUpdate(task.deviceId())
+                .orElseThrow(() -> ApiException.notFound("DEVICE_NOT_FOUND", "设备不存在: " + task.deviceId()));
+        deviceRepository.updateCurrentVersion(task.deviceId(), lockedOrder.toVersion());
+        if (task.configAfter() != null) {
+            deviceConfigRepository.replaceAll(task.deviceId(), task.configAfter());
+            deviceRepository.updateConfigVersion(task.deviceId(), task.configVersion() + 1);
+        }
     }
 
     /**

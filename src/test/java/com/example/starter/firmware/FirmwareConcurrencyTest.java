@@ -70,6 +70,7 @@ class FirmwareConcurrencyTest {
         jdbc.update("DELETE FROM release_pause_record");
         jdbc.update("DELETE FROM release_resume_record");
         jdbc.update("DELETE FROM release_order");
+        jdbc.update("DELETE FROM device_config");
         jdbc.update("DELETE FROM device");
         jdbc.update("DELETE FROM idempotency_record");
         executor = Executors.newFixedThreadPool(8);

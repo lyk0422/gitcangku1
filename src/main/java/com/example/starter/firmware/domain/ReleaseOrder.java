@@ -1,5 +1,7 @@
 package com.example.starter.firmware.domain;
 
+import java.util.List;
+
 /**
  * 固件灰度发布单。
  *
@@ -15,8 +17,10 @@ package com.example.starter.firmware.domain;
  * @param monitorRound            当前监控轮次，从1开始，人工恢复后加一
  * @param roundSuccess            当前监控轮次内首次进入 SUCCESS 的任务数
  * @param roundFailed             当前监控轮次内首次进入 FAILED 的任务数
+ * @param rules                   配置迁移规则，至多5条，有序执行；空列表表示不迁移配置
  */
 public record ReleaseOrder(long id, int version, String model, String fromVersion, String toVersion,
                            int ratio, ReleaseStatus status, int sampleFloor, int failureThresholdPercent,
-                           int monitorRound, int roundSuccess, int roundFailed) {
+                           int monitorRound, int roundSuccess, int roundFailed,
+                           List<MigrationRule> rules) {
 }

@@ -5,9 +5,17 @@ CREATE TABLE IF NOT EXISTS device (
   model VARCHAR(64) NOT NULL COMMENT '设备型号，登记后不可修改',
   current_version VARCHAR(64) NOT NULL COMMENT '设备当前固件版本',
   bucket_no INT NOT NULL COMMENT '灰度分桶号，取值0~99，登记后不可修改',
+  config_version INT NOT NULL DEFAULT 1 COMMENT '配置版本，从1开始，本地修改或成功回执应用迁移后加一',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '登记时间',
   PRIMARY KEY (device_id)
 ) COMMENT='设备登记表';
+
+CREATE TABLE IF NOT EXISTS device_config (
+  device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
+  cfg_key VARCHAR(64) NOT NULL COMMENT '配置键，非空字符串，单设备至多10个',
+  cfg_value INT NOT NULL COMMENT '配置整数值，取值0~1000000，运算越界拒绝不截断',
+  PRIMARY KEY (device_id, cfg_key)
+) COMMENT='设备配置项，键值整体替换，不允许部分覆盖';
 
 CREATE TABLE IF NOT EXISTS release_order (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '发布单ID',
@@ -23,6 +31,7 @@ CREATE TABLE IF NOT EXISTS release_order (
   round_success INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入SUCCESS的任务数，重复回执不重复计数',
   round_failed INT NOT NULL DEFAULT 0 COMMENT '当前监控轮次内首次进入FAILED的任务数，重复回执不重复计数',
   active_model VARCHAR(64) NULL COMMENT 'ACTIVE或PAUSED时等于model，取消后置NULL；用于同型号至多一张未终结发布单的唯一约束',
+  migration_rules CLOB NULL COMMENT '配置迁移规则JSON数组，至多5条，有序执行；NULL表示不迁移配置',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id)
@@ -36,6 +45,9 @@ CREATE TABLE IF NOT EXISTS rollout_task (
   device_id VARCHAR(64) NOT NULL COMMENT '设备ID',
   status VARCHAR(16) NOT NULL COMMENT 'PENDING待回执；SUCCESS成功；FAILED失败；CANCELLED已取消',
   first_result VARCHAR(16) NULL COMMENT '首次回执结果（SUCCESS/FAILED），未回执为NULL',
+  config_version INT NULL COMMENT '领取时冻结的设备配置版本；发布单无迁移规则时为NULL',
+  config_before CLOB NULL COMMENT '领取时冻结的迁移前完整配置快照（JSON对象，键升序）',
+  config_after CLOB NULL COMMENT '领取时预演通过的迁移后完整配置快照（JSON对象，键升序），SUCCESS回执整体应用',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近变更时间',
   PRIMARY KEY (id),
