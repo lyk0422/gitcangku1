@@ -15,17 +15,32 @@ CREATE TABLE IF NOT EXISTS coord_lock (
     touched  BIGINT NOT NULL COMMENT '仅用于产生真实行更新以加行级排他锁的计数器，无业务含义'
 ) COMMENT = '审核与区域变更事务协调锁';
 
--- 禁飞区：zoneId 唯一；非退化轴对齐闭矩形；只能创建或撤销
+-- 禁飞区：zoneId 唯一；只能创建或撤销。
+-- RECTANGLE：非退化轴对齐闭矩形，边界坐标非空；
+-- POLYGON：带孔洞多边形，边界坐标为 NULL，环顶点冻结在 zone_ring 表。
 CREATE TABLE IF NOT EXISTS no_fly_zone (
     zone_id          VARCHAR(64) PRIMARY KEY COMMENT '禁飞区唯一标识',
-    x_min            INT NOT NULL COMMENT '矩形左边界（含），单位米',
-    y_min            INT NOT NULL COMMENT '矩形下边界（含），单位米',
-    x_max            INT NOT NULL COMMENT '矩形右边界（含），单位米，x_min < x_max',
-    y_max            INT NOT NULL COMMENT '矩形上边界（含），单位米，y_min < y_max',
+    zone_type        VARCHAR(16) NOT NULL COMMENT '区域类型：RECTANGLE 轴对齐闭矩形；POLYGON 带孔洞多边形',
+    x_min            INT NULL COMMENT '矩形左边界（含），单位米；仅 RECTANGLE 有值',
+    y_min            INT NULL COMMENT '矩形下边界（含），单位米；仅 RECTANGLE 有值',
+    x_max            INT NULL COMMENT '矩形右边界（含），单位米，x_min < x_max；仅 RECTANGLE 有值',
+    y_max            INT NULL COMMENT '矩形上边界（含），单位米，y_min < y_max；仅 RECTANGLE 有值',
     status           VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 有效参与审核；REVOKED 已撤销不参与审核',
     created_version  BIGINT NOT NULL COMMENT '创建生效时的全局空域版本',
     revoked_version  BIGINT NULL COMMENT '撤销生效时的全局空域版本；NULL 表示仍有效'
-) COMMENT = '禁飞区（非退化轴对齐闭矩形，只能创建或撤销）';
+) COMMENT = '禁飞区（轴对齐闭矩形或带孔洞多边形，只能创建或撤销）';
+
+-- 带孔洞多边形区域的环顶点：创建时冻结，撤销不改写、不删除。
+-- 顶点首尾不重复，按 seq 顺序连接，末点隐含连回首点。
+CREATE TABLE IF NOT EXISTS zone_ring (
+    zone_id     VARCHAR(64) NOT NULL COMMENT '所属带孔洞多边形区域标识',
+    ring_kind   VARCHAR(8) NOT NULL COMMENT '环类型：OUTER 外环（每区一条，ring_index=0）；HOLE 孔洞',
+    ring_index  INT NOT NULL COMMENT '孔洞序号：外环固定为 0；孔洞从 0 开始按提交顺序编号',
+    seq         INT NOT NULL COMMENT '环内顶点序号，从 0 开始，表示环的实际连接顺序',
+    x           INT NOT NULL COMMENT '顶点 X 坐标，单位米，范围 [-100000,100000]',
+    y           INT NOT NULL COMMENT '顶点 Y 坐标，单位米，范围 [-100000,100000]',
+    PRIMARY KEY (zone_id, ring_kind, ring_index, seq)
+) COMMENT = '带孔洞多边形区域的冻结环顶点（外环与孔洞）';
 
 -- 航线当前状态：routeId 唯一，版本从 1 开始，替换成功加一
 -- touch 仅用于审核事务对该行产生真实更新以加行级写锁，与替换操作互斥
@@ -62,7 +77,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
-    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
+    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_POLYGON_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
     request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'

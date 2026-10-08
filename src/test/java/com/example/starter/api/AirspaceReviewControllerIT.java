@@ -39,6 +39,7 @@ class AirspaceReviewControllerIT {
         jdbc.update("DELETE FROM request_dedup");
         jdbc.update("DELETE FROM route_point");
         jdbc.update("DELETE FROM route");
+        jdbc.update("DELETE FROM zone_ring");
         jdbc.update("DELETE FROM no_fly_zone");
         jdbc.update("UPDATE airspace_meta SET global_version = 0 WHERE id = 1");
         jdbc.update("UPDATE coord_lock SET touched = 0 WHERE id = 1");
@@ -201,6 +202,104 @@ class AirspaceReviewControllerIT {
                                  "requestId":"idem-fail"}"""))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.replayed").value(false));
+    }
+
+    @Test
+    @DisplayName("带孔洞多边形：孔洞内 CLEAR、触孔边/穿实体 BLOCKED、非法形状 400、重放 replayed")
+    void polygonZoneOverHttp() throws Exception {
+        // 三条航线：孔洞内 / 触孔边 / 穿实体
+        String createRoute = """
+                {"routeId":"%s","requestId":"%s",
+                 "points":[{"x":%d,"y":%d},{"x":%d,"y":%d}]}""";
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(String.format(createRoute, "p-in", "req-p-in", 4, 4, 6, 6)))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(String.format(createRoute, "p-touch", "req-p-touch", 4, 4, 7, 6)))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(String.format(createRoute, "p-cross", "req-p-cross", 2, 5, 8, 5)))
+                .andExpect(status().isCreated());
+
+        // 建区前审核 → CLEAR（空域版本 0）
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"p-in","routeVersion":1,"airspaceVersion":0,
+                                 "requestId":"req-p-rv0"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.conclusion").value("CLEAR"));
+
+        // 创建外正方形 [0,10]、孔洞 [3,7] 的多边形区域
+        String polygonBody = """
+                {"zoneId":"poly1","requestId":"req-poly-1",
+                 "outerRing":[{"x":0,"y":0},{"x":10,"y":0},{"x":10,"y":10},{"x":0,"y":10}],
+                 "holes":[{"points":[{"x":3,"y":3},{"x":7,"y":3},{"x":7,"y":7},{"x":3,"y":7}]}]}""";
+        mockMvc.perform(post("/api/airspace/zones/polygon")
+                        .contentType(MediaType.APPLICATION_JSON).content(polygonBody))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.zoneType").value("POLYGON"))
+                .andExpect(jsonPath("$.data.airspaceVersion").value(1))
+                .andExpect(jsonPath("$.data.outerRing.length()").value(4))
+                .andExpect(jsonPath("$.data.holes[0].points.length()").value(4));
+        // 同参重放
+        mockMvc.perform(post("/api/airspace/zones/polygon")
+                        .contentType(MediaType.APPLICATION_JSON).content(polygonBody))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.replayed").value(true));
+
+        // 孔洞内 CLEAR；触孔边 BLOCKED；穿实体 BLOCKED
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"p-in","routeVersion":1,"airspaceVersion":1,
+                                 "requestId":"req-p-rv1"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.conclusion").value("CLEAR"));
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"p-touch","routeVersion":1,"airspaceVersion":1,
+                                 "requestId":"req-p-rv2"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.conclusion").value("BLOCKED"))
+                .andExpect(jsonPath("$.data.hitZoneIds[0]").value("poly1"));
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"p-cross","routeVersion":1,"airspaceVersion":1,
+                                 "requestId":"req-p-rv3"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.conclusion").value("BLOCKED"))
+                .andExpect(jsonPath("$.data.hitZoneIds[0]").value("poly1"));
+
+        // 孔洞贴外环边 → 400
+        mockMvc.perform(post("/api/airspace/zones/polygon")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"zoneId":"poly-bad","requestId":"req-poly-bad",
+                                 "outerRing":[{"x":0,"y":0},{"x":10,"y":0},{"x":10,"y":10},{"x":0,"y":10}],
+                                 "holes":[{"points":[{"x":3,"y":0},{"x":7,"y":0},{"x":7,"y":5},{"x":3,"y":5}]}]}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_POLYGON_ZONE"));
+
+        // 撤销后版本推进到 2，穿实体路线变为 CLEAR
+        mockMvc.perform(post("/api/airspace/zones/revoke")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"zoneId":"poly1","requestId":"req-poly-revoke"}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.airspaceVersion").value(2));
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"p-cross","routeVersion":1,"airspaceVersion":2,
+                                 "requestId":"req-p-rv4"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.conclusion").value("CLEAR"));
     }
 
     @Test

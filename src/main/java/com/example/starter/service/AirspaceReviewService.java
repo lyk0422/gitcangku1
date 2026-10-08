@@ -2,6 +2,9 @@ package com.example.starter.service;
 
 import com.example.starter.api.ApiException;
 import com.example.starter.api.dto.MutationResponse;
+import com.example.starter.api.dto.PolygonRingDto;
+import com.example.starter.api.dto.PolygonZoneCreateRequest;
+import com.example.starter.api.dto.PolygonZoneResult;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
 import com.example.starter.api.dto.RouteCreateRequest;
@@ -13,6 +16,8 @@ import com.example.starter.api.dto.ZoneResult;
 import com.example.starter.api.dto.ZoneRevokeRequest;
 import com.example.starter.domain.Geometry;
 import com.example.starter.domain.Point;
+import com.example.starter.domain.Polygon;
+import com.example.starter.domain.PolygonValidator;
 import com.example.starter.domain.ReviewConclusion;
 import com.example.starter.domain.ZoneStatus;
 import com.example.starter.repo.AirspaceRepository;
@@ -60,6 +65,7 @@ import java.util.function.Supplier;
 public class AirspaceReviewService {
 
     static final String KIND_ZONE_CREATE = "ZONE_CREATE";
+    static final String KIND_ZONE_POLYGON_CREATE = "ZONE_POLYGON_CREATE";
     static final String KIND_ZONE_REVOKE = "ZONE_REVOKE";
     static final String KIND_ROUTE_CREATE = "ROUTE_CREATE";
     static final String KIND_ROUTE_REPLACE = "ROUTE_REPLACE";
@@ -100,16 +106,48 @@ public class AirspaceReviewService {
                         "禁飞区已存在: " + request.zoneId());
             }
             long newVersion = airspaceRepo.incrementGlobalVersion();
-            airspaceRepo.insertZone(new ZonePo(request.zoneId(), request.xMin(), request.yMin(),
+            airspaceRepo.insertZone(ZonePo.rectangle(request.zoneId(), request.xMin(), request.yMin(),
                     request.xMax(), request.yMax(), ZoneStatus.ACTIVE.name(), newVersion, null));
             return new MutationResponse(request.requestId(), false,
                     new ZoneResult(request.zoneId(), ZoneStatus.ACTIVE.name(), newVersion));
         });
     }
 
+    /**
+     * 创建带孔洞多边形禁飞区；同键同参重放原结果，异参 409。
+     * 环合法性（数量、闭合、非退化、无自交、孔洞严格内含且互不接触）不满足时返回 400。
+     */
+    public MutationResponse createPolygonZone(PolygonZoneCreateRequest request) {
+        return withIdempotency(request.requestId(), KIND_ZONE_POLYGON_CREATE,
+                canonicalHash(request), () -> {
+                    List<Point> outer = toPoints(request.outerRing());
+                    List<List<Point>> holes = new ArrayList<>(request.holes().size());
+                    for (PolygonRingDto hole : request.holes()) {
+                        holes.add(toPoints(hole.points()));
+                    }
+                    try {
+                        PolygonValidator.validate(outer, holes);
+                    } catch (IllegalArgumentException ex) {
+                        throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_POLYGON_ZONE",
+                                ex.getMessage());
+                    }
+                    if (airspaceRepo.findZone(request.zoneId()) != null) {
+                        throw new ApiException(HttpStatus.CONFLICT, "ZONE_ALREADY_EXISTS",
+                                "禁飞区已存在: " + request.zoneId());
+                    }
+                    Polygon polygon = new Polygon(outer, holes);
+                    long newVersion = airspaceRepo.incrementGlobalVersion();
+                    airspaceRepo.insertPolygonZone(ZonePo.polygon(
+                            request.zoneId(), polygon, ZoneStatus.ACTIVE.name(), newVersion, null));
+                    return new MutationResponse(request.requestId(), false,
+                            new PolygonZoneResult(request.zoneId(), "POLYGON",
+                                    ZoneStatus.ACTIVE.name(),
+                                    toPointDtos(outer), toRingDtos(holes), newVersion));
+                });
+    }
+
     /** 撤销禁飞区（只能撤销一次，撤销使空域版本加一）。 */
-    public MutationResponse revokeZone(ZoneRevokeRequest request) {
-        return withIdempotency(request.requestId(), KIND_ZONE_REVOKE, canonicalHash(request), () -> {
+    public MutationResponse revokeZone(ZoneRevokeRequest request) {        return withIdempotency(request.requestId(), KIND_ZONE_REVOKE, canonicalHash(request), () -> {
             ZonePo zone = airspaceRepo.findZone(request.zoneId());
             if (zone == null) {
                 throw new ApiException(HttpStatus.NOT_FOUND, "ZONE_NOT_FOUND",
@@ -195,12 +233,16 @@ public class AirspaceReviewService {
                         "空域版本不是当前版本：submitted=" + request.airspaceVersion()
                                 + ", current=" + globalVersion);
             }
-            // 持锁状态下读取全部有效禁飞区，与上面的版本号同属一个一致状态
+            // 持锁状态下读取全部有效禁飞区，与上面的版本号同属一个一致状态。
+            // 矩形区域用轴对齐精确判定，多边形区域用带孔洞实体判定，二者共同计入命中。
             List<ZonePo> activeZones = airspaceRepo.findActiveZones();
             Set<String> hits = new TreeSet<>();
             for (ZonePo zone : activeZones) {
-                if (Geometry.polylineHitsRectangle(route.points(),
-                        zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax())) {
+                boolean hit = zone.isPolygon()
+                        ? zone.polygon().polylineHits(route.points())
+                        : Geometry.polylineHitsRectangle(route.points(),
+                                zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax());
+                if (hit) {
                     hits.add(zone.zoneId());
                 }
             }
@@ -327,6 +369,22 @@ public class AirspaceReviewService {
             points.add(new Point(dto.x(), dto.y()));
         }
         return points;
+    }
+
+    private static List<RoutePointDto> toPointDtos(List<Point> points) {
+        List<RoutePointDto> dtos = new ArrayList<>(points.size());
+        for (Point p : points) {
+            dtos.add(new RoutePointDto(p.x(), p.y()));
+        }
+        return List.copyOf(dtos);
+    }
+
+    private static List<PolygonRingDto> toRingDtos(List<List<Point>> rings) {
+        List<PolygonRingDto> dtos = new ArrayList<>(rings.size());
+        for (List<Point> ring : rings) {
+            dtos.add(new PolygonRingDto(toPointDtos(ring)));
+        }
+        return List.copyOf(dtos);
     }
 
     private static void validatePointsDistinct(List<Point> points) {
