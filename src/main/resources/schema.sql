@@ -2,11 +2,15 @@
 -- 兼容 H2（MODE=MySQL）与 MySQL 语法；时间戳均为服务器时区（Asia/Shanghai）。
 
 -- 观测记录当前状态表：每条观测记录一行，version 从 1 开始单调递增。
+-- 普通观测（PLAIN）使用 location/reading/note；圆弧观测（ARC）使用 start_angle/arc_length。
 CREATE TABLE IF NOT EXISTS observation_current (
     observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
-    location VARCHAR(512) NOT NULL COMMENT '观测地点（可编辑字段）',
-    reading VARCHAR(64) NOT NULL COMMENT '观测读数，十进制字符串，最多三位小数，比较按数值（可编辑字段）',
-    note VARCHAR(1024) NOT NULL COMMENT '观测备注（可编辑字段）',
+    obs_type VARCHAR(16) NOT NULL DEFAULT 'PLAIN' COMMENT '观测类型：PLAIN 普通观测 / ARC 圆弧观测',
+    location VARCHAR(512) NULL COMMENT '观测地点（可编辑字段）；ARC 类型为 NULL',
+    reading VARCHAR(64) NULL COMMENT '观测读数，十进制字符串，最多三位小数，比较按数值（可编辑字段）；ARC 类型为 NULL',
+    note VARCHAR(1024) NULL COMMENT '观测备注（可编辑字段）；ARC 类型为 NULL',
+    start_angle INT NULL COMMENT '圆弧起始角，单位千分之一度，取值 0..359999，区间含两端并按模 360000 绕回；仅 ARC 类型非空',
+    arc_length INT NULL COMMENT '圆弧正向弧长，单位千分之一度，取值 1..180000；仅 ARC 类型非空',
     version INT NOT NULL COMMENT '当前版本号，从 1 开始',
     deleted BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已删除：TRUE 表示当前状态为删除墓碑',
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次变更时间（服务器时区）',
@@ -17,9 +21,12 @@ CREATE TABLE IF NOT EXISTS observation_current (
 CREATE TABLE IF NOT EXISTS observation_version (
     observation_id VARCHAR(64) NOT NULL COMMENT '观测记录唯一标识',
     version INT NOT NULL COMMENT '版本号，从 1 开始，与 observation_current.version 对应',
-    location VARCHAR(512) NULL COMMENT '该版本观测地点快照；删除墓碑版本为 NULL',
-    reading VARCHAR(64) NULL COMMENT '该版本观测读数快照（十进制字符串原文）；删除墓碑版本为 NULL',
-    note VARCHAR(1024) NULL COMMENT '该版本观测备注快照；删除墓碑版本为 NULL',
+    obs_type VARCHAR(16) NOT NULL COMMENT '观测类型：PLAIN 普通观测 / ARC 圆弧观测',
+    location VARCHAR(512) NULL COMMENT '该版本观测地点快照；ARC 类型或删除墓碑版本为 NULL',
+    reading VARCHAR(64) NULL COMMENT '该版本观测读数快照（十进制字符串原文）；ARC 类型或删除墓碑版本为 NULL',
+    note VARCHAR(1024) NULL COMMENT '该版本观测备注快照；ARC 类型或删除墓碑版本为 NULL',
+    start_angle INT NULL COMMENT '该版本圆弧起始角快照（千分之一度，0..359999）；仅 ARC 非墓碑版本非空',
+    arc_length INT NULL COMMENT '该版本圆弧正向弧长快照（千分之一度，1..180000）；仅 ARC 非墓碑版本非空',
     deleted BOOLEAN NOT NULL COMMENT '该版本是否为删除墓碑：TRUE 时业务字段无意义',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '该版本生成时间（服务器时区）',
     PRIMARY KEY (observation_id, version)
@@ -58,4 +65,20 @@ CREATE TABLE IF NOT EXISTS conflict_resolution (
     -- 不设置指向 observation_current 的外键：观测记录删除仅置墓碑（当前行保留），
     -- 且不可变解决历史必须在任何数据清理/归档场景下继续可查。
     UNIQUE (observation_id, request_id)
+);
+
+-- 圆弧交集裁定记录表：成功裁定后原子写入，不可变、永不更新或删除。
+-- 冻结参与裁定的源圆弧（观测标识、版本、起始角、弧长）与全部交集分量，后续修订不倒改旧结果。
+CREATE TABLE IF NOT EXISTS arc_adjudication (
+    adjudication_id VARCHAR(128) NOT NULL COMMENT '全局唯一裁定标识',
+    request_id VARCHAR(128) NOT NULL COMMENT '生成该裁定的请求标识（requestId）',
+    operator VARCHAR(128) NOT NULL COMMENT '执行裁定的操作者标识（非空）',
+    source_count INT NOT NULL COMMENT '参与裁定的圆弧观测条数（2..10）',
+    sources VARCHAR(2000) NOT NULL COMMENT '源圆弧冻结快照（JSON 数组：观测标识、版本、起始角、弧长，千分之一度），按观测标识排序',
+    components VARCHAR(4000) NOT NULL COMMENT '全部交集分量（JSON 数组：起始角、弧长，千分之一度，按起始角升序；允许退化单点弧长 0）',
+    created_at_utc TIMESTAMP NOT NULL COMMENT '裁定完成时刻（UTC）',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录落库时间（服务器时区）',
+    PRIMARY KEY (adjudication_id),
+    -- requestId 全局唯一（与 request_log 一致），支撑裁定请求的同参重放/异参 409。
+    UNIQUE (request_id)
 );
