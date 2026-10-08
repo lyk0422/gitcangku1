@@ -10,11 +10,13 @@ import jakarta.validation.constraints.Size;
  * @param routeId         航线唯一标识
  * @param routeVersion    明确的航线版本
  * @param airspaceVersion 明确的空域版本
+ * @param operator        非空操作者标识
  * @param requestId       写操作全局唯一请求标识，用于幂等重放
  */
 public record ReviewRequest(
         @NotBlank @Size(max = 64) String routeId,
         @NotNull Integer routeVersion,
         @NotNull Long airspaceVersion,
+        @NotBlank @Size(max = 64) String operator,
         @NotBlank @Size(max = 64) String requestId) {
 }

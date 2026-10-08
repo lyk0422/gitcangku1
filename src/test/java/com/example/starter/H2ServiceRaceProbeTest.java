@@ -69,21 +69,22 @@ class H2ServiceRaceProbeTest {
                 String zoneId = "pz" + iter;
                 service.createRoute(new RouteCreateRequest(routeId,
                         List.of(new RoutePointDto(0, 10), new RoutePointDto(100, 10)),
-                        "preq-route-" + iter));
+                        "tester", "preq-route-" + iter));
 
                 Future<Object> zoneFuture;
                 Future<Object> reviewFuture;
                 if (zoneFirst) {
                     // 建区先完整提交，再立即用旧空域版本发起审核
                     Object zr = service.createZone(new ZoneCreateRequest(
-                            zoneId, 40, 5, 60, 15, "preq-zone-" + iter));
+                            zoneId, 40, 5, 60, 15, "tester", "preq-zone-" + iter));
                     assertTrue(zr instanceof MutationResponse);
                     CountDownLatch done = new CountDownLatch(1);
                     reviewFuture = pool.submit(() -> {
                         done.countDown();
                         try {
                             return service.review(
-                                    new ReviewRequest(routeId, 1, 0L, "preq-rv-" + iter));
+                                    new ReviewRequest(routeId, 1, 0L, "tester",
+                                        "preq-rv-" + iter));
                         } catch (ApiException ex) {
                             return ex;
                         }
@@ -96,7 +97,8 @@ class H2ServiceRaceProbeTest {
                         barrier.await(5, TimeUnit.SECONDS);
                         try {
                             return service.review(
-                                    new ReviewRequest(routeId, 1, 0L, "preq-rv-" + iter));
+                                    new ReviewRequest(routeId, 1, 0L, "tester",
+                                        "preq-rv-" + iter));
                         } catch (ApiException ex) {
                             return ex;
                         }
@@ -105,7 +107,7 @@ class H2ServiceRaceProbeTest {
                         barrier.await(5, TimeUnit.SECONDS);
                         try {
                             return service.createZone(new ZoneCreateRequest(
-                                    zoneId, 40, 5, 60, 15, "preq-zone-" + iter));
+                                    zoneId, 40, 5, 60, 15, "tester", "preq-zone-" + iter));
                         } catch (ApiException ex) {
                             return ex;
                         }
@@ -145,6 +147,7 @@ class H2ServiceRaceProbeTest {
     private void cleanup() {
         jdbc.update("DELETE FROM review");
         jdbc.update("DELETE FROM request_dedup");
+        jdbc.update("DELETE FROM route_curve_point");
         jdbc.update("DELETE FROM route_point");
         jdbc.update("DELETE FROM route");
         jdbc.update("DELETE FROM no_fly_zone");

@@ -2,6 +2,9 @@ package com.example.starter.service;
 
 import com.example.starter.api.ApiException;
 import com.example.starter.api.dto.MutationResponse;
+import com.example.starter.api.dto.CurveRouteCreateRequest;
+import com.example.starter.api.dto.CurveRouteReplaceRequest;
+import com.example.starter.api.dto.CurveSegmentDto;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
 import com.example.starter.api.dto.RouteCreateRequest;
@@ -13,7 +16,10 @@ import com.example.starter.api.dto.ZoneResult;
 import com.example.starter.api.dto.ZoneRevokeRequest;
 import com.example.starter.domain.Geometry;
 import com.example.starter.domain.Point;
+import com.example.starter.domain.QuadraticCurve;
 import com.example.starter.domain.ReviewConclusion;
+import com.example.starter.domain.RouteCurve;
+import com.example.starter.domain.RouteKind;
 import com.example.starter.domain.ZoneStatus;
 import com.example.starter.repo.AirspaceRepository;
 import com.example.starter.repo.DedupPo;
@@ -63,6 +69,8 @@ public class AirspaceReviewService {
     static final String KIND_ZONE_REVOKE = "ZONE_REVOKE";
     static final String KIND_ROUTE_CREATE = "ROUTE_CREATE";
     static final String KIND_ROUTE_REPLACE = "ROUTE_REPLACE";
+    static final String KIND_ROUTE_CURVE_CREATE = "ROUTE_CURVE_CREATE";
+    static final String KIND_ROUTE_CURVE_REPLACE = "ROUTE_CURVE_REPLACE";
     static final String KIND_REVIEW = "REVIEW";
 
     private final AirspaceRepository airspaceRepo;
@@ -90,7 +98,8 @@ public class AirspaceReviewService {
 
     /** 创建禁飞区；同键同参重放原结果，异参 409。 */
     public MutationResponse createZone(ZoneCreateRequest request) {
-        return withIdempotency(request.requestId(), KIND_ZONE_CREATE, canonicalHash(request), () -> {
+        return withIdempotency(request.requestId(), request.operator(),
+                KIND_ZONE_CREATE, canonicalHash(request), () -> {
             if (request.xMin() >= request.xMax() || request.yMin() >= request.yMax()) {
                 throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_ZONE_RECTANGLE",
                         "禁飞区必须是非退化轴对齐矩形：xMin < xMax 且 yMin < yMax");
@@ -109,7 +118,8 @@ public class AirspaceReviewService {
 
     /** 撤销禁飞区（只能撤销一次，撤销使空域版本加一）。 */
     public MutationResponse revokeZone(ZoneRevokeRequest request) {
-        return withIdempotency(request.requestId(), KIND_ZONE_REVOKE, canonicalHash(request), () -> {
+        return withIdempotency(request.requestId(), request.operator(),
+                KIND_ZONE_REVOKE, canonicalHash(request), () -> {
             ZonePo zone = airspaceRepo.findZone(request.zoneId());
             if (zone == null) {
                 throw new ApiException(HttpStatus.NOT_FOUND, "ZONE_NOT_FOUND",
@@ -126,11 +136,12 @@ public class AirspaceReviewService {
         });
     }
 
-    // ============================ 航线 ============================
+    // ============================ 航线（直线，原接口兼容） ============================
 
-    /** 创建航线（初始版本 1）。 */
+    /** 创建直线航线（初始版本 1）。 */
     public MutationResponse createRoute(RouteCreateRequest request) {
-        return withIdempotency(request.requestId(), KIND_ROUTE_CREATE, canonicalHash(request), () -> {
+        return withIdempotency(request.requestId(), request.operator(),
+                KIND_ROUTE_CREATE, canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
             if (routeRepo.findRoute(request.routeId()) != null) {
@@ -143,43 +154,105 @@ public class AirspaceReviewService {
         });
     }
 
-    /** 替换航线点列，expectedVersion 不匹配返回 409；成功版本加一。 */
+    /** 替换直线航线点列，expectedVersion 不匹配返回 409；成功版本加一。 */
     public MutationResponse replaceRoute(RouteReplaceRequest request) {
-        return withIdempotency(request.requestId(), KIND_ROUTE_REPLACE, canonicalHash(request), () -> {
+        return withIdempotency(request.requestId(), request.operator(),
+                KIND_ROUTE_REPLACE, canonicalHash(request), () -> {
             List<Point> points = toPoints(request.points());
             validatePointsDistinct(points);
-            RoutePo route = routeRepo.findRoute(request.routeId());
-            if (route == null) {
-                throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
-                        "航线不存在: " + request.routeId());
-            }
-            if (route.version() != request.expectedVersion()) {
-                throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
-                        "航线版本不匹配：expected=" + request.expectedVersion()
-                                + ", current=" + route.version());
-            }
-            // 条件更新兜底并发替换：更新 0 行说明版本已被其他事务推进
-            int updated = routeRepo.compareAndIncrementVersion(
-                    request.routeId(), request.expectedVersion());
-            if (updated == 0) {
-                throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
-                        "航线版本已变化，请使用最新 expectedVersion 重试");
-            }
-            routeRepo.deletePoints(request.routeId());
-            routeRepo.insertPoints(request.routeId(), points);
-            return new MutationResponse(request.requestId(), false,
-                    new RouteResult(request.routeId(), request.expectedVersion() + 1));
+            return replaceRouteGeometry(request.routeId(), request.expectedVersion(),
+                    request.requestId(), RouteKind.LINE, () -> {
+                        routeRepo.deleteGeometry(request.routeId());
+                        routeRepo.insertPoints(request.routeId(), points);
+                    });
         });
+    }
+
+    // ============================ 航线（二次曲线，新增类型） ============================
+
+    /** 创建二次曲线航线（初始版本 1）；段数 1~5，相邻段首尾端点必须相等。 */
+    public MutationResponse createCurveRoute(CurveRouteCreateRequest request) {
+        return withIdempotency(request.requestId(), request.operator(),
+                KIND_ROUTE_CURVE_CREATE, canonicalHash(request), () -> {
+            List<QuadraticCurve> segments = toCurves(request.segments());
+            validateCurveSegments(segments);
+            if (routeRepo.findRoute(request.routeId()) != null) {
+                throw new ApiException(HttpStatus.CONFLICT, "ROUTE_ALREADY_EXISTS",
+                        "航线已存在: " + request.routeId());
+            }
+            routeRepo.insertCurveRoute(request.routeId(), segments);
+            return new MutationResponse(request.requestId(), false,
+                    new RouteResult(request.routeId(), 1));
+        });
+    }
+
+    /**
+     * 替换二次曲线航线（曲线修订），expectedVersion 不匹配返回 409；
+     * 成功后航线版本加一，审核时冻结新的完整控制点，旧审核结论对当前查询失效（STALE）。
+     */
+    public MutationResponse replaceCurveRoute(CurveRouteReplaceRequest request) {
+        return withIdempotency(request.requestId(), request.operator(),
+                KIND_ROUTE_CURVE_REPLACE, canonicalHash(request), () -> {
+            List<QuadraticCurve> segments = toCurves(request.segments());
+            validateCurveSegments(segments);
+            return replaceRouteGeometry(request.routeId(), request.expectedVersion(),
+                    request.requestId(), RouteKind.CURVE, () -> {
+                        routeRepo.deleteGeometry(request.routeId());
+                        routeRepo.insertCurvePoints(request.routeId(), segments);
+                    });
+        });
+    }
+
+    /** 段数兜底校验（Web 层 @Size 之外的内部防线，1~5 段）。 */
+    private static void validateCurveSegments(List<QuadraticCurve> segments) {
+        if (segments.isEmpty() || segments.size() > 5) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_CURVE_SEGMENT_COUNT",
+                    "二次曲线航线必须包含 1~5 个曲线段，实际为 " + segments.size());
+        }
+        validateCurveContinuity(segments);
+    }
+
+    /**
+     * 航线几何替换的公共流程：条件推进版本（与审核互斥），成功后由 geometryWriter
+     * 在同一事务内删除旧几何并写入新几何。kind 仅用于防止直线/曲线接口串改几何类型。
+     */
+    private MutationResponse replaceRouteGeometry(String routeId, int expectedVersion,
+                                                  String requestId, RouteKind expectedKind,
+                                                  Runnable geometryWriter) {
+        RoutePo route = routeRepo.findRoute(routeId);
+        if (route == null) {
+            throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
+                    "航线不存在: " + routeId);
+        }
+        if (route.kind() != expectedKind) {
+            throw new ApiException(HttpStatus.CONFLICT, "ROUTE_KIND_MISMATCH",
+                    "航线几何类型不是 " + expectedKind + ": " + route.kind());
+        }
+        if (route.version() != expectedVersion) {
+            throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                    "航线版本不匹配：expected=" + expectedVersion
+                            + ", current=" + route.version());
+        }
+        // 条件更新兜底并发替换：更新 0 行说明版本已被其他事务推进
+        int updated = routeRepo.compareAndIncrementVersion(routeId, expectedVersion);
+        if (updated == 0) {
+            throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                    "航线版本已变化，请使用最新 expectedVersion 重试");
+        }
+        geometryWriter.run();
+        return new MutationResponse(requestId, false,
+                new RouteResult(routeId, expectedVersion + 1));
     }
 
     // ============================ 审核 ============================
 
     /** 提交审核：任一指定版本不是当前版本返回 409；结果不可变。 */
     public MutationResponse review(ReviewRequest request) {
-        return withIdempotency(request.requestId(), KIND_REVIEW, canonicalHash(request), () -> {
+        return withIdempotency(request.requestId(), request.operator(),
+                KIND_REVIEW, canonicalHash(request), () -> {
             // 先锁空域版本行：与任何区域创建/撤销事务互斥
             long globalVersion = airspaceRepo.getGlobalVersionForUpdate();
-            // 再锁航线行：与航线替换事务互斥，保证版本号与点列一致
+            // 再锁航线行：与航线替换（直线/曲线修订）事务互斥，保证版本号与几何一致
             RoutePo route = routeRepo.findRouteForUpdate(request.routeId());
             if (route == null) {
                 throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
@@ -199,8 +272,12 @@ public class AirspaceReviewService {
             List<ZonePo> activeZones = airspaceRepo.findActiveZones();
             Set<String> hits = new TreeSet<>();
             for (ZonePo zone : activeZones) {
-                if (Geometry.polylineHitsRectangle(route.points(),
-                        zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax())) {
+                boolean hit = route.kind() == RouteKind.CURVE
+                        ? Geometry.curveHitsRectangle(new RouteCurve(route.curves()),
+                                zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax())
+                        : Geometry.polylineHitsRectangle(route.points(),
+                                zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax());
+                if (hit) {
                     hits.add(zone.zoneId());
                 }
             }
@@ -208,9 +285,10 @@ public class AirspaceReviewService {
                     ? ReviewConclusion.CLEAR.name()
                     : ReviewConclusion.BLOCKED.name();
             String reviewId = "rv_" + UUID.randomUUID();
-            ReviewPo po = new ReviewPo(reviewId, request.routeId(), route.version(), globalVersion,
-                    conclusion, new ArrayList<>(hits), List.copyOf(route.points()),
-                    request.requestId(), nowMillis());
+            ReviewPo po = new ReviewPo(reviewId, request.routeId(), route.kind(),
+                    route.version(), globalVersion, conclusion, new ArrayList<>(hits),
+                    List.copyOf(route.points()), List.copyOf(route.curves()),
+                    request.requestId(), request.operator(), nowMillis());
             reviewRepo.insertReview(po);
             return new MutationResponse(request.requestId(), false, toDto(po, conclusion, true));
         });
@@ -257,10 +335,12 @@ public class AirspaceReviewService {
      * 也可能在持锁后读到赢家已提交的状态而抛业务冲突（409）；两种情况都在
      * 回滚后用新事务查询去重表：赢家同键同参已提交则重放原结果，否则按原错误抛出。</p>
      */
-    private MutationResponse withIdempotency(String requestId, String kind, String paramHash,
+    private MutationResponse withIdempotency(String requestId, String operator, String kind,
+                                             String paramHash,
                                              Supplier<MutationResponse> action) {
         try {
-            return txTemplate.execute(status -> doIdempotent(requestId, kind, paramHash, action));
+            return txTemplate.execute(status ->
+                    doIdempotent(requestId, operator, kind, paramHash, action));
         } catch (DuplicateKeyException dup) {
             return resolveAfterRace(requestId, kind, paramHash,
                     new ApiException(HttpStatus.CONFLICT, "RESOURCE_CONFLICT",
@@ -288,7 +368,8 @@ public class AirspaceReviewService {
         return deserializeReplay(winner);
     }
 
-    private MutationResponse doIdempotent(String requestId, String kind, String paramHash,
+    private MutationResponse doIdempotent(String requestId, String operator, String kind,
+                                          String paramHash,
                                           Supplier<MutationResponse> action) {
         DedupPo existing = reviewRepo.findDedup(requestId);
         if (existing != null) {
@@ -297,7 +378,7 @@ public class AirspaceReviewService {
         }
         // 业务异常会触发事务回滚，去重键不会被占用
         MutationResponse result = action.get();
-        reviewRepo.insertDedup(new DedupPo(requestId, kind, paramHash,
+        reviewRepo.insertDedup(new DedupPo(requestId, kind, operator, paramHash,
                 writeJson(result), nowMillis()));
         return result;
     }
@@ -305,7 +386,7 @@ public class AirspaceReviewService {
     private void ensureSameRequest(DedupPo existing, String kind, String paramHash) {
         if (!existing.requestKind().equals(kind) || !existing.requestHash().equals(paramHash)) {
             throw new ApiException(HttpStatus.CONFLICT, "IDEMPOTENT_PARAM_MISMATCH",
-                    "requestId 已用于参数不同的请求: " + existing.requestId());
+                    "requestId 已用于操作、资源或参数不同的请求: " + existing.requestId());
         }
     }
 
@@ -340,13 +421,51 @@ public class AirspaceReviewService {
                 "航线至少需要两个不同的点");
     }
 
-    private static ReviewResultDto toDto(ReviewPo po, String conclusion, Boolean current) {
-        List<RoutePointDto> snapshot = new ArrayList<>(po.pointsSnapshot().size());
-        for (Point p : po.pointsSnapshot()) {
-            snapshot.add(new RoutePointDto(p.x(), p.y()));
+    /** DTO 曲线段转领域曲线段，固定 P0/P1/P2 三点原样保留（不做直线近似）。 */
+    private static List<QuadraticCurve> toCurves(List<CurveSegmentDto> dtos) {
+        List<QuadraticCurve> segments = new ArrayList<>(dtos.size());
+        for (CurveSegmentDto dto : dtos) {
+            segments.add(new QuadraticCurve(
+                    new Point(dto.p0().x(), dto.p0().y()),
+                    new Point(dto.p1().x(), dto.p1().y()),
+                    new Point(dto.p2().x(), dto.p2().y())));
         }
-        return new ReviewResultDto(po.reviewId(), po.routeId(), po.routeVersion(),
-                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()), snapshot, current);
+        return segments;
+    }
+
+    /**
+     * 校验曲线段连续性：第 i 段固定终点 P2 必须与第 i+1 段固定起点 P0 完全相同；
+     * 控制点允许退化（共线或与端点重合），不在此拒绝。
+     */
+    private static void validateCurveContinuity(List<QuadraticCurve> segments) {
+        for (int i = 0; i + 1 < segments.size(); i++) {
+            Point end = segments.get(i).p2();
+            Point nextStart = segments.get(i + 1).p0();
+            if (end.x() != nextStart.x() || end.y() != nextStart.y()) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "CURVE_NOT_CONTINUOUS",
+                        "第 " + (i + 1) + " 段终点 (" + end.x() + "," + end.y()
+                                + ") 与第 " + (i + 2) + " 段起点 ("
+                                + nextStart.x() + "," + nextStart.y() + ") 不一致，前后端点必须相等");
+            }
+        }
+    }
+
+    private static ReviewResultDto toDto(ReviewPo po, String conclusion, Boolean current) {
+        List<RoutePointDto> pointSnapshot = new ArrayList<>(po.pointsSnapshot().size());
+        for (Point p : po.pointsSnapshot()) {
+            pointSnapshot.add(new RoutePointDto(p.x(), p.y()));
+        }
+        List<CurveSegmentDto> curveSnapshot = new ArrayList<>(po.curveSnapshot().size());
+        for (QuadraticCurve c : po.curveSnapshot()) {
+            curveSnapshot.add(new CurveSegmentDto(
+                    new RoutePointDto(c.p0().x(), c.p0().y()),
+                    new RoutePointDto(c.p1().x(), c.p1().y()),
+                    new RoutePointDto(c.p2().x(), c.p2().y())));
+        }
+        return new ReviewResultDto(po.reviewId(), po.routeId(), po.routeKind().name(),
+                po.routeVersion(), po.airspaceVersion(), conclusion,
+                List.copyOf(po.hitZoneIds()), List.copyOf(pointSnapshot),
+                List.copyOf(curveSnapshot), po.operator(), current);
     }
 
     private long nowMillis() {
@@ -393,6 +512,13 @@ public class AirspaceReviewService {
             node.forEach(child -> array.add(canonicalize(child)));
             return array;
         }
+        if (node.isNumber()) {
+            // 十进制同值同参：10 与 10.0、1.00e2 归一为同一无尾零十进制文本；
+            // 仍是数值节点（无引号），与内容相同的文本参数不发生字段碰撞
+            return JsonNodeFactory.instance.numberNode(
+                    node.decimalValue().stripTrailingZeros());
+        }
+        // 文本、布尔、null 原样保留（文本严格区分大小写与空白，不做归一）
         return node;
     }
 }
