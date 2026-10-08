@@ -22,7 +22,6 @@ import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
-import com.example.starter.race.persistence.IdempotencyRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
@@ -30,21 +29,14 @@ import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
 import com.example.starter.race.persistence.SnapshotRow;
 import com.example.starter.race.persistence.RaceRepository;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.ArrayList;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.TreeMap;
 import java.util.function.Supplier;
 
@@ -68,17 +60,21 @@ public class RaceServiceImpl implements RaceService {
     private static final long MAX_FINISH_TIME_MS = 86_400_000L;
     /** 加时处罚上界（毫秒），含端点：1小时。 */
     private static final long MAX_PENALTY_MS = 3_600_000L;
-    /** 同键并发时等待先行者事务结束的上限（毫秒）。 */
-    private static final long INFLIGHT_WAIT_MAX_MS = 30_000L;
 
     private final RaceRepository repository;
     private final Clock clock;
-    private final ObjectMapper objectMapper;
+    private final IdempotencyExecutor idempotency;
+    private final StageService stageService;
 
-    public RaceServiceImpl(RaceRepository repository, Clock clock, ObjectMapper objectMapper) {
+    public RaceServiceImpl(
+            RaceRepository repository,
+            Clock clock,
+            IdempotencyExecutor idempotency,
+            StageService stageService) {
         this.repository = repository;
         this.clock = clock;
-        this.objectMapper = objectMapper;
+        this.idempotency = idempotency;
+        this.stageService = stageService;
     }
 
     @Override
@@ -135,6 +131,7 @@ public class RaceServiceImpl implements RaceService {
                         "finishTimeMs", request.finishTimeMs()),
                 () -> {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireSingleDayRace(raceId);
                     RunnerRow runner = requireRunner(raceId, request.bib());
                     validateFinishTime(request.finishTimeMs(), false);
                     // 修订后原始完赛耗时仍须严格大于该选手每一条已有分段耗时，否则分段不变量被破坏。
@@ -247,6 +244,7 @@ public class RaceServiceImpl implements RaceService {
                                 .toList()),
                 () -> {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireSingleDayRace(raceId);
                     validateCheckpointDefinitions(request.checkpoints());
                     if (!repository.findCheckpoints(raceId).isEmpty()) {
                         throw new ConflictException("赛事已配置检查点，配置后不可修改: " + raceId);
@@ -289,6 +287,7 @@ public class RaceServiceImpl implements RaceService {
                     }
 
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireSingleDayRace(raceId);
                     RunnerRow runner = requireRunner(raceId, bib);
                     CheckpointRow checkpoint = repository
                             .findCheckpoint(raceId, request.checkpointCode())
@@ -355,6 +354,10 @@ public class RaceServiceImpl implements RaceService {
                     if (race.status() == RaceStatus.SEALED) {
                         throw new ConflictException("赛事已封榜: " + raceId);
                     }
+                    if (repository.isStagesRace(raceId)) {
+                        // 阶段赛事封榜：逐阶段校验关门资格并固化阶段快照，不走单日逻辑。
+                        return stageService.sealStages(race, request.expectedVersion());
+                    }
                     List<RunnerRow> runners = repository.findRunners(raceId);
                     List<PenaltyRow> penalties = repository.findPenalties(raceId);
                     List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
@@ -406,6 +409,9 @@ public class RaceServiceImpl implements RaceService {
                     .orElseThrow(() -> new IllegalStateException(
                             "赛事已封榜但缺少快照: " + raceId));
             return ResponseMapper.snapshotStanding(snapshot);
+        }
+        if (repository.isStagesRace(raceId)) {
+            return stageService.liveOverallStanding(race);
         }
         return ResponseMapper.liveStanding(
                 race,
@@ -499,50 +505,15 @@ public class RaceServiceImpl implements RaceService {
     }
 
     /**
-     * 幂等包装：同键同参重放原成功结果，同键异参409；
-     * 业务异常随事务回滚，占位行消失，不占用 requestId。
+     * 幂等包装：委托给共享的 {@link IdempotencyExecutor}；
+     * 同键同参重放原成功结果，同键异参409，业务异常随事务回滚不占键。
      */
     private ServiceResult withIdempotency(
             String requestId,
             String operation,
             TreeMap<String, Object> params,
             Supplier<ServiceResult> action) {
-        String digest = digest(operation, params);
-        long deadline = clock.millis() + INFLIGHT_WAIT_MAX_MS;
-        boolean acquired = false;
-        while (!acquired) {
-            try {
-                repository.insertIdempotencyPlaceholder(
-                        requestId, operation, digest, clock.millis());
-                acquired = true;
-            } catch (DuplicateKeyException ex) {
-                Optional<IdempotencyRow> existing =
-                        repository.findIdempotencyForUpdate(requestId);
-                if (existing.isEmpty()) {
-                    // 先行者事务回滚，占位行已随其消失，立即重新占位。
-                    continue;
-                }
-                IdempotencyRow row = existing.get();
-                if (row.responseStatus() == 0) {
-                    // 理论上不会出现（提交必带最终响应）；防御性等待先行者完成。
-                    if (clock.millis() >= deadline) {
-                        throw new ConflictException("相同 requestId 的请求仍在处理中");
-                    }
-                    sleepBriefly();
-                    continue;
-                }
-                if (!row.requestDigest().equals(digest)) {
-                    throw new ConflictException(
-                            "requestId 已用于不同参数的请求: " + requestId);
-                }
-                JsonNode replayedBody = parseReplayedBody(row.responseBody());
-                return new ServiceResult(replayedBody, row.responseStatus());
-            }
-        }
-        ServiceResult result = action.get();
-        repository.completeIdempotency(
-                requestId, result.status(), writeJson(result.body()));
-        return result;
+        return idempotency.execute(requestId, operation, params, action);
     }
 
     private RaceRow requireOpenRace(String raceId, Integer expectedVersion) {
@@ -578,6 +549,13 @@ public class RaceServiceImpl implements RaceService {
                 .orElseThrow(() -> new NotFoundException("选手不存在: " + bib));
     }
 
+    /** 阶段（STAGES）赛事禁止使用单日入口写入，防止绕过阶段检查。 */
+    private void requireSingleDayRace(String raceId) {
+        if (repository.isStagesRace(raceId)) {
+            throw new ConflictException("阶段赛事请使用阶段入口，禁止单日提交: " + raceId);
+        }
+    }
+
     private static void validateFinishTime(Long finishTimeMs, boolean nullable) {
         if (finishTimeMs == null) {
             if (!nullable) {
@@ -599,53 +577,7 @@ public class RaceServiceImpl implements RaceService {
     }
 
     private static TreeMap<String, Object> orderedParams(Object... keyValues) {
-        if (keyValues.length % 2 != 0) {
-            throw new IllegalArgumentException("参数必须为键值对");
-        }
-        TreeMap<String, Object> params = new TreeMap<>();
-        for (int i = 0; i < keyValues.length; i += 2) {
-            params.put((String) keyValues[i], keyValues[i + 1]);
-        }
-        return params;
-    }
-
-    private String digest(String operation, Map<String, Object> params) {
-        try {
-            Map<String, Object> canonical = new TreeMap<>(params);
-            canonical.put("__operation", operation);
-            MessageDigest messageDigest = MessageDigest.getInstance("SHA-256");
-            byte[] bytes = objectMapper.writerWithDefaultPrettyPrinter()
-                    .writeValueAsString(canonical)
-                    .getBytes(StandardCharsets.UTF_8);
-            return HexFormat.of().formatHex(messageDigest.digest(bytes));
-        } catch (NoSuchAlgorithmException | com.fasterxml.jackson.core.JsonProcessingException ex) {
-            throw new IllegalStateException("计算请求摘要失败", ex);
-        }
-    }
-
-    private String writeJson(Object body) {
-        try {
-            return objectMapper.writeValueAsString(body);
-        } catch (com.fasterxml.jackson.core.JsonProcessingException ex) {
-            throw new IllegalStateException("序列化响应失败", ex);
-        }
-    }
-
-    private JsonNode parseReplayedBody(String body) {
-        try {
-            return objectMapper.readTree(body);
-        } catch (com.fasterxml.jackson.core.JsonProcessingException ex) {
-            throw new IllegalStateException("解析原响应失败", ex);
-        }
-    }
-
-    private static void sleepBriefly() {
-        try {
-            Thread.sleep(10L);
-        } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            throw new ConflictException("等待同键请求完成时被中断");
-        }
+        return IdempotencyExecutor.orderedParams(keyValues);
     }
 
     /**

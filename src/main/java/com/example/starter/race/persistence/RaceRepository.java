@@ -3,6 +3,7 @@ package com.example.starter.race.persistence;
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.StageStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -30,6 +31,10 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final StageCheckpointRowMapper STAGE_CHECKPOINT_ROW_MAPPER =
+            new StageCheckpointRowMapper();
+    private static final StageTimingRowMapper STAGE_TIMING_ROW_MAPPER =
+            new StageTimingRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -370,15 +375,226 @@ public class RaceRepository {
 
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM result_snapshot_stage_checkpoint");
+        jdbcTemplate.update("DELETE FROM result_snapshot_stage_entry");
+        jdbcTemplate.update("DELETE FROM result_snapshot_stage");
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
+        jdbcTemplate.update("DELETE FROM stage_timing");
+        jdbcTemplate.update("DELETE FROM stage_checkpoint");
+        jdbcTemplate.update("DELETE FROM race_stage");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
         jdbcTemplate.update("DELETE FROM race");
+    }
+
+    /** 赛事是否已配置阶段（STAGES 模式）。 */
+    public boolean isStagesRace(String raceId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM race_stage WHERE race_id = ?",
+                Integer.class, raceId);
+        return count != null && count > 0;
+    }
+
+    /** 查询赛事全部阶段，按阶段序号升序。 */
+    public List<StageRow> findStages(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, stage_no, created_at FROM race_stage "
+                        + "WHERE race_id = ? ORDER BY stage_no",
+                (rs, rowNum) -> new StageRow(
+                        rs.getString("race_id"),
+                        rs.getInt("stage_no"),
+                        rs.getLong("created_at")),
+                raceId);
+    }
+
+    /** 一次性写入赛事阶段配置头（配置后固定不可修改）。 */
+    public void insertStages(List<StageRow> rows) {
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO race_stage (race_id, stage_no, created_at) VALUES (?, ?, ?)",
+                rows,
+                rows.size(),
+                (ps, row) -> {
+                    ps.setString(1, row.raceId());
+                    ps.setInt(2, row.stageNo());
+                    ps.setLong(3, row.createdAt());
+                });
+    }
+
+    /** 一次性写入全部阶段检查点配置。 */
+    public void insertStageCheckpoints(List<StageCheckpointRow> rows) {
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO stage_checkpoint (race_id, stage_no, checkpoint_code, position, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                rows,
+                rows.size(),
+                (ps, row) -> {
+                    ps.setString(1, row.raceId());
+                    ps.setInt(2, row.stageNo());
+                    ps.setString(3, row.checkpointCode());
+                    ps.setInt(4, row.position());
+                    ps.setLong(5, row.createdAt());
+                });
+    }
+
+    /** 查询赛事全部阶段检查点，按阶段序号与阶段内顺序升序。 */
+    public List<StageCheckpointRow> findStageCheckpoints(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, stage_no, checkpoint_code, position, created_at "
+                        + "FROM stage_checkpoint WHERE race_id = ? ORDER BY stage_no, position",
+                STAGE_CHECKPOINT_ROW_MAPPER, raceId);
+    }
+
+    /** 按赛事、阶段与代码查询阶段检查点。 */
+    public Optional<StageCheckpointRow> findStageCheckpoint(
+            String raceId, int stageNo, String checkpointCode) {
+        return jdbcTemplate
+                .query("SELECT race_id, stage_no, checkpoint_code, position, created_at "
+                                + "FROM stage_checkpoint "
+                                + "WHERE race_id = ? AND stage_no = ? AND checkpoint_code = ?",
+                        STAGE_CHECKPOINT_ROW_MAPPER, raceId, stageNo, checkpointCode)
+                .stream()
+                .findFirst();
+    }
+
+    /** 统计赛事下的阶段分段记录总数（用于“尚无计时数据才可配置阶段”）。 */
+    public int countStageTimings(String raceId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM stage_timing WHERE race_id = ?",
+                Integer.class, raceId);
+        return count == null ? 0 : count;
+    }
+
+    /** 新增选手阶段分段通过记录（全局唯一 timingId 与选手+阶段+检查点唯一键由数据库约束保证）。 */
+    public void insertStageTiming(StageTimingRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO stage_timing "
+                        + "(timing_id, race_id, stage_no, bib, checkpoint_code, position, "
+                        + "elapsed_millis, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                row.timingId(), row.raceId(), row.stageNo(), row.bib(), row.checkpointCode(),
+                row.position(), row.elapsedMillis(), row.createdAt());
+    }
+
+    /** 按全局分段ID查询阶段分段记录（用于 timingId 幂等重放）。 */
+    public Optional<StageTimingRow> findStageTiming(String timingId) {
+        return jdbcTemplate
+                .query("SELECT timing_id, race_id, stage_no, bib, checkpoint_code, position, "
+                                + "elapsed_millis, created_at "
+                                + "FROM stage_timing WHERE timing_id = ?",
+                        STAGE_TIMING_ROW_MAPPER, timingId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 查询某选手某阶段的全部分段记录，按 position 升序。 */
+    public List<StageTimingRow> findStageTimingsForRunner(String raceId, int stageNo, String bib) {
+        return jdbcTemplate.query(
+                "SELECT timing_id, race_id, stage_no, bib, checkpoint_code, position, "
+                        + "elapsed_millis, created_at "
+                        + "FROM stage_timing WHERE race_id = ? AND stage_no = ? AND bib = ? "
+                        + "ORDER BY position",
+                STAGE_TIMING_ROW_MAPPER, raceId, stageNo, bib);
+    }
+
+    /** 查询赛事下全部阶段分段记录（用于阶段成绩与封榜计算）。 */
+    public List<StageTimingRow> findAllStageTimings(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT timing_id, race_id, stage_no, bib, checkpoint_code, position, "
+                        + "elapsed_millis, created_at "
+                        + "FROM stage_timing WHERE race_id = ? ORDER BY stage_no, bib, position",
+                STAGE_TIMING_ROW_MAPPER, raceId);
+    }
+
+    /** 更正阶段分段记录耗时；返回受影响行数（0 表示记录不存在）。 */
+    public int updateStageTiming(String timingId, long elapsedMillis) {
+        return jdbcTemplate.update(
+                "UPDATE stage_timing SET elapsed_millis = ? WHERE timing_id = ?",
+                elapsedMillis, timingId);
+    }
+
+    /** 原子写入阶段封榜快照：阶段F、每名选手每阶段资格与每阶段原始点明细。 */
+    public void insertStageSnapshot(
+            List<SnapshotStageRow> stages,
+            List<SnapshotStageEntryRow> entries,
+            List<SnapshotStageCheckpointRow> checkpoints) {
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO result_snapshot_stage (race_id, stage_no, fastest_ms, complete_count) "
+                        + "VALUES (?, ?, ?, ?)",
+                stages,
+                stages.size(),
+                (ps, row) -> {
+                    ps.setString(1, row.raceId());
+                    ps.setInt(2, row.stageNo());
+                    ps.setLong(3, row.fastestMs());
+                    ps.setInt(4, row.completeCount());
+                });
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO result_snapshot_stage_entry "
+                        + "(race_id, stage_no, bib, raw_time_ms, checkpoint_count, "
+                        + "covered_checkpoint_count, status) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                entries,
+                entries.size(),
+                (ps, row) -> {
+                    ps.setString(1, row.raceId());
+                    ps.setInt(2, row.stageNo());
+                    ps.setString(3, row.bib());
+                    ps.setObject(4, row.rawTimeMs());
+                    ps.setInt(5, row.checkpointCount());
+                    ps.setInt(6, row.coveredCheckpointCount());
+                    ps.setString(7, row.status().name());
+                });
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO result_snapshot_stage_checkpoint "
+                        + "(race_id, stage_no, bib, checkpoint_code, position, elapsed_millis, timing_id) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                checkpoints,
+                checkpoints.size(),
+                (ps, row) -> {
+                    ps.setString(1, row.raceId());
+                    ps.setInt(2, row.stageNo());
+                    ps.setString(3, row.bib());
+                    ps.setString(4, row.checkpointCode());
+                    ps.setInt(5, row.position());
+                    ps.setObject(6, row.elapsedMillis());
+                    ps.setString(7, row.timingId());
+                });
+    }
+
+    /** 查询封榜快照中的阶段最快值，按阶段序号升序；未封榜或单日赛事为空列表。 */
+    public List<SnapshotStageRow> findSnapshotStages(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, stage_no, fastest_ms, complete_count "
+                        + "FROM result_snapshot_stage WHERE race_id = ? ORDER BY stage_no",
+                (rs, rowNum) -> new SnapshotStageRow(
+                        rs.getString("race_id"),
+                        rs.getInt("stage_no"),
+                        rs.getLong("fastest_ms"),
+                        rs.getInt("complete_count")),
+                raceId);
+    }
+
+    /** 查询封榜快照中的阶段资格条目，按阶段序号与参赛号升序。 */
+    public List<SnapshotStageEntryRow> findSnapshotStageEntries(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, stage_no, bib, raw_time_ms, checkpoint_count, "
+                        + "covered_checkpoint_count, status "
+                        + "FROM result_snapshot_stage_entry WHERE race_id = ? "
+                        + "ORDER BY stage_no, bib",
+                (rs, rowNum) -> new SnapshotStageEntryRow(
+                        rs.getString("race_id"),
+                        rs.getInt("stage_no"),
+                        rs.getString("bib"),
+                        (Long) rs.getObject("raw_time_ms"),
+                        rs.getInt("checkpoint_count"),
+                        rs.getInt("covered_checkpoint_count"),
+                        StageStatus.valueOf(rs.getString("status"))),
+                raceId);
     }
 
     private static final class RaceRowMapper implements RowMapper<RaceRow> {
@@ -475,6 +691,33 @@ public class RaceRepository {
                     rs.getInt("position"),
                     (Long) rs.getObject("elapsed_millis"),
                     rs.getString("timing_id"));
+        }
+    }
+
+    private static final class StageCheckpointRowMapper implements RowMapper<StageCheckpointRow> {
+        @Override
+        public StageCheckpointRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new StageCheckpointRow(
+                    rs.getString("race_id"),
+                    rs.getInt("stage_no"),
+                    rs.getString("checkpoint_code"),
+                    rs.getInt("position"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class StageTimingRowMapper implements RowMapper<StageTimingRow> {
+        @Override
+        public StageTimingRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new StageTimingRow(
+                    rs.getString("timing_id"),
+                    rs.getString("race_id"),
+                    rs.getInt("stage_no"),
+                    rs.getString("bib"),
+                    rs.getString("checkpoint_code"),
+                    rs.getInt("position"),
+                    rs.getLong("elapsed_millis"),
+                    rs.getLong("created_at"));
         }
     }
 

@@ -95,9 +95,78 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS race_stage (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    stage_no INT NOT NULL COMMENT '阶段序号，从1连续递增；配置后固定不可修改',
+    created_at BIGINT NOT NULL COMMENT '配置时间，Unix毫秒时间戳',
+    CONSTRAINT pk_race_stage PRIMARY KEY (race_id, stage_no),
+    CONSTRAINT fk_stage_race FOREIGN KEY (race_id) REFERENCES race (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS stage_checkpoint (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    stage_no INT NOT NULL COMMENT '阶段序号',
+    checkpoint_code VARCHAR(64) NOT NULL COMMENT '检查点代码，同一阶段内唯一',
+    position INT NOT NULL COMMENT '阶段内检查点顺序，从1连续递增，配置后不可修改',
+    created_at BIGINT NOT NULL COMMENT '配置时间，Unix毫秒时间戳',
+    CONSTRAINT pk_stage_checkpoint PRIMARY KEY (race_id, stage_no, checkpoint_code),
+    CONSTRAINT uk_stage_checkpoint_position UNIQUE (race_id, stage_no, position),
+    CONSTRAINT fk_stage_checkpoint_stage FOREIGN KEY (race_id, stage_no) REFERENCES race_stage (race_id, stage_no)
+);
+
+CREATE TABLE IF NOT EXISTS stage_timing (
+    timing_id VARCHAR(128) NOT NULL COMMENT '阶段分段记录ID，全局唯一（第二层幂等键）',
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID',
+    stage_no INT NOT NULL COMMENT '阶段序号',
+    bib VARCHAR(64) NOT NULL COMMENT '选手参赛号',
+    checkpoint_code VARCHAR(64) NOT NULL COMMENT '通过的检查点代码',
+    position INT NOT NULL COMMENT '阶段内检查点顺序（配置时固化），用于严格递增校验',
+    elapsed_millis BIGINT NOT NULL COMMENT '阶段内累计耗时（毫秒，1~86400000），阶段从零计时',
+    created_at BIGINT NOT NULL COMMENT '记录提交时间，Unix毫秒时间戳',
+    CONSTRAINT pk_stage_timing PRIMARY KEY (timing_id),
+    CONSTRAINT uk_stage_timing_runner_checkpoint UNIQUE (race_id, stage_no, bib, checkpoint_code),
+    CONSTRAINT fk_stage_timing_checkpoint FOREIGN KEY (race_id, stage_no, checkpoint_code)
+        REFERENCES stage_checkpoint (race_id, stage_no, checkpoint_code),
+    CONSTRAINT fk_stage_timing_runner FOREIGN KEY (race_id, bib) REFERENCES runner (race_id, bib),
+    INDEX idx_stage_timing_race_stage_bib (race_id, stage_no, bib)
+);
+
+CREATE TABLE IF NOT EXISTS result_snapshot_stage (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
+    stage_no INT NOT NULL COMMENT '阶段序号',
+    fastest_ms BIGINT NOT NULL COMMENT '封榜时该阶段全部完整选手的最快原始用时F（毫秒）',
+    complete_count INT NOT NULL COMMENT '封榜时该阶段完整选手数量',
+    CONSTRAINT pk_snapshot_stage PRIMARY KEY (race_id, stage_no),
+    CONSTRAINT fk_snapshot_stage_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS result_snapshot_stage_entry (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
+    stage_no INT NOT NULL COMMENT '阶段序号',
+    bib VARCHAR(64) NOT NULL COMMENT '参赛号',
+    raw_time_ms BIGINT COMMENT '封榜时该选手该阶段原始用时（毫秒）=最后一个检查点累计耗时；阶段不完整为NULL',
+    checkpoint_count INT NOT NULL COMMENT '该阶段检查点总数',
+    covered_checkpoint_count INT NOT NULL COMMENT '封榜时该选手该阶段已覆盖检查点数量',
+    status VARCHAR(16) NOT NULL COMMENT '阶段资格：COMPLETE-完整且在关门线内，OUT-完整但超过关门线11F/10，INCOMPLETE-缺点',
+    CONSTRAINT pk_snapshot_stage_entry PRIMARY KEY (race_id, stage_no, bib),
+    CONSTRAINT fk_snapshot_stage_entry_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS result_snapshot_stage_checkpoint (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
+    stage_no INT NOT NULL COMMENT '阶段序号',
+    bib VARCHAR(64) NOT NULL COMMENT '参赛号',
+    checkpoint_code VARCHAR(64) NOT NULL COMMENT '检查点代码',
+    position INT NOT NULL COMMENT '阶段内检查点顺序，从1递增',
+    elapsed_millis BIGINT COMMENT '封榜时该选手该阶段通过该检查点的累计耗时（毫秒）；缺失检查点为NULL',
+    timing_id VARCHAR(128) COMMENT '阶段分段记录ID；缺失检查点为NULL',
+    CONSTRAINT pk_snapshot_stage_checkpoint PRIMARY KEY (race_id, stage_no, bib, checkpoint_code),
+    CONSTRAINT fk_snapshot_stage_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/CONFIGURE_STAGES/SUBMIT_STAGE_TIMING/REVISE_STAGE_TIMING',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',

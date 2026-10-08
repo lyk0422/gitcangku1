@@ -2,6 +2,7 @@ package com.example.starter.race.api;
 
 import com.example.starter.race.service.RaceService;
 import com.example.starter.race.service.ServiceResult;
+import com.example.starter.race.service.StageService;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -18,9 +19,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class RaceController {
 
     private final RaceService raceService;
+    private final StageService stageService;
 
-    public RaceController(RaceService raceService) {
+    public RaceController(RaceService raceService, StageService stageService) {
         this.raceService = raceService;
+        this.stageService = stageService;
     }
 
     /** 新建赛事。 */
@@ -111,6 +114,40 @@ public class RaceController {
     @GetMapping("/{raceId}/missing-checkpoints")
     public MissingCheckpointsResponse getMissingCheckpoints(@PathVariable String raceId) {
         return raceService.getMissingCheckpoints(raceId);
+    }
+
+    /** 一次性固定赛事阶段（2~5个）及其有序检查点。 */
+    @PostMapping("/{raceId}/stages")
+    public ResponseEntity<Object> configureStages(
+            @PathVariable String raceId,
+            @Valid @RequestBody ConfigureStagesRequest request) {
+        return toResponse(stageService.configureStages(raceId, request));
+    }
+
+    /** 为选手提交阶段检查点通过记录（阶段从零计时）。 */
+    @PostMapping("/{raceId}/stages/{stageNo}/runners/{bib}/timings")
+    public ResponseEntity<Object> submitStageTiming(
+            @PathVariable String raceId,
+            @PathVariable int stageNo,
+            @PathVariable String bib,
+            @Valid @RequestBody SubmitStageTimingRequest request) {
+        return toResponse(stageService.submitStageTiming(raceId, stageNo, bib, request));
+    }
+
+    /** 更正阶段分段计时，重算全部阶段F与资格。 */
+    @PostMapping("/{raceId}/stages/{stageNo}/timings/{timingId}/revision")
+    public ResponseEntity<Object> reviseStageTiming(
+            @PathVariable String raceId,
+            @PathVariable int stageNo,
+            @PathVariable String timingId,
+            @Valid @RequestBody ReviseStageTimingRequest request) {
+        return toResponse(stageService.reviseStageTiming(raceId, stageNo, timingId, request));
+    }
+
+    /** 查询各阶段成绩（封榜后返回只读快照内容）。 */
+    @GetMapping("/{raceId}/stages/results")
+    public StageResultsResponse getStageResults(@PathVariable String raceId) {
+        return stageService.getStageResults(raceId);
     }
 
     private ResponseEntity<Object> toResponse(ServiceResult result) {
