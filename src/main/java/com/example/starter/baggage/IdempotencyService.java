@@ -16,12 +16,17 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * 幂等去重服务：所有写操作携带全局唯一 requestId。
- * 同键同参重放原成功结果，同键异参返回 409；失败请求不占键，
- * 业务变更与去重记录在同一事务中原子提交。
+ * 幂等去重服务：所有写操作携带全局唯一 requestId 与非空操作者。
+ * 同键重放时按“操作 + 操作者 + 资源标识 + 全参数（含期望版本）”结构化比较：
+ * 完全一致重放原成功结果，任一不同返回 409；失败请求不占键，
+ * 业务变更与去重记录在同一事务中原子提交。唯一键竞争按重放处理，不上抛 500。
+ * 十进制字段由 JSON 数值按值比较，文本字段原样参与比较。
  */
 @Service
 public class IdempotencyService {
+
+    /** 无操作者信息的旧入口使用的占位操作者。 */
+    private static final String LEGACY_OPERATOR = "LEGACY";
 
     private final JdbcTemplate jdbcTemplate;
     private final TransactionTemplate transactionTemplate;
@@ -37,20 +42,29 @@ public class IdempotencyService {
         this.objectMapper = objectMapper;
     }
 
+    /** 旧签名兼容：无操作者信息时以占位操作者参与摘要。 */
+    public <T> T execute(String requestId, String operation, int successStatus,
+                         Object payload, Class<T> resultType, Supplier<T> action) {
+        return execute(requestId, operation, LEGACY_OPERATOR, successStatus, payload, resultType, action);
+    }
+
     /**
      * 在幂等保护下执行写操作。
      *
      * @param requestId     全局唯一请求标识
-     * @param operation     操作类型
+     * @param operation     操作类型（参与摘要，同 requestId 跨操作视为异参）
+     * @param operator      非空操作者标识（原样参与摘要）
      * @param successStatus 成功响应的 HTTP 状态码（随记录保存，供审计）
      * @param payload       请求参数（不含 requestId，调用方需已规范化），用于计算摘要
      * @param resultType    成功结果类型，用于重放时反序列化
      * @param action        业务动作，成功结果与去重记录在同一事务提交
      * @return 已存储的成功结果（重放）或本次执行结果
      */
-    public <T> T execute(String requestId, String operation, int successStatus,
+    public <T> T execute(String requestId, String operation, String operator, int successStatus,
                          Object payload, Class<T> resultType, Supplier<T> action) {
-        String hash = sha256(writeJson(payload));
+        String normalizedOperator = operator == null || operator.isBlank()
+                ? LEGACY_OPERATOR : operator;
+        String hash = sha256(operation + "|" + normalizedOperator + "|" + writeJson(payload));
         Object lock = locks.computeIfAbsent(requestId, key -> new Object());
         synchronized (lock) {
             try {
@@ -62,13 +76,13 @@ public class IdempotencyService {
                     return transactionTemplate.execute(status -> {
                         T result = action.get();
                         jdbcTemplate.update(
-                                "INSERT INTO request_log (request_id, operation, request_hash, response_status, response_body)"
-                                        + " VALUES (?, ?, ?, ?, ?)",
-                                requestId, operation, hash, successStatus, writeJson(result));
+                                "INSERT INTO request_log (request_id, operation, operator, request_hash,"
+                                        + " response_status, response_body) VALUES (?, ?, ?, ?, ?, ?)",
+                                requestId, operation, normalizedOperator, hash, successStatus, writeJson(result));
                         return result;
                     });
                 } catch (DuplicateKeyException duplicate) {
-                    // 唯一主键兜底：其他节点已写入同键记录，按已存储结果处理
+                    // 唯一主键兜底：并发竞争下同键记录已由其他事务写入，按已存储结果处理而非报 500
                     StoredRequest stored = find(requestId);
                     if (stored == null) {
                         throw duplicate;
@@ -83,7 +97,7 @@ public class IdempotencyService {
 
     private <T> T replay(StoredRequest stored, String hash, Class<T> resultType) {
         if (!stored.requestHash().equals(hash)) {
-            throw ApiException.conflict("requestId 已被使用且请求参数不一致");
+            throw ApiException.conflict("requestId 已被使用且操作或请求参数不一致");
         }
         try {
             return objectMapper.readValue(stored.responseBody(), resultType);

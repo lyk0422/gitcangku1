@@ -11,6 +11,7 @@ spring:
     init:
       mode: always
       schema-locations: classpath:schema.sql
+      data-locations: classpath:data.sql
     hikari:
       maximum-pool-size: 5
       minimum-idle: 1

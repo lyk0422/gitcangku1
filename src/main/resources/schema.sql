@@ -9,10 +9,20 @@ CREATE TABLE IF NOT EXISTS leg (
     destination     VARCHAR(64)  NOT NULL COMMENT '到达站代码',
     status          VARCHAR(16)  NOT NULL DEFAULT 'OPEN' COMMENT '航段状态：OPEN/SEALED/ARRIVED',
     version         INT          NOT NULL DEFAULT 1 COMMENT '乐观锁版本，每次状态或装载变更后递增',
-    sealed_manifest CLOB         NULL COMMENT '封舱时的只读装载清单（JSON 数组），未封舱为 NULL',
+    sealed_manifest CLOB         NULL COMMENT '封舱时的只读装载清单（JSON 数组，元素为袋号字符串），未封舱为 NULL',
+    sealed_layout   CLOB         NULL COMMENT '封舱时冻结的只读二维布局快照（JSON 数组：袋号/登记宽高毫米/是否旋转90度/左下角x,y毫米）；未封舱或无二维配置的旧航段为 NULL',
     arrival_type    VARCHAR(16)  NULL COMMENT '到达确认类型：NULL 未到达，EXACT 精确到达，DIFF 差异到达',
     arrival_actual  CLOB         NULL COMMENT '差异到达实际到达袋号只读快照（JSON 数组），未差异到达为 NULL',
     created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    PRIMARY KEY (leg_id)
+);
+
+-- 航段平面舱位布局：仅配置二维布局的航段有一行；固定矩形舱底，单位毫米，原点为舱底左下角
+CREATE TABLE IF NOT EXISTS floor_layout (
+    leg_id     VARCHAR(64) NOT NULL COMMENT '航段标识',
+    width_mm   INT         NOT NULL COMMENT '舱底固定长度（x 轴，毫米，正整数）',
+    height_mm  INT         NOT NULL COMMENT '舱底固定宽度（y 轴，毫米，正整数）',
+    created_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (leg_id)
 );
 
@@ -30,6 +40,15 @@ CREATE TABLE IF NOT EXISTS bag (
     PRIMARY KEY (bag_tag)
 );
 
+-- 行李二维尺寸：仅处理合成正整数毫米尺寸；未登记尺寸的行李不能装载到配置平面舱位的航段
+CREATE TABLE IF NOT EXISTS bag_size (
+    bag_tag    VARCHAR(64) NOT NULL COMMENT '行李牌号',
+    width_mm   INT         NOT NULL COMMENT '行李登记长度（x 轴方向原始尺寸，毫米，正整数）',
+    height_mm  INT         NOT NULL COMMENT '行李登记宽度（y 轴方向原始尺寸，毫米，正整数）',
+    created_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    PRIMARY KEY (bag_tag)
+);
+
 -- 行李行程明细：有序航段列表，相邻航段首尾站衔接
 CREATE TABLE IF NOT EXISTS bag_itinerary (
     bag_tag     VARCHAR(64) NOT NULL COMMENT '行李牌号',
@@ -40,10 +59,16 @@ CREATE TABLE IF NOT EXISTS bag_itinerary (
     PRIMARY KEY (bag_tag, seq)
 );
 
--- 装载明细：bag_tag 为主键，保证一件行李同一时间只在一个航段的装载清单中
+-- 装载明细：bag_tag 为主键，保证一件行李同一时间只在一个航段的装载清单中；
+-- 无二维配置旧航段的位置列均为 NULL，rotated 恒为 FALSE
 CREATE TABLE IF NOT EXISTS load_record (
     bag_tag   VARCHAR(64) NOT NULL COMMENT '行李牌号',
     leg_id    VARCHAR(64) NOT NULL COMMENT '装载到的航段',
+    width_mm  INT         NULL COMMENT '装载时登记的行李长度（毫米，正整数）；无二维配置航段为 NULL',
+    height_mm INT         NULL COMMENT '装载时登记的行李宽度（毫米，正整数）；无二维配置航段为 NULL',
+    rotated   BOOLEAN     NOT NULL DEFAULT FALSE COMMENT '落位是否相对登记尺寸旋转 90 度：FALSE 不旋转，TRUE 旋转后宽高互换',
+    pos_x     INT         NULL COMMENT '落位矩形左下角 x 坐标（毫米，非负，相对舱底原点）；无二维配置航段为 NULL',
+    pos_y     INT         NULL COMMENT '落位矩形左下角 y 坐标（毫米，非负，相对舱底原点）；无二维配置航段为 NULL',
     loaded_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '装载时间',
     PRIMARY KEY (bag_tag)
 );
@@ -61,11 +86,12 @@ CREATE TABLE IF NOT EXISTS bag_event (
     UNIQUE (bag_tag, seq)
 );
 
--- 幂等去重：仅记录成功请求；同 requestId 同参数重放原结果，异参数返回 409
+-- 幂等去重：仅记录成功请求；同 requestId 同操作/资源/全参数（含操作者）重放原结果，异参数返回 409
 CREATE TABLE IF NOT EXISTS request_log (
     request_id      VARCHAR(128) NOT NULL COMMENT '全局唯一请求标识',
-    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
-    request_hash    VARCHAR(64)  NOT NULL COMMENT '请求参数（不含 requestId）的 SHA-256 摘要',
+    operation       VARCHAR(32)  NOT NULL COMMENT '操作类型：REGISTER_LEG/REGISTER_BAG/LOAD/REARRANGE/SEAL/ARRIVE/ARRIVE_DIFFERENCE/RECOVER',
+    operator        VARCHAR(64)  NOT NULL COMMENT '提交写操作的非空操作者标识，参与参数摘要比较',
+    request_hash    VARCHAR(64)  NOT NULL COMMENT '操作类型+操作者+请求参数（不含 requestId，资源标识与期望版本在内）的 SHA-256 摘要',
     response_status INT          NOT NULL COMMENT '原成功响应的 HTTP 状态码',
     response_body   CLOB         NOT NULL COMMENT '原成功响应体（JSON）',
     created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
