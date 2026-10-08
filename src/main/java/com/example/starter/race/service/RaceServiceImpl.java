@@ -5,29 +5,39 @@ import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.EnableIntervalModeRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.ReviseIntervalRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
+import com.example.starter.race.api.RunnerIntervalsResponse;
 import com.example.starter.race.api.RunnerMissingCheckpointsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.SubmitIntervalRequest;
 import com.example.starter.race.api.SubmitTimingRequest;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.IntervalRankCalculator;
+import com.example.starter.race.domain.IntervalResultEntry;
+import com.example.starter.race.domain.IntervalRules;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
 import com.example.starter.race.domain.ResultEntry;
+import com.example.starter.race.domain.TimingMode;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
+import com.example.starter.race.persistence.IntervalTimingRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
+import com.example.starter.race.persistence.SnapshotIntervalRow;
 import com.example.starter.race.persistence.SnapshotRow;
 import com.example.starter.race.persistence.RaceRepository;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -95,7 +105,8 @@ public class RaceServiceImpl implements RaceService {
                     }
                     RaceRow race = repository.findRace(request.raceId()).orElseThrow();
                     return ServiceResult.created(new RaceResponse(
-                            race.raceId(), race.version(), race.status(), race.createdAt()));
+                            race.raceId(), race.version(), race.status(),
+                            race.timingMode(), race.createdAt()));
                 });
     }
 
@@ -112,6 +123,9 @@ public class RaceServiceImpl implements RaceService {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
                     Long finishTimeMs = request.finishTimeMs();
                     validateFinishTime(finishTimeMs, true);
+                    if (race.timingMode() == TimingMode.INTERVAL && finishTimeMs != null) {
+                        throw new ConflictException("区间计时模式不接受单值完赛耗时");
+                    }
                     long now = clock.millis();
                     bumpVersion(race, request.expectedVersion());
                     try {
@@ -135,6 +149,7 @@ public class RaceServiceImpl implements RaceService {
                         "finishTimeMs", request.finishTimeMs()),
                 () -> {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireSingleMode(race, "单值计时修订不能覆盖区间计时模式");
                     RunnerRow runner = requireRunner(raceId, request.bib());
                     validateFinishTime(request.finishTimeMs(), false);
                     // 修订后原始完赛耗时仍须严格大于该选手每一条已有分段耗时，否则分段不变量被破坏。
@@ -248,11 +263,21 @@ public class RaceServiceImpl implements RaceService {
                 () -> {
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
                     validateCheckpointDefinitions(request.checkpoints());
+                    if (race.timingMode() == TimingMode.INTERVAL) {
+                        for (ConfigureCheckpointsRequest.CheckpointDefinition def
+                                : request.checkpoints()) {
+                            if (IntervalRules.FINISH_CODE.equals(def.checkpointCode())) {
+                                throw new BadRequestException(
+                                        "检查点代码不能使用保留字: " + IntervalRules.FINISH_CODE);
+                            }
+                        }
+                    }
                     if (!repository.findCheckpoints(raceId).isEmpty()) {
                         throw new ConflictException("赛事已配置检查点，配置后不可修改: " + raceId);
                     }
-                    if (repository.countTimings(raceId) > 0) {
-                        throw new ConflictException("赛事已存在分段记录，不能再配置检查点: " + raceId);
+                    if (repository.countTimings(raceId) > 0
+                            || repository.countIntervals(raceId) > 0) {
+                        throw new ConflictException("赛事已存在计时记录，不能再配置检查点: " + raceId);
                     }
                     bumpVersion(race, request.expectedVersion());
                     long now = clock.millis();
@@ -289,6 +314,7 @@ public class RaceServiceImpl implements RaceService {
                     }
 
                     RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireSingleMode(race, "单值分段记录不能写入区间计时模式赛事");
                     RunnerRow runner = requireRunner(raceId, bib);
                     CheckpointRow checkpoint = repository
                             .findCheckpoint(raceId, request.checkpointCode())
@@ -359,8 +385,7 @@ public class RaceServiceImpl implements RaceService {
                     List<PenaltyRow> penalties = repository.findPenalties(raceId);
                     List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
                     List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
-                    List<ResultEntry> entries =
-                            ResultCalculator.compute(runners, penalties, checkpoints, timings);
+                    List<IntervalTimingRow> intervals = repository.findAllIntervals(raceId);
 
                     int newVersion = request.expectedVersion() + 1;
                     int updated = repository.sealIfOpenAtVersion(
@@ -369,30 +394,66 @@ public class RaceServiceImpl implements RaceService {
                         throw new ConflictException("版本冲突或赛事已封榜");
                     }
                     long now = clock.millis();
-                    List<SnapshotEntryRow> snapshotEntries = new ArrayList<>(entries.size());
-                    for (int order = 0; order < entries.size(); order++) {
-                        ResultEntry entry = entries.get(order);
-                        snapshotEntries.add(new SnapshotEntryRow(
-                                raceId,
-                                entry.bib(),
-                                entry.rank(),
-                                entry.status(),
-                                entry.finishTimeMs(),
-                                entry.penaltyMs(),
-                                entry.totalTimeMs(),
-                                order,
-                                entry.checkpointCount(),
-                                entry.coveredCheckpointCount(),
-                                entry.missingCheckpoints()));
+                    List<SnapshotEntryRow> snapshotEntries;
+                    List<SnapshotIntervalRow> snapshotIntervals;
+                    if (race.timingMode() == TimingMode.INTERVAL) {
+                        // 区间模式：冻结完整区间、全部肯定先后关系（由净区间可推导）与名次范围。
+                        List<IntervalResultEntry> intervalEntries = IntervalRankCalculator.compute(
+                                runners, penalties, checkpoints, intervals);
+                        snapshotEntries = new ArrayList<>(intervalEntries.size());
+                        for (int order = 0; order < intervalEntries.size(); order++) {
+                            IntervalResultEntry entry = intervalEntries.get(order);
+                            snapshotEntries.add(new SnapshotEntryRow(
+                                    raceId,
+                                    entry.bib(),
+                                    null,
+                                    entry.status(),
+                                    null,
+                                    entry.penaltyMs(),
+                                    null,
+                                    order,
+                                    entry.checkpointCount(),
+                                    entry.coveredCheckpointCount(),
+                                    entry.missingCheckpoints(),
+                                    entry.rankBest(),
+                                    entry.rankWorst(),
+                                    entry.netLowerMs(),
+                                    entry.netUpperMs()));
+                        }
+                        snapshotIntervals = intervals.stream()
+                                .map(row -> new SnapshotIntervalRow(
+                                        raceId, row.bib(), row.checkpointCode(), row.position(),
+                                        row.lowerMs(), row.upperMs(), row.timingId()))
+                                .toList();
+                    } else {
+                        List<ResultEntry> entries =
+                                ResultCalculator.compute(runners, penalties, checkpoints, timings);
+                        snapshotEntries = new ArrayList<>(entries.size());
+                        for (int order = 0; order < entries.size(); order++) {
+                            ResultEntry entry = entries.get(order);
+                            snapshotEntries.add(new SnapshotEntryRow(
+                                    raceId,
+                                    entry.bib(),
+                                    entry.rank(),
+                                    entry.status(),
+                                    entry.finishTimeMs(),
+                                    entry.penaltyMs(),
+                                    entry.totalTimeMs(),
+                                    order,
+                                    entry.checkpointCount(),
+                                    entry.coveredCheckpointCount(),
+                                    entry.missingCheckpoints()));
+                        }
+                        snapshotIntervals = List.of();
                     }
                     // 在同一封榜事务内固化每名选手 × 每个检查点的明细，缺失行耗时为 null。
                     List<SnapshotCheckpointRow> snapshotCheckpoints =
                             buildSnapshotCheckpoints(raceId, runners, checkpoints, timings);
-                    repository.insertSnapshot(new SnapshotRow(raceId, newVersion, now,
-                            snapshotEntries, snapshotCheckpoints));
-                    return ServiceResult.ok(new StandingResponse(
-                            raceId, newVersion, RaceStatus.SEALED, now,
-                            snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
+                    SnapshotRow snapshot = new SnapshotRow(raceId, newVersion, now,
+                            snapshotEntries, snapshotCheckpoints, snapshotIntervals);
+                    repository.insertSnapshot(snapshot);
+                    return ServiceResult.ok(ResponseMapper.snapshotStanding(
+                            snapshot, race.timingMode()));
                 });
     }
 
@@ -405,7 +466,15 @@ public class RaceServiceImpl implements RaceService {
             SnapshotRow snapshot = repository.findSnapshot(raceId)
                     .orElseThrow(() -> new IllegalStateException(
                             "赛事已封榜但缺少快照: " + raceId));
-            return ResponseMapper.snapshotStanding(snapshot);
+            return ResponseMapper.snapshotStanding(snapshot, race.timingMode());
+        }
+        if (race.timingMode() == TimingMode.INTERVAL) {
+            return ResponseMapper.liveIntervalStanding(
+                    race,
+                    repository.findRunners(raceId),
+                    repository.findPenalties(raceId),
+                    repository.findCheckpoints(raceId),
+                    repository.findAllIntervals(raceId));
         }
         return ResponseMapper.liveStanding(
                 race,
@@ -491,11 +560,215 @@ public class RaceServiceImpl implements RaceService {
     @Override
     @Transactional(readOnly = true)
     public StandingResponse getSnapshot(String raceId) {
-        repository.findRace(raceId)
+        RaceRow race = repository.findRace(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
         SnapshotRow snapshot = repository.findSnapshot(raceId)
                 .orElseThrow(() -> new NotFoundException("赛事尚未封榜: " + raceId));
-        return ResponseMapper.snapshotStanding(snapshot);
+        return ResponseMapper.snapshotStanding(snapshot, race.timingMode());
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult enableIntervalMode(String raceId, EnableIntervalModeRequest request) {
+        return withIdempotency(request.requestId(), "ENABLE_INTERVAL_MODE",
+                orderedParams(
+                        "raceId", raceId,
+                        "expectedVersion", request.expectedVersion(),
+                        "operator", request.operator()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    if (race.timingMode() == TimingMode.INTERVAL) {
+                        throw new ConflictException("赛事已启用区间计时模式: " + raceId);
+                    }
+                    // 仅尚无任何计时证据的赛事可启用：无单值完赛耗时、无分段记录、无区间记录。
+                    if (repository.countRunnersWithFinishTime(raceId) > 0
+                            || repository.countTimings(raceId) > 0
+                            || repository.countIntervals(raceId) > 0) {
+                        throw new ConflictException("赛事已存在计时证据，不能启用区间计时模式: " + raceId);
+                    }
+                    boolean reservedCodeUsed = repository.findCheckpoints(raceId).stream()
+                            .anyMatch(cp -> IntervalRules.FINISH_CODE.equals(cp.checkpointCode()));
+                    if (reservedCodeUsed) {
+                        throw new ConflictException(
+                                "赛事检查点占用保留字 " + IntervalRules.FINISH_CODE
+                                        + "，不能启用区间计时模式: " + raceId);
+                    }
+                    int updated = repository.enableIntervalModeIfOpen(
+                            raceId, request.expectedVersion());
+                    if (updated == 0) {
+                        throw new ConflictException("版本冲突或赛事状态已变化");
+                    }
+                    RaceRow refreshed = repository.findRace(raceId).orElseThrow();
+                    return ServiceResult.ok(new RaceResponse(
+                            refreshed.raceId(), refreshed.version(), refreshed.status(),
+                            refreshed.timingMode(), refreshed.createdAt()));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult submitInterval(String raceId, String bib, SubmitIntervalRequest request) {
+        return withIdempotency(request.requestId(), "SUBMIT_INTERVAL",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "timingId", request.timingId(),
+                        "checkpointCode", request.checkpointCode(),
+                        "lowerMs", request.lowerMs(),
+                        "upperMs", request.upperMs(),
+                        "expectedVersion", request.expectedVersion(),
+                        "operator", request.operator()),
+                () -> {
+                    // timingId 是第二层全局幂等键：同参重放原结果，异参409。
+                    IntervalTimingRow existing =
+                            repository.findInterval(request.timingId()).orElse(null);
+                    if (existing != null) {
+                        return replayIntervalOrConflict(raceId, bib, request, existing);
+                    }
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireIntervalMode(race);
+                    requireRunner(raceId, bib);
+                    String rangeError =
+                            IntervalRules.validateRange(request.lowerMs(), request.upperMs());
+                    if (rangeError != null) {
+                        throw new BadRequestException(rangeError);
+                    }
+                    int position = resolveIntervalPosition(raceId, request.checkpointCode());
+                    List<IntervalTimingRow> runnerIntervals =
+                            repository.findIntervalsForRunner(raceId, bib);
+                    String violation = IntervalRules.validateAdjacency(
+                            runnerIntervals, position, request.lowerMs(), request.upperMs());
+                    if (violation != null) {
+                        throw new UnprocessableEntityException(violation);
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    IntervalTimingRow row = new IntervalTimingRow(
+                            request.timingId(), raceId, bib, request.checkpointCode(), position,
+                            request.lowerMs(), request.upperMs(), request.operator(), now, now);
+                    try {
+                        repository.insertInterval(row);
+                    } catch (DuplicateKeyException ex) {
+                        // 并发下唯一约束兜底：同 timingId 走重放/异参冲突，其余为计时点重复。
+                        if (constraintMatches(ex, "pk_interval_timing")) {
+                            IntervalTimingRow concurrent =
+                                    repository.findInterval(request.timingId()).orElseThrow();
+                            return replayIntervalOrConflict(raceId, bib, request, concurrent);
+                        }
+                        throw new UnprocessableEntityException(
+                                "同一选手同一计时点最多一条区间记录");
+                    }
+                    IntervalTimingRow saved =
+                            repository.findInterval(request.timingId()).orElseThrow();
+                    return ServiceResult.created(ResponseMapper.toIntervalResponse(saved));
+                });
+    }
+
+    private ServiceResult replayIntervalOrConflict(
+            String raceId,
+            String bib,
+            SubmitIntervalRequest request,
+            IntervalTimingRow existing) {
+        boolean sameParams = existing.raceId().equals(raceId)
+                && existing.bib().equals(bib)
+                && existing.checkpointCode().equals(request.checkpointCode())
+                && existing.lowerMs() == request.lowerMs()
+                && existing.upperMs() == request.upperMs();
+        if (!sameParams) {
+            throw new ConflictException(
+                    "timingId 已用于不同参数的区间记录: " + request.timingId());
+        }
+        return ServiceResult.created(ResponseMapper.toIntervalResponse(existing));
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult reviseInterval(String raceId, String bib, ReviseIntervalRequest request) {
+        return withIdempotency(request.requestId(), "REVISE_INTERVAL",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", bib,
+                        "checkpointCode", request.checkpointCode(),
+                        "lowerMs", request.lowerMs(),
+                        "upperMs", request.upperMs(),
+                        "expectedVersion", request.expectedVersion(),
+                        "operator", request.operator()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    requireIntervalMode(race);
+                    requireRunner(raceId, bib);
+                    IntervalTimingRow existing = repository
+                            .findIntervalByPoint(raceId, bib, request.checkpointCode())
+                            .orElseThrow(() -> new NotFoundException(
+                                    "区间记录不存在: " + request.checkpointCode()));
+                    String rangeError =
+                            IntervalRules.validateRange(request.lowerMs(), request.upperMs());
+                    if (rangeError != null) {
+                        throw new BadRequestException(rangeError);
+                    }
+                    // 修订后与该选手其它区间仍须满足相邻严格递增（排除被修订记录自身）。
+                    List<IntervalTimingRow> others = repository
+                            .findIntervalsForRunner(raceId, bib).stream()
+                            .filter(row -> !row.checkpointCode().equals(request.checkpointCode()))
+                            .toList();
+                    String violation = IntervalRules.validateAdjacency(
+                            others, existing.position(), request.lowerMs(), request.upperMs());
+                    if (violation != null) {
+                        throw new UnprocessableEntityException(violation);
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    int updated = repository.updateInterval(
+                            raceId, bib, request.checkpointCode(),
+                            request.lowerMs(), request.upperMs(), request.operator(), now);
+                    if (updated == 0) {
+                        throw new NotFoundException("区间记录不存在: " + request.checkpointCode());
+                    }
+                    IntervalTimingRow refreshed = repository
+                            .findIntervalByPoint(raceId, bib, request.checkpointCode())
+                            .orElseThrow();
+                    return ServiceResult.ok(ResponseMapper.toIntervalResponse(refreshed));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public RunnerIntervalsResponse getRunnerIntervals(String raceId, String bib) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        RunnerRow runner = repository.findRunner(raceId, bib)
+                .orElseThrow(() -> new NotFoundException("选手不存在: " + bib));
+        List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
+        if (race.status() == RaceStatus.SEALED) {
+            SnapshotRow snapshot = repository.findSnapshot(raceId)
+                    .orElseThrow(() -> new IllegalStateException(
+                            "赛事已封榜但缺少快照: " + raceId));
+            return ResponseMapper.snapshotRunnerIntervals(snapshot, bib, checkpoints);
+        }
+        return ResponseMapper.runnerIntervals(
+                race, runner, checkpoints, repository.findIntervalsForRunner(raceId, bib));
+    }
+
+    /** 解析计时点顺序：完赛点 FINISH 为检查点总数+1，其余须为已配置检查点。 */
+    private int resolveIntervalPosition(String raceId, String checkpointCode) {
+        if (IntervalRules.FINISH_CODE.equals(checkpointCode)) {
+            return repository.findCheckpoints(raceId).size() + 1;
+        }
+        return repository.findCheckpoint(raceId, checkpointCode)
+                .orElseThrow(() -> new NotFoundException("检查点不存在: " + checkpointCode))
+                .position();
+    }
+
+    private static void requireIntervalMode(RaceRow race) {
+        if (race.timingMode() != TimingMode.INTERVAL) {
+            throw new ConflictException("赛事未启用区间计时模式: " + race.raceId());
+        }
+    }
+
+    private static void requireSingleMode(RaceRow race, String message) {
+        if (race.timingMode() != TimingMode.SINGLE) {
+            throw new ConflictException(message);
+        }
     }
 
     /**

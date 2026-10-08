@@ -113,6 +113,40 @@ public class RaceController {
         return raceService.getMissingCheckpoints(raceId);
     }
 
+    /** 启用区间计时模式（仅尚无任何计时证据的赛事）。 */
+    @PostMapping("/{raceId}/interval-mode")
+    public ResponseEntity<Object> enableIntervalMode(
+            @PathVariable String raceId,
+            @Valid @RequestBody EnableIntervalModeRequest request) {
+        return toResponse(raceService.enableIntervalMode(raceId, request));
+    }
+
+    /** 为选手提交某计时点的累计毫秒闭区间。 */
+    @PostMapping("/{raceId}/runners/{bib}/intervals")
+    public ResponseEntity<Object> submitInterval(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody SubmitIntervalRequest request) {
+        return toResponse(raceService.submitInterval(raceId, bib, request));
+    }
+
+    /** 修订选手某计时点的区间。 */
+    @PostMapping("/{raceId}/runners/{bib}/interval-revisions")
+    public ResponseEntity<Object> reviseInterval(
+            @PathVariable String raceId,
+            @PathVariable String bib,
+            @Valid @RequestBody ReviseIntervalRequest request) {
+        return toResponse(raceService.reviseInterval(raceId, bib, request));
+    }
+
+    /** 查询单个选手的区间明细（检查点在前、完赛点最后）。 */
+    @GetMapping("/{raceId}/runners/{bib}/intervals")
+    public RunnerIntervalsResponse getRunnerIntervals(
+            @PathVariable String raceId,
+            @PathVariable String bib) {
+        return raceService.getRunnerIntervals(raceId, bib);
+    }
+
     private ResponseEntity<Object> toResponse(ServiceResult result) {
         return ResponseEntity.status(result.status()).body(result.body());
     }

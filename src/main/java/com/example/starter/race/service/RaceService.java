@@ -3,13 +3,17 @@ package com.example.starter.race.service;
 import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.EnableIntervalModeRequest;
 import com.example.starter.race.api.RegisterRunnerRequest;
+import com.example.starter.race.api.ReviseIntervalRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
+import com.example.starter.race.api.RunnerIntervalsResponse;
 import com.example.starter.race.api.RunnerTimingResponse;
 import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
+import com.example.starter.race.api.SubmitIntervalRequest;
 import com.example.starter.race.api.SubmitTimingRequest;
 
 /**
@@ -59,4 +63,22 @@ public interface RaceService {
 
     /** 查询赛事全部选手缺失检查点汇总，按参赛号与检查点顺序稳定返回；只读。 */
     MissingCheckpointsResponse getMissingCheckpoints(String raceId);
+
+    /**
+     * 启用区间计时模式：仅 OPEN、版本匹配且尚无任何计时证据
+     * （无单值完赛耗时、无分段记录、无区间记录）的赛事可启用，启用后不可回退。
+     */
+    ServiceResult enableIntervalMode(String raceId, EnableIntervalModeRequest request);
+
+    /**
+     * 提交选手某计时点的累计毫秒闭区间 [L,U]（完赛点代码固定为 FINISH）；
+     * 仅区间模式赛事可写。非法区间400、相邻区间不能保证严格递增422，失败不写入。
+     */
+    ServiceResult submitInterval(String raceId, String bib, SubmitIntervalRequest request);
+
+    /** 修订选手某计时点区间；与提交共用不变量，与赛事版本共享乐观并发控制。 */
+    ServiceResult reviseInterval(String raceId, String bib, ReviseIntervalRequest request);
+
+    /** 查询单个选手的区间明细（检查点在前、完赛点最后）；封榜后读快照；只读。 */
+    RunnerIntervalsResponse getRunnerIntervals(String raceId, String bib);
 }

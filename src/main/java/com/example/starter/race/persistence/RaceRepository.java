@@ -3,6 +3,7 @@ package com.example.starter.race.persistence;
 import com.example.starter.race.domain.EntryStatus;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
+import com.example.starter.race.domain.TimingMode;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -30,6 +31,10 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final IntervalTimingRowMapper INTERVAL_TIMING_ROW_MAPPER =
+            new IntervalTimingRowMapper();
+    private static final SnapshotIntervalRowMapper SNAPSHOT_INTERVAL_ROW_MAPPER =
+            new SnapshotIntervalRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -40,7 +45,8 @@ public class RaceRepository {
     /** 按ID查询赛事。 */
     public Optional<RaceRow> findRace(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ?",
+                .query("SELECT race_id, version, status, timing_mode, created_at "
+                                + "FROM race WHERE race_id = ?",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -53,7 +59,8 @@ public class RaceRepository {
      */
     public Optional<RaceRow> findRaceForUpdate(String raceId) {
         return jdbcTemplate
-                .query("SELECT race_id, version, status, created_at FROM race WHERE race_id = ? FOR UPDATE",
+                .query("SELECT race_id, version, status, timing_mode, created_at "
+                                + "FROM race WHERE race_id = ? FOR UPDATE",
                         RACE_ROW_MAPPER, raceId)
                 .stream()
                 .findFirst();
@@ -157,6 +164,97 @@ public class RaceRepository {
                 row.position(), row.elapsedMillis(), row.createdAt());
     }
 
+    /** 统计赛事下已有原始完赛耗时的选手数（用于“尚无计时证据才可启用区间模式”）。 */
+    public int countRunnersWithFinishTime(String raceId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM runner WHERE race_id = ? AND finish_time_ms IS NOT NULL",
+                Integer.class, raceId);
+        return count == null ? 0 : count;
+    }
+
+    /** 统计赛事下的区间记录总数（用于“尚无任何计时证据时才可配置检查点/启用模式”）。 */
+    public int countIntervals(String raceId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM interval_timing WHERE race_id = ?",
+                Integer.class, raceId);
+        return count == null ? 0 : count;
+    }
+
+    /** 查询某选手的全部区间记录，按 position 升序排列。 */
+    public List<IntervalTimingRow> findIntervalsForRunner(String raceId, String bib) {
+        return jdbcTemplate.query(
+                "SELECT timing_id, race_id, bib, checkpoint_code, position, lower_ms, upper_ms, "
+                        + "operator, created_at, updated_at "
+                        + "FROM interval_timing WHERE race_id = ? AND bib = ? ORDER BY position",
+                INTERVAL_TIMING_ROW_MAPPER, raceId, bib);
+    }
+
+    /** 查询赛事下全部区间记录（用于区间成绩与封榜计算）。 */
+    public List<IntervalTimingRow> findAllIntervals(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT timing_id, race_id, bib, checkpoint_code, position, lower_ms, upper_ms, "
+                        + "operator, created_at, updated_at "
+                        + "FROM interval_timing WHERE race_id = ? ORDER BY bib, position",
+                INTERVAL_TIMING_ROW_MAPPER, raceId);
+    }
+
+    /** 按全局区间记录ID查询（用于 timingId 幂等重放）。 */
+    public Optional<IntervalTimingRow> findInterval(String timingId) {
+        return jdbcTemplate
+                .query("SELECT timing_id, race_id, bib, checkpoint_code, position, lower_ms, upper_ms, "
+                                + "operator, created_at, updated_at "
+                                + "FROM interval_timing WHERE timing_id = ?",
+                        INTERVAL_TIMING_ROW_MAPPER, timingId)
+                .stream()
+                .findFirst();
+    }
+
+    /** 按选手与计时点查询区间记录（用于区间修订定位）。 */
+    public Optional<IntervalTimingRow> findIntervalByPoint(String raceId, String bib, String code) {
+        return jdbcTemplate
+                .query("SELECT timing_id, race_id, bib, checkpoint_code, position, lower_ms, upper_ms, "
+                                + "operator, created_at, updated_at "
+                                + "FROM interval_timing "
+                                + "WHERE race_id = ? AND bib = ? AND checkpoint_code = ?",
+                        INTERVAL_TIMING_ROW_MAPPER, raceId, bib, code)
+                .stream()
+                .findFirst();
+    }
+
+    /** 新增区间计时记录（全局唯一 timingId 与选手+计时点唯一键由数据库约束保证）。 */
+    public void insertInterval(IntervalTimingRow row) {
+        jdbcTemplate.update(
+                "INSERT INTO interval_timing "
+                        + "(timing_id, race_id, bib, checkpoint_code, position, lower_ms, upper_ms, "
+                        + "operator, created_at, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row.timingId(), row.raceId(), row.bib(), row.checkpointCode(), row.position(),
+                row.lowerMs(), row.upperMs(), row.operator(), row.createdAt(), row.updatedAt());
+    }
+
+    /** 修订区间端点与操作者；返回受影响行数（0 表示记录不存在）。 */
+    public int updateInterval(
+            String raceId, String bib, String code, long lowerMs, long upperMs,
+            String operator, long now) {
+        return jdbcTemplate.update(
+                "UPDATE interval_timing SET lower_ms = ?, upper_ms = ?, operator = ?, updated_at = ? "
+                        + "WHERE race_id = ? AND bib = ? AND checkpoint_code = ?",
+                lowerMs, upperMs, operator, now, raceId, bib, code);
+    }
+
+    /**
+     * 条件启用区间模式：仅当赛事仍为 OPEN、版本匹配且当前为 SINGLE 时切换并推进版本。
+     *
+     * @return 受影响行数；0 表示不存在、已封榜、版本不匹配或已是区间模式
+     */
+    public int enableIntervalModeIfOpen(String raceId, int expectedVersion) {
+        return jdbcTemplate.update(
+                "UPDATE race SET timing_mode = 'INTERVAL', version = version + 1 "
+                        + "WHERE race_id = ? AND version = ? AND status = 'OPEN' "
+                        + "AND timing_mode = 'SINGLE'",
+                raceId, expectedVersion);
+    }
+
     /** 一次性写入赛事检查点配置（配置后不可修改）。 */
     public void insertCheckpoints(List<CheckpointRow> rows) {
         jdbcTemplate.batchUpdate(
@@ -180,6 +278,8 @@ public class RaceRepository {
                         rs.getString("race_id"),
                         rs.getInt("version"),
                         rs.getLong("sealed_at"),
+                        List.of(),
+                        List.of(),
                         List.of()),
                 raceId);
         if (headers.isEmpty()) {
@@ -188,7 +288,8 @@ public class RaceRepository {
         SnapshotRow header = headers.getFirst();
         List<SnapshotEntryRow> entryRows = jdbcTemplate.query(
                 "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count "
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "rank_best, rank_worst, net_lower_ms, net_upper_ms "
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
         List<SnapshotCheckpointRow> checkpoints = jdbcTemplate.query(
@@ -196,6 +297,11 @@ public class RaceRepository {
                         + "FROM result_snapshot_checkpoint WHERE race_id = ? "
                         + "ORDER BY bib, position",
                 SNAPSHOT_CHECKPOINT_ROW_MAPPER, raceId);
+        List<SnapshotIntervalRow> intervals = jdbcTemplate.query(
+                "SELECT race_id, bib, checkpoint_code, position, lower_ms, upper_ms, timing_id "
+                        + "FROM result_snapshot_interval WHERE race_id = ? "
+                        + "ORDER BY bib, position",
+                SNAPSHOT_INTERVAL_ROW_MAPPER, raceId);
         // 缺失检查点由明细表中 elapsed_millis 为 NULL 的行派生，保持展示顺序稳定。
         java.util.Map<String, List<String>> missingByBib = new java.util.LinkedHashMap<>();
         for (SnapshotCheckpointRow detail : checkpoints) {
@@ -210,10 +316,12 @@ public class RaceRepository {
                         entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
                         entry.displayOrder(), entry.checkpointCount(),
                         entry.coveredCheckpointCount(),
-                        missingByBib.getOrDefault(entry.bib(), List.of())))
+                        missingByBib.getOrDefault(entry.bib(), List.of()),
+                        entry.rankBest(), entry.rankWorst(),
+                        entry.netLowerMs(), entry.netUpperMs()))
                 .toList();
         return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.sealedAt(),
-                entries, checkpoints));
+                entries, checkpoints, intervals));
     }
 
     /** 新建赛事，初始版本1、状态OPEN。 */
@@ -284,7 +392,7 @@ public class RaceRepository {
                 newVersion, raceId, expectedVersion);
     }
 
-    /** 原子写入封榜快照头表、全部条目以及每名选手的分段明细。 */
+    /** 原子写入封榜快照头表、全部条目、每名选手的分段明细以及区间明细。 */
     public void insertSnapshot(SnapshotRow snapshot) {
         jdbcTemplate.update(
                 "INSERT INTO result_snapshot (race_id, version, sealed_at) VALUES (?, ?, ?)",
@@ -292,8 +400,9 @@ public class RaceRepository {
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_entry "
                         + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "rank_best, rank_worst, net_lower_ms, net_upper_ms) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.entries(),
                 snapshot.entries().size(),
                 (ps, entry) -> {
@@ -307,6 +416,10 @@ public class RaceRepository {
                     ps.setInt(8, entry.displayOrder());
                     ps.setInt(9, entry.checkpointCount());
                     ps.setInt(10, entry.coveredCheckpointCount());
+                    ps.setObject(11, entry.rankBest());
+                    ps.setObject(12, entry.rankWorst());
+                    ps.setObject(13, entry.netLowerMs());
+                    ps.setObject(14, entry.netUpperMs());
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
@@ -321,6 +434,21 @@ public class RaceRepository {
                     ps.setInt(4, detail.position());
                     ps.setObject(5, detail.elapsedMillis());
                     ps.setString(6, detail.timingId());
+                });
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO result_snapshot_interval "
+                        + "(race_id, bib, checkpoint_code, position, lower_ms, upper_ms, timing_id) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                snapshot.intervals(),
+                snapshot.intervals().size(),
+                (ps, detail) -> {
+                    ps.setString(1, detail.raceId());
+                    ps.setString(2, detail.bib());
+                    ps.setString(3, detail.checkpointCode());
+                    ps.setInt(4, detail.position());
+                    ps.setLong(5, detail.lowerMs());
+                    ps.setLong(6, detail.upperMs());
+                    ps.setString(7, detail.timingId());
                 });
     }
 
@@ -370,10 +498,12 @@ public class RaceRepository {
 
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM result_snapshot_interval");
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
+        jdbcTemplate.update("DELETE FROM interval_timing");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
         jdbcTemplate.update("DELETE FROM checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
@@ -388,6 +518,7 @@ public class RaceRepository {
                     rs.getString("race_id"),
                     rs.getInt("version"),
                     RaceStatus.valueOf(rs.getString("status")),
+                    TimingMode.valueOf(rs.getString("timing_mode")),
                     rs.getLong("created_at"));
         }
     }
@@ -435,7 +566,11 @@ public class RaceRepository {
                     rs.getInt("display_order"),
                     rs.getInt("checkpoint_count"),
                     rs.getInt("covered_checkpoint_count"),
-                    List.of());
+                    List.of(),
+                    (Integer) rs.getObject("rank_best"),
+                    (Integer) rs.getObject("rank_worst"),
+                    (Long) rs.getObject("net_lower_ms"),
+                    (Long) rs.getObject("net_upper_ms"));
         }
     }
 
@@ -488,6 +623,37 @@ public class RaceRepository {
                     rs.getInt("response_status"),
                     rs.getString("response_body"),
                     rs.getLong("created_at"));
+        }
+    }
+
+    private static final class IntervalTimingRowMapper implements RowMapper<IntervalTimingRow> {
+        @Override
+        public IntervalTimingRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new IntervalTimingRow(
+                    rs.getString("timing_id"),
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("checkpoint_code"),
+                    rs.getInt("position"),
+                    rs.getLong("lower_ms"),
+                    rs.getLong("upper_ms"),
+                    rs.getString("operator"),
+                    rs.getLong("created_at"),
+                    rs.getLong("updated_at"));
+        }
+    }
+
+    private static final class SnapshotIntervalRowMapper implements RowMapper<SnapshotIntervalRow> {
+        @Override
+        public SnapshotIntervalRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new SnapshotIntervalRow(
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getString("checkpoint_code"),
+                    rs.getInt("position"),
+                    rs.getLong("lower_ms"),
+                    rs.getLong("upper_ms"),
+                    rs.getString("timing_id"));
         }
     }
 }
