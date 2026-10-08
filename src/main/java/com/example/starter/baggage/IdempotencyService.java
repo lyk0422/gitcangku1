@@ -9,7 +9,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.Supplier;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.DecimalNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -50,7 +54,7 @@ public class IdempotencyService {
      */
     public <T> T execute(String requestId, String operation, int successStatus,
                          Object payload, Class<T> resultType, Supplier<T> action) {
-        String hash = sha256(writeJson(payload));
+        String hash = sha256(operation + "\n" + canonicalJson(payload));
         Object lock = locks.computeIfAbsent(requestId, key -> new Object());
         synchronized (lock) {
             try {
@@ -106,6 +110,31 @@ public class IdempotencyService {
         } catch (Exception ex) {
             throw new IllegalArgumentException("请求参数无法序列化", ex);
         }
+    }
+
+    /**
+     * 结构化参数摘要：操作类型与资源、全参数、期望版本一起参与比较。
+     * 十进制按值规范化（1.0 与 1.00 视为相同），文本保持原样不做任何折叠。
+     */
+    private String canonicalJson(Object payload) {
+        JsonNode tree = normalizeDecimals(objectMapper.valueToTree(payload));
+        return writeJson(tree);
+    }
+
+    /** 递归把浮点数值规范化为去尾零的 BigDecimal，对象与数组就地处理（基于自有副本）。 */
+    private static JsonNode normalizeDecimals(JsonNode node) {
+        if (node.isObject()) {
+            ObjectNode object = (ObjectNode) node;
+            object.fields().forEachRemaining(entry -> entry.setValue(normalizeDecimals(entry.getValue())));
+        } else if (node.isArray()) {
+            ArrayNode array = (ArrayNode) node;
+            for (int i = 0; i < array.size(); i++) {
+                array.set(i, normalizeDecimals(array.get(i)));
+            }
+        } else if (node.isFloatingPointNumber()) {
+            return DecimalNode.valueOf(node.decimalValue().stripTrailingZeros());
+        }
+        return node;
     }
 
     private static String sha256(String text) {

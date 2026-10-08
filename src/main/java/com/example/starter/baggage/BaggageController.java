@@ -21,6 +21,8 @@ import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.RearrangeRequest;
+import com.example.starter.baggage.BaggageDtos.RearrangeResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -54,10 +56,17 @@ public class BaggageController {
         return ResponseEntity.status(HttpStatus.CREATED).body(baggageService.registerBag(request));
     }
 
-    /** 批量装载：整批原子，任一行李不满足则 422 且无一件移动。 */
+    /** 批量装载：整批原子，任一行李不满足则 422 且无一件移动；布局航段必须提交落位。 */
     @PostMapping("/legs/{legId}/load")
     public LoadResponse load(@PathVariable String legId, @Valid @RequestBody LoadRequest request) {
         return baggageService.load(legId, request);
+    }
+
+    /** 整批重排：未封舱布局航段对 1~10 件已装行李统一下发新位置，任一违规全部不变。 */
+    @PostMapping("/legs/{legId}/rearrange")
+    public RearrangeResponse rearrange(@PathVariable String legId,
+                                       @Valid @RequestBody RearrangeRequest request) {
+        return baggageService.rearrange(legId, request);
     }
 
     /** 封舱：校验版本，保存只读装载清单并转 SEALED。 */
