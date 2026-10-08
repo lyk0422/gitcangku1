@@ -55,4 +55,38 @@ public final class Requests {
     /** 任务完成/取消请求，操作人由 X-Actor-Id 指定且须为当前指挥人。 */
     public record TaskActionRequest(String commandKey) {
     }
+
+    /**
+     * 指令计划单步定义：stepKey 计划内唯一；effectDesc 合成效果说明、
+     * compensationDesc 补偿说明均为非空原样文本。
+     */
+    public record PlanStepDefinition(String stepKey, String effectDesc, String compensationDesc) {
+    }
+
+    /**
+     * 创建指令计划请求：1~5 个有序步骤，数组顺序即执行顺序（序号从 1 起）；
+     * 步骤 stepKey 不可重复。写入须带全局 commandKey 与 X-Request-Id 请求头。
+     */
+    public record PlanCreateRequest(String commandKey, List<PlanStepDefinition> steps) {
+    }
+
+    /**
+     * 显式执行步骤请求：只能执行当前下一步；expectedVersion 为调用方持有的计划版本，
+     * 与服务端不一致返回 409，为 null 表示不校验。
+     */
+    public record PlanStepExecuteRequest(String commandKey, Long expectedVersion) {
+    }
+
+    /** 取消计划请求：RUNNING/COMPLETED → COMPENSATING；expectedVersion 语义同执行请求。 */
+    public record PlanCancelRequest(String commandKey, Long expectedVersion) {
+    }
+
+    /**
+     * 逐项补偿请求：stepKey 为待补偿步骤，须是当前序号最大的已执行（APPLIED）步骤。
+     * evidence 非空表示补偿成功并保存补偿证据；failureDiagnostic 非空表示补偿失败，
+     * 仅保存失败诊断、步骤保持 APPLIED，二者必须且只能填一个。
+     */
+    public record PlanCompensateRequest(String commandKey, Long expectedVersion,
+                                        String evidence, String failureDiagnostic) {
+    }
 }

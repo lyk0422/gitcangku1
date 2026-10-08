@@ -78,4 +78,42 @@ public final class Responses {
     /** 解决门禁未完成项：仍有 OPEN 任务时按 groupCode、taskKey 返回。 */
     public record UnfinishedTaskView(String groupCode, String taskKey) {
     }
+
+    /** 解决门禁未终结计划：存在 RUNNING/COMPENSATING 计划时按 planId、status 返回。 */
+    public record UnfinishedPlanView(long planId, String status) {
+    }
+
+    /**
+     * 单次补偿尝试视图（只追加、只读）：evidence 仅成功有值，
+     * failureDiagnostic 仅失败有值；requestId 为该次写入携带的全局请求 id。
+     */
+    public record CompensationAttemptView(long id, int stepIndex, int attemptNo, String status,
+                                          String evidence, String failureDiagnostic,
+                                          String actor, String requestId, java.time.Instant createdAt) {
+    }
+
+    /**
+     * 计划步骤视图：effectDesc 为原合成效果说明（补偿后仍保留）；
+     * attempts 为该步骤全部补偿尝试（成功/失败均含），按尝试顺序返回；
+     * appliedBy/appliedAt 仅 APPLIED/COMPENSATED 有值，compensatedBy/compensatedAt 仅 COMPENSATED 有值。
+     */
+    public record PlanStepView(int stepIndex, String stepKey, String effectDesc,
+                               String compensationDesc, String status,
+                               String appliedBy, java.time.Instant appliedAt,
+                               String compensatedBy, java.time.Instant compensatedAt,
+                               List<CompensationAttemptView> attempts) {
+    }
+
+    /**
+     * 指令计划视图：steps 按执行顺序返回。
+     * nextStepKey 为执行阶段（RUNNING）当前唯一允许执行的下一步，无（已全部执行或非 RUNNING）为 null；
+     * compensationStepKey 为 COMPENSATING 时当前唯一允许补偿的步骤（序号最大的 APPLIED 步骤），
+     * 其余情况为 null。status=COMPENSATING 且 compensationStepKey 为 null 表示尚有失败诊断待重试的边界不会出现
+     * ——只要存在 APPLIED 步骤该字段必非 null。
+     */
+    public record PlanView(long planId, String incidentKey, String status, long version,
+                           String createdBy, java.time.Instant createdAt, java.time.Instant updatedAt,
+                           List<PlanStepView> steps, String nextStepKey,
+                           String compensationStepKey) {
+    }
 }

@@ -35,6 +35,7 @@ import com.example.starter.incident.dto.Responses.TaskBlockerView;
 import com.example.starter.incident.dto.Responses.TaskView;
 import com.example.starter.incident.dto.Responses.TransferView;
 import com.example.starter.incident.dto.Responses.UnfinishedTaskView;
+import com.example.starter.incident.dto.Responses.UnfinishedPlanView;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
@@ -72,16 +73,19 @@ public class IncidentService {
     private final EscalationRepository escalations;
     private final IncidentTaskRepository tasks;
     private final CommandKeyRepository commandKeys;
+    private final CommandPlanRepository planRepository;
     private final ObjectMapper objectMapper;
     private final Clock clock;
 
     public IncidentService(IncidentRepository incidents, EscalationRepository escalations,
                            IncidentTaskRepository tasks, CommandKeyRepository commandKeys,
+                           CommandPlanRepository planRepository,
                            ObjectMapper objectMapper, Clock clock) {
         this.incidents = incidents;
         this.escalations = escalations;
         this.tasks = tasks;
         this.commandKeys = commandKeys;
+        this.planRepository = planRepository;
         this.objectMapper = objectMapper;
         this.clock = clock;
     }
@@ -271,6 +275,19 @@ public class IncidentService {
                         if (!unfinished.isEmpty()) {
                             throw ApiException.conflict(
                                     "仍有未完成的处置任务，不能进入 RESOLVED", unfinished);
+                        }
+                        // 解决门禁：所有指令计划须 COMPLETED 或 CANCELLED；
+                        // RUNNING 未执行完、COMPENSATING 补偿未完成均阻止解决
+                        List<UnfinishedPlanView> unfinishedPlans = planRepository
+                                .listPlansByIncident(incident.id()).stream()
+                                .filter(p -> p.status() != PlanStatus.COMPLETED
+                                        && p.status() != PlanStatus.CANCELLED)
+                                .map(p -> new UnfinishedPlanView(p.id(), p.status().name()))
+                                .toList();
+                        if (!unfinishedPlans.isEmpty()) {
+                            throw ApiException.conflict(
+                                    "仍有未终结的指令计划（RUNNING/COMPENSATING），不能进入 RESOLVED",
+                                    unfinishedPlans);
                         }
                     }
                     Instant now = now();

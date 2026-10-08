@@ -100,3 +100,51 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY COMMENT '固定为 1 的单行锁；创建任务时 SELECT ... FOR UPDATE 持有，串行化环检测与写入，保证并发反向依赖最终图无环'
 ) COMMENT='任务依赖图全局锁表';
+
+CREATE TABLE IF NOT EXISTS command_plans (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id；每事件可有多张指令计划',
+    status VARCHAR(16) NOT NULL COMMENT '计划状态：RUNNING 执行中（含尚未执行任何步骤）/ COMPLETED 全部步骤已执行 / COMPENSATING 已取消、正在逆序补偿 / CANCELLED 全部已执行步骤补偿完成（终态）；仅允许 RUNNING/COMPLETED→COMPENSATING→CANCELLED',
+    version BIGINT NOT NULL COMMENT '期望版本号，初始 0，计划或其任一步骤每次写入加 1；请求携带 expectedVersion 时按值校验并发修改',
+    created_by VARCHAR(128) NOT NULL COMMENT '创建人（创建时的当前指挥人）',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT fk_command_plans_incident FOREIGN KEY (incident_id) REFERENCES incidents (id),
+    INDEX idx_command_plans_incident (incident_id)
+) COMMENT='联动处置指令计划表（仅合成状态，无外部 HTTP 调用）';
+
+CREATE TABLE IF NOT EXISTS command_plan_steps (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    plan_id BIGINT NOT NULL COMMENT '所属计划 id，关联 command_plans.id',
+    incident_id BIGINT NOT NULL COMMENT '所属事件 id，关联 incidents.id，冗余便于事件维度清理与查询',
+    step_index INT NOT NULL COMMENT '步骤序号，计划内从 1 开始连续递增；只能按序号顺序执行，补偿时按序号逆序',
+    step_key VARCHAR(128) NOT NULL COMMENT '步骤业务键，计划内唯一；显式执行/补偿均以该键定位步骤',
+    effect_desc VARCHAR(1024) NOT NULL COMMENT '合成效果说明（原样保存的文本，补偿后仍保留）',
+    compensation_desc VARCHAR(1024) NOT NULL COMMENT '补偿说明（原样保存的文本），描述该步骤效果的补偿方式',
+    status VARCHAR(16) NOT NULL COMMENT '步骤状态：PENDING 未执行 / APPLIED 已生效 / COMPENSATED 已补偿；仅允许 PENDING→APPLIED→COMPENSATED，计划进入 COMPENSATING 后 PENDING 步骤不再执行',
+    applied_by VARCHAR(128) NULL COMMENT '生效操作人（执行时的当前指挥人）；仅 APPLIED/COMPENSATED 有值，PENDING 为空',
+    applied_at TIMESTAMP(6) NULL COMMENT '生效 UTC 时刻；仅 APPLIED/COMPENSATED 有值，PENDING 为空',
+    compensated_by VARCHAR(128) NULL COMMENT '补偿操作人（补偿时的当前指挥人，交接后为新指挥人）；仅 COMPENSATED 有值',
+    compensated_at TIMESTAMP(6) NULL COMMENT '补偿 UTC 时刻；仅 COMPENSATED 有值',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '创建 UTC 时间',
+    updated_at TIMESTAMP(6) NOT NULL COMMENT '最近变更 UTC 时间',
+    CONSTRAINT uk_plan_step_key UNIQUE (plan_id, step_key),
+    CONSTRAINT uk_plan_step_index UNIQUE (plan_id, step_index),
+    CONSTRAINT fk_plan_steps_plan FOREIGN KEY (plan_id) REFERENCES command_plans (id)
+) COMMENT='指令计划步骤表';
+
+CREATE TABLE IF NOT EXISTS command_plan_compensations (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    plan_id BIGINT NOT NULL COMMENT '所属计划 id，关联 command_plans.id',
+    step_id BIGINT NOT NULL COMMENT '补偿步骤 id，关联 command_plan_steps.id',
+    step_index INT NOT NULL COMMENT '补偿步骤序号，冗余便于按逆序核对',
+    attempt_no INT NOT NULL COMMENT '该步骤第几次补偿尝试，从 1 递增；失败后允许以新 commandKey 再次尝试，每次尝试均留痕',
+    status VARCHAR(16) NOT NULL COMMENT '尝试结果：SUCCEEDED 成功（步骤转 COMPENSATED）/ FAILED 失败（仅保存诊断，步骤保持 APPLIED）',
+    evidence VARCHAR(2048) NULL COMMENT '补偿证据，成功时非空原样保存；失败尝试为空',
+    failure_diagnostic VARCHAR(2048) NULL COMMENT '失败诊断，失败尝试非空原样保存；成功尝试为空',
+    actor VARCHAR(128) NOT NULL COMMENT '补偿操作人（操作时的当前指挥人）',
+    request_id VARCHAR(128) NOT NULL COMMENT '全局请求 id（X-Request-Id），随每次写入留痕',
+    created_at TIMESTAMP(6) NOT NULL COMMENT '尝试落库 UTC 时间',
+    CONSTRAINT fk_plan_compensations_step FOREIGN KEY (step_id) REFERENCES command_plan_steps (id),
+    INDEX idx_plan_compensations_step (step_id)
+) COMMENT='步骤补偿尝试证据/诊断表（只追加，查询只读）';

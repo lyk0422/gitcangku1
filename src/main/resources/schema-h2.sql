@@ -100,3 +100,48 @@ CREATE TABLE IF NOT EXISTS incident_task_blockers (
 CREATE TABLE IF NOT EXISTS task_graph_lock (
     id TINYINT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS command_plans (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    incident_id BIGINT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    version BIGINT NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_command_plans_incident ON command_plans (incident_id);
+
+CREATE TABLE IF NOT EXISTS command_plan_steps (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    plan_id BIGINT NOT NULL,
+    incident_id BIGINT NOT NULL,
+    step_index INT NOT NULL,
+    step_key VARCHAR(128) NOT NULL,
+    effect_desc VARCHAR(1024) NOT NULL,
+    compensation_desc VARCHAR(1024) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    applied_by VARCHAR(128) NULL,
+    applied_at TIMESTAMP(6) NULL,
+    compensated_by VARCHAR(128) NULL,
+    compensated_at TIMESTAMP(6) NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT uk_plan_step_key UNIQUE (plan_id, step_key),
+    CONSTRAINT uk_plan_step_index UNIQUE (plan_id, step_index)
+);
+
+CREATE TABLE IF NOT EXISTS command_plan_compensations (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    plan_id BIGINT NOT NULL,
+    step_id BIGINT NOT NULL,
+    step_index INT NOT NULL,
+    attempt_no INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    evidence VARCHAR(2048) NULL,
+    failure_diagnostic VARCHAR(2048) NULL,
+    actor VARCHAR(128) NOT NULL,
+    request_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plan_compensations_step ON command_plan_compensations (step_id);

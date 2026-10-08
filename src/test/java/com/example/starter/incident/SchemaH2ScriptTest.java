@@ -108,6 +108,72 @@ class SchemaH2ScriptTest {
                     duplicateBlockerRejected = true;
                 }
                 assertThat(duplicateBlockerRejected).isTrue();
+
+                // 指令计划：同一计划内 step_key、step_index 唯一；条件更新只在当前状态生效
+                st.execute("INSERT INTO command_plans (incident_id, status, version, created_by,"
+                        + " created_at, updated_at) VALUES (1,'RUNNING',0,'alice','"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO command_plan_steps (plan_id, incident_id, step_index,"
+                        + " step_key, effect_desc, compensation_desc, status, applied_by,"
+                        + " applied_at, compensated_by, compensated_at, created_at, updated_at)"
+                        + " VALUES (1,1,1,'S1','效果','补偿','PENDING',NULL,NULL,NULL,NULL,'"
+                        + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                boolean dupStepKeyRejected = false;
+                try {
+                    st.execute("INSERT INTO command_plan_steps (plan_id, incident_id, step_index,"
+                            + " step_key, effect_desc, compensation_desc, status, applied_by,"
+                            + " applied_at, compensated_by, compensated_at, created_at, updated_at)"
+                            + " VALUES (1,1,2,'S1','x','y','PENDING',NULL,NULL,NULL,NULL,'"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    dupStepKeyRejected = true;
+                }
+                assertThat(dupStepKeyRejected).isTrue();
+                boolean dupStepIndexRejected = false;
+                try {
+                    st.execute("INSERT INTO command_plan_steps (plan_id, incident_id, step_index,"
+                            + " step_key, effect_desc, compensation_desc, status, applied_by,"
+                            + " applied_at, compensated_by, compensated_at, created_at, updated_at)"
+                            + " VALUES (1,1,1,'S2','x','y','PENDING',NULL,NULL,NULL,NULL,'"
+                            + Timestamp.from(now) + "','" + Timestamp.from(now) + "')");
+                } catch (Exception e) {
+                    dupStepIndexRejected = true;
+                }
+                assertThat(dupStepIndexRejected).isTrue();
+
+                // PENDING → APPLIED 条件更新成功一次；第二次（已非 PENDING）更新 0 行，重复执行不重复记效果
+                int applied = st.executeUpdate("UPDATE command_plan_steps SET status='APPLIED',"
+                        + " applied_by='alice', applied_at='" + Timestamp.from(now)
+                        + "', updated_at='" + Timestamp.from(now)
+                        + "' WHERE id = 1 AND status='PENDING'");
+                assertThat(applied).isEqualTo(1);
+                int reapply = st.executeUpdate("UPDATE command_plan_steps SET status='APPLIED',"
+                        + " applied_by='alice' WHERE id = 1 AND status='PENDING'");
+                assertThat(reapply).isZero();
+                // APPLIED → COMPENSATED 成功；对已 COMPENSATED 行再补偿 0 行
+                int compensated = st.executeUpdate("UPDATE command_plan_steps SET status='COMPENSATED',"
+                        + " compensated_by='bob', compensated_at='" + Timestamp.from(now)
+                        + "', updated_at='" + Timestamp.from(now)
+                        + "' WHERE id = 1 AND status='APPLIED'");
+                assertThat(compensated).isEqualTo(1);
+                int recompensate = st.executeUpdate("UPDATE command_plan_steps SET status='COMPENSATED'"
+                        + " WHERE id = 1 AND status='APPLIED'");
+                assertThat(recompensate).isZero();
+
+                // 补偿尝试证据/诊断可只追加两条（一次失败一次成功）
+                st.execute("INSERT INTO command_plan_compensations (plan_id, step_id, step_index,"
+                        + " attempt_no, status, evidence, failure_diagnostic, actor, request_id,"
+                        + " created_at) VALUES (1,1,1,1,'FAILED',NULL,'下游超时','alice','REQ-1','"
+                        + Timestamp.from(now) + "')");
+                st.execute("INSERT INTO command_plan_compensations (plan_id, step_id, step_index,"
+                        + " attempt_no, status, evidence, failure_diagnostic, actor, request_id,"
+                        + " created_at) VALUES (1,1,1,2,'SUCCEEDED','已回滚',NULL,'alice','REQ-2','"
+                        + Timestamp.from(now) + "')");
+                try (ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM command_plan_compensations"
+                        + " WHERE step_id = 1")) {
+                    rs.next();
+                    assertThat(rs.getInt(1)).isEqualTo(2);
+                }
             }
         }
     }
