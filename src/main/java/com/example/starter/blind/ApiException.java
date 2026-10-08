@@ -48,4 +48,9 @@ public class ApiException extends RuntimeException {
     public static ApiException full(String message) {
         return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message);
     }
+
+    /** 422 业务不可处理：如闭组汇总时有效结果不足。 */
+    public static ApiException unprocessable(String message) {
+        return new ApiException(HttpStatus.UNPROCESSABLE_ENTITY, message);
+    }
 }

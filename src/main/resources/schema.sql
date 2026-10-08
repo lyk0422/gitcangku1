@@ -112,3 +112,38 @@ COMMENT ON COLUMN idempotent_request.fingerprint IS '请求参数指纹（含路
 COMMENT ON COLUMN idempotent_request.response_status IS '首次成功响应的 HTTP 状态码，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.response_body IS '首次成功响应体 JSON，重放时原样返回';
 COMMENT ON COLUMN idempotent_request.created_at IS '记录时间，Unix 毫秒，UTC';
+
+CREATE TABLE IF NOT EXISTS blind_sample (
+    id              BIGINT       NOT NULL AUTO_INCREMENT,
+    experiment_id   VARCHAR(64)  NOT NULL,
+    allocation_id   BIGINT       NOT NULL,
+    primary_code    VARCHAR(32)  NOT NULL,
+    secondary_code  VARCHAR(32),
+    analyst_actor   VARCHAR(64),
+    status          VARCHAR(16)  NOT NULL,
+    result_value    INT,
+    version         INT          NOT NULL,
+    created_actor   VARCHAR(64)  NOT NULL,
+    created_at      BIGINT       NOT NULL,
+    received_at     BIGINT,
+    result_at       BIGINT,
+    CONSTRAINT pk_sample PRIMARY KEY (id),
+    CONSTRAINT uq_sample_allocation UNIQUE (allocation_id),
+    CONSTRAINT uq_sample_primary_code UNIQUE (primary_code),
+    CONSTRAINT uq_sample_secondary_code UNIQUE (secondary_code),
+    CONSTRAINT ck_sample_status CHECK (status IN ('CREATED', 'RECEIVED', 'RESULT'))
+);
+COMMENT ON TABLE  blind_sample IS '二级盲码交接样本表；每个分配至多一个样本，一级码由协调员持有，二级码仅接收分析员本人可用';
+COMMENT ON COLUMN blind_sample.id IS '样本自增主键';
+COMMENT ON COLUMN blind_sample.experiment_id IS '所属实验编号';
+COMMENT ON COLUMN blind_sample.allocation_id IS '对应分配主键，唯一约束保证一个参与者分配至多一个样本';
+COMMENT ON COLUMN blind_sample.primary_code IS '一级随机码，全局唯一，与区组/席位/处理无对应规律；协调员可见';
+COMMENT ON COLUMN blind_sample.secondary_code IS '二级随机码，全局唯一，接收时生成；仅接收分析员本人可见可用，NULL=未接收';
+COMMENT ON COLUMN blind_sample.analyst_actor IS '接收样本的分析员操作者编号，一样本仅绑定一名分析员；NULL=未接收';
+COMMENT ON COLUMN blind_sample.status IS '样本状态：CREATED=已建未接收；RECEIVED=已接收未录结果；RESULT=已录入结果';
+COMMENT ON COLUMN blind_sample.result_value IS '分析员录入的整数结果，一样本仅一个；NULL=未录入；退组样本的结果保留但不进闭组汇总';
+COMMENT ON COLUMN blind_sample.version IS '乐观锁版本号，创建为1，接收与录入结果各加1；录入结果可携带期望版本校验';
+COMMENT ON COLUMN blind_sample.created_actor IS '创建样本的协调员操作者编号';
+COMMENT ON COLUMN blind_sample.created_at IS '样本创建时间，Unix 毫秒，UTC';
+COMMENT ON COLUMN blind_sample.received_at IS '接收时间，Unix 毫秒，UTC；NULL=未接收';
+COMMENT ON COLUMN blind_sample.result_at IS '结果录入时间，Unix 毫秒，UTC；NULL=未录入';

@@ -106,6 +106,18 @@ public class AllocationRepository {
     }
 
     /**
+     * 行级锁定分配，用于接收样本与退组竞争时按提交顺序判定退组状态。
+     */
+    public AllocationRow lockById(long allocationId) {
+        List<AllocationRow> rows = jdbc.query(
+                "SELECT id, experiment_id, participant_id, block_no, seat_no, blind_code, status, "
+                        + "assigned_actor, assigned_at, withdrawn_at "
+                        + "FROM allocation WHERE id = ? FOR UPDATE",
+                ALLOCATION_MAPPER, allocationId);
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /**
      * 插入时若参与者已在同实验占席，抛出由唯一约束触发的 DuplicateKeyException。
      */
     public boolean isDuplicateParticipant(DuplicateKeyException e) {
