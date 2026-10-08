@@ -23,9 +23,12 @@ import java.util.Map;
  * @param selections      各冲突字段的人工选择
  * @param operator        操作者标识
  * @param resolvedAtUtc   解决完成时刻（UTC，ISO-8601）
- * @param location        解决后版本的观测地点
- * @param reading         解决后版本的观测读数
- * @param note            解决后版本的观测备注
+ * @param location        解决后版本的观测地点（FIELD）
+ * @param reading         解决后版本的观测读数（FIELD）
+ * @param note            解决后版本的观测备注（FIELD）
+ * @param sectionNo       解决后版本的断面号（SECTION）
+ * @param lateralMm       解决后版本的横向坐标，整数毫米（SECTION）
+ * @param elevationMm     解决后版本的高程，整数毫米（SECTION）
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ResolutionResponse(
@@ -42,7 +45,10 @@ public record ResolutionResponse(
         Instant resolvedAtUtc,
         String location,
         String reading,
-        String note) {
+        String note,
+        String sectionNo,
+        Integer lateralMm,
+        Integer elevationMm) {
 
     private static final TypeReference<Map<String, String>> SELECTIONS_TYPE = new TypeReference<>() {
     };
@@ -66,7 +72,10 @@ public record ResolutionResponse(
                 record.resolvedAtUtc(),
                 pointed.location(),
                 pointed.reading(),
-                pointed.note());
+                pointed.note(),
+                pointed.sectionNo(),
+                pointed.lateralMm(),
+                pointed.elevationMm());
     }
 
     private static Map<String, String> parseSelections(String json, ObjectMapper objectMapper) {

@@ -43,9 +43,14 @@ public class ObservationService {
     private static final String SEPARATOR = "\u0001";
 
     /**
-     * 三个可编辑字段的固定顺序：冲突重算、选择校验与指纹均以此顺序处理，保证结果稳定。
+     * SECTION 类型版本组在选择映射中的键：断面号/横向/高程三字段作为完整版本组整体选择与裁决。
      */
-    private static final List<String> FIELDS = List.of("location", "reading", "note");
+    private static final String SECTION_GROUP_FIELD = "sectionPoint";
+
+    /**
+     * 选择映射允许的全部键（FIELD 三字段 + SECTION 版本组），规范化顺序固定。
+     */
+    private static final List<String> ALL_SELECTABLE = List.of("location", "reading", "note", "sectionPoint");
 
     private final ObservationRepository observationRepository;
     private final RequestLogRepository requestLogRepository;
@@ -70,8 +75,9 @@ public class ObservationService {
      */
     @Transactional
     public WriteOutcome create(CreateObservationRequest request) {
-        String fingerprint = fingerprint("CREATE", request.observationId(), request.location(),
-                request.reading(), request.note());
+        String fingerprint = fingerprint("CREATE", request.observationId(), request.observationType(),
+                request.location(), request.reading(), request.note(),
+                request.sectionNo(), str(request.lateralMm()), str(request.elevationMm()));
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -84,8 +90,7 @@ public class ObservationService {
         if (observationRepository.findCurrentForUpdate(request.observationId()).isPresent()) {
             throw ApiException.conflict("observation already exists: " + request.observationId(), null);
         }
-        ObservationSnapshot snapshot = new ObservationSnapshot(request.observationId(), 1,
-                request.location(), request.reading(), request.note(), false);
+        ObservationSnapshot snapshot = buildCreateSnapshot(request);
         try {
             observationRepository.insertCurrent(snapshot);
         } catch (DuplicateKeyException e) {
@@ -102,7 +107,8 @@ public class ObservationService {
     @Transactional
     public WriteOutcome merge(String observationId, MergeObservationRequest request) {
         String fingerprint = fingerprint("MERGE", observationId, String.valueOf(request.baseVersion()),
-                request.location(), request.reading(), request.note());
+                request.location(), request.reading(), request.note(),
+                request.sectionNo(), str(request.lateralMm()), str(request.elevationMm()));
         WriteOutcome replayed = checkReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -117,6 +123,11 @@ public class ObservationService {
         if (current.deleted()) {
             throw ApiException.gone("observation already deleted: " + observationId);
         }
+        if (current.observationType() == ObservationType.SECTION) {
+            return mergeSection(observationId, request, current);
+        }
+        requireFieldGroup(request.location(), request.reading(), request.note());
+        rejectSectionFields(request.sectionNo(), request.lateralMm(), request.elevationMm());
         ObservationSnapshot base = observationRepository.findVersion(observationId, request.baseVersion())
                 .orElseThrow(() -> ApiException.notFound(
                         "base version not found: " + observationId + "@" + request.baseVersion()));
@@ -131,13 +142,13 @@ public class ObservationService {
             throw ApiException.mergeConflict(conflictFields, current.version());
         }
 
-        ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
+        ObservationSnapshot merged = ObservationSnapshot.field(observationId, current.version(),
                 mergedLocation, mergedReading, mergedNote, false);
         if (sameContent(merged, current)) {
             // 合并结果与当前完全相同：返回当前版本，不加版本
             return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
         }
-        ObservationSnapshot next = new ObservationSnapshot(observationId, current.version() + 1,
+        ObservationSnapshot next = ObservationSnapshot.field(observationId, current.version() + 1,
                 mergedLocation, mergedReading, mergedNote, false);
         observationRepository.updateCurrent(next);
         observationRepository.insertVersion(next);
@@ -167,8 +178,7 @@ public class ObservationService {
         if (request.expectedVersion() != current.version()) {
             throw ApiException.conflict("expectedVersion mismatch", current.version());
         }
-        ObservationSnapshot tombstone = new ObservationSnapshot(observationId, current.version() + 1,
-                null, null, null, true);
+        ObservationSnapshot tombstone = ObservationSnapshot.tombstone(current, current.version() + 1);
         observationRepository.markDeleted(observationId, tombstone.version());
         observationRepository.insertVersion(tombstone);
         return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(tombstone));
@@ -194,7 +204,9 @@ public class ObservationService {
         String normalizedSelections = writeSelectionsJson(selections);
         String fingerprint = fingerprint("RESOLVE", observationId, request.resolutionId(),
                 String.valueOf(request.baseVersion()), String.valueOf(request.expectedCurrentVersion()),
-                request.location(), request.reading(), request.note(), normalizedSelections, request.operator());
+                request.location(), request.reading(), request.note(),
+                request.sectionNo(), str(request.lateralMm()), str(request.elevationMm()),
+                normalizedSelections, request.operator());
         ResolveOutcome replayed = checkResolveReplay(request.requestId(), fingerprint);
         if (replayed != null) {
             return replayed;
@@ -230,35 +242,15 @@ public class ObservationService {
                 .orElseThrow(() -> ApiException.notFound(
                         "base version not found: " + observationId + "@" + request.baseVersion()));
 
-        List<String> conflictFields = new ArrayList<>();
-        boolean locationConflict = fieldConflicts(base.location(), current.location(), request.location(), false);
-        if (locationConflict) {
-            conflictFields.add("location");
-        }
-        boolean readingConflict = fieldConflicts(base.reading(), current.reading(), request.reading(), true);
-        if (readingConflict) {
-            conflictFields.add("reading");
-        }
-        boolean noteConflict = fieldConflicts(base.note(), current.note(), request.note(), false);
-        if (noteConflict) {
-            conflictFields.add("note");
-        }
-        validateSelectionCoverage(selections.keySet(), conflictFields);
-
-        String resolvedLocation = resolveFieldValue(locationConflict, selections.get("location"),
-                base.location(), current.location(), request.location(), false);
-        String resolvedReading = resolveFieldValue(readingConflict, selections.get("reading"),
-                base.reading(), current.reading(), request.reading(), true);
-        String resolvedNote = resolveFieldValue(noteConflict, selections.get("note"),
-                base.note(), current.note(), request.note(), false);
-
-        ObservationSnapshot merged = new ObservationSnapshot(observationId, current.version(),
-                resolvedLocation, resolvedReading, resolvedNote, false);
+        MergePlan plan = current.observationType() == ObservationType.SECTION
+                ? planSectionResolution(current, base, request, selections)
+                : planFieldResolution(current, base, request, selections);
+        List<String> conflictFields = plan.conflictFields();
+        ObservationSnapshot merged = plan.merged();
         boolean contentChanged = !sameContent(merged, current);
         int newVersion = contentChanged ? current.version() + 1 : current.version();
         if (contentChanged) {
-            ObservationSnapshot next = new ObservationSnapshot(observationId, newVersion,
-                    resolvedLocation, resolvedReading, resolvedNote, false);
+            ObservationSnapshot next = withVersion(merged, newVersion);
             observationRepository.updateCurrent(next);
             observationRepository.insertVersion(next);
         }
@@ -267,6 +259,7 @@ public class ObservationService {
                 request.resolutionId(), observationId, request.requestId(),
                 request.baseVersion(), current.version(), newVersion,
                 request.location(), request.reading(), request.note(),
+                request.sectionNo(), request.lateralMm(), request.elevationMm(),
                 List.copyOf(conflictFields), normalizedSelections, request.operator(),
                 Instant.now(clock), contentChanged);
         try {
@@ -284,9 +277,7 @@ public class ObservationService {
             return completeResolve(request.requestId(), HttpStatus.OK, resolutionResponseOf(winner));
         }
 
-        ObservationSnapshot pointed = contentChanged
-                ? new ObservationSnapshot(observationId, newVersion, resolvedLocation, resolvedReading, resolvedNote, false)
-                : current;
+        ObservationSnapshot pointed = contentChanged ? withVersion(merged, newVersion) : current;
         return completeResolve(request.requestId(), HttpStatus.OK,
                 ResolutionResponse.of(record, pointed, objectMapper));
     }
@@ -362,9 +353,15 @@ public class ObservationService {
     }
 
     /**
-     * 判断合并结果与当前版本内容是否完全相同（读数按数值，其余按原文）。
+     * 判断合并结果与当前版本内容是否完全相同（读数按数值，文本按原文，SECTION 按版本组整体）。
      */
     private boolean sameContent(ObservationSnapshot merged, ObservationSnapshot current) {
+        if (merged.observationType() != current.observationType()) {
+            return false;
+        }
+        if (merged.observationType() == ObservationType.SECTION) {
+            return sectionGroupEquals(merged.sectionNo(), merged.lateralMm(), merged.elevationMm(), current);
+        }
         return Objects.equals(merged.location(), current.location())
                 && Objects.equals(merged.note(), current.note())
                 && readingEquals(merged.reading(), current.reading());
@@ -450,15 +447,16 @@ public class ObservationService {
     // ---------- 冲突解决辅助逻辑 ----------
 
     /**
-     * 解析并规范化选择映射：键必须是三个可编辑字段之一，值仅允许 CURRENT/CANDIDATE（大小写不敏感）；
-     * 重复字段（JSON 反序列化不会出现）或非法键值一律 400。
+     * 解析并规范化选择映射：键必须是 FIELD 三字段或 SECTION 版本组 sectionPoint 之一，
+     * 值仅允许 CURRENT/CANDIDATE（大小写不敏感）；非法键值一律 400。
      */
     private Map<String, FieldSelection> parseSelections(Map<String, String> raw) {
         Map<String, FieldSelection> selections = new LinkedHashMap<>();
         for (Map.Entry<String, String> entry : raw.entrySet()) {
             String field = entry.getKey() == null ? null : entry.getKey().trim();
-            if (field == null || !FIELDS.contains(field)) {
-                throw ApiException.badRequest("selection key must be one of location/reading/note: " + field);
+            if (field == null || !ALL_SELECTABLE.contains(field)) {
+                throw ApiException.badRequest(
+                        "selection key must be one of location/reading/note/sectionPoint: " + field);
             }
             FieldSelection selection = FieldSelection.fromValue(entry.getValue());
             if (selection == null) {
@@ -477,7 +475,7 @@ public class ObservationService {
      */
     private String writeSelectionsJson(Map<String, FieldSelection> selections) {
         Map<String, String> ordered = new LinkedHashMap<>();
-        for (String field : FIELDS) {
+        for (String field : ALL_SELECTABLE) {
             FieldSelection selection = selections.get(field);
             if (selection != null) {
                 ordered.put(field, selection.name());
@@ -609,6 +607,9 @@ public class ObservationService {
                 && Objects.equals(record.candidateLocation(), request.location())
                 && Objects.equals(record.candidateReading(), request.reading())
                 && Objects.equals(record.candidateNote(), request.note())
+                && Objects.equals(record.candidateSectionNo(), request.sectionNo())
+                && Objects.equals(record.candidateLateralMm(), request.lateralMm())
+                && Objects.equals(record.candidateElevationMm(), request.elevationMm())
                 && Objects.equals(record.fieldSelections(), normalizedSelections)
                 && Objects.equals(record.operator(), request.operator());
     }
@@ -622,6 +623,187 @@ public class ObservationService {
                 .orElseThrow(() -> new IllegalStateException(
                         "pointed version missing for resolution: " + record.resolutionId()));
         return ResolutionResponse.of(record, pointed, objectMapper);
+    }
+
+    // ---------- 观测类型与 SECTION 版本组辅助逻辑 ----------
+
+    /**
+     * 按请求类型构造创建快照：FIELD 要求 location/reading/note 齐全且不带断面字段；
+     * SECTION 要求 sectionNo/lateralMm/elevationMm 完整版本组且不带 FIELD 字段。
+     */
+    private ObservationSnapshot buildCreateSnapshot(CreateObservationRequest request) {
+        ObservationType type = ObservationType.fromValue(request.observationType());
+        if (type == null) {
+            throw ApiException.badRequest("observationType must be FIELD or SECTION: " + request.observationType());
+        }
+        if (type == ObservationType.FIELD) {
+            requireFieldGroup(request.location(), request.reading(), request.note());
+            rejectSectionFields(request.sectionNo(), request.lateralMm(), request.elevationMm());
+            return ObservationSnapshot.field(request.observationId(), 1,
+                    request.location(), request.reading(), request.note(), false);
+        }
+        rejectFieldGroup(request.location(), request.reading(), request.note());
+        requireSectionGroup(request.sectionNo(), request.lateralMm(), request.elevationMm());
+        return ObservationSnapshot.section(request.observationId(), 1,
+                request.sectionNo(), request.lateralMm(), request.elevationMm(), false);
+    }
+
+    /**
+     * SECTION 类型三方合并：断面号/横向/高程三字段作为完整版本组整体判定，不可拆分拼接不同提交。
+     */
+    private WriteOutcome mergeSection(String observationId, MergeObservationRequest request,
+                                      ObservationSnapshot current) {
+        rejectFieldGroup(request.location(), request.reading(), request.note());
+        requireSectionGroup(request.sectionNo(), request.lateralMm(), request.elevationMm());
+        ObservationSnapshot base = observationRepository.findVersion(observationId, request.baseVersion())
+                .orElseThrow(() -> ApiException.notFound(
+                        "base version not found: " + observationId + "@" + request.baseVersion()));
+        requireSectionBase(base, observationId, request.baseVersion());
+        if (sectionGroupConflicts(base, current,
+                request.sectionNo(), request.lateralMm(), request.elevationMm())) {
+            throw ApiException.mergeConflict(List.of(SECTION_GROUP_FIELD), current.version());
+        }
+        if (sectionGroupEquals(request.sectionNo(), request.lateralMm(), request.elevationMm(), base)
+                || sameContent(ObservationSnapshot.section(observationId, current.version(),
+                        request.sectionNo(), request.lateralMm(), request.elevationMm(), false), current)) {
+            // 候选未改或合并结果与当前完全相同：返回当前版本，不加版本
+            return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(current));
+        }
+        ObservationSnapshot next = ObservationSnapshot.section(observationId, current.version() + 1,
+                request.sectionNo(), request.lateralMm(), request.elevationMm(), false);
+        observationRepository.updateCurrent(next);
+        observationRepository.insertVersion(next);
+        return complete(request.requestId(), HttpStatus.OK, ObservationResponse.of(next));
+    }
+
+    /**
+     * FIELD 类型冲突解决计划：按原三方规则逐字段重算冲突并应用人工选择。
+     */
+    private MergePlan planFieldResolution(ObservationSnapshot current, ObservationSnapshot base,
+                                          ResolveConflictRequest request,
+                                          Map<String, FieldSelection> selections) {
+        requireFieldGroup(request.location(), request.reading(), request.note());
+        rejectSectionFields(request.sectionNo(), request.lateralMm(), request.elevationMm());
+        List<String> conflictFields = new ArrayList<>();
+        boolean locationConflict = fieldConflicts(base.location(), current.location(), request.location(), false);
+        if (locationConflict) {
+            conflictFields.add("location");
+        }
+        boolean readingConflict = fieldConflicts(base.reading(), current.reading(), request.reading(), true);
+        if (readingConflict) {
+            conflictFields.add("reading");
+        }
+        boolean noteConflict = fieldConflicts(base.note(), current.note(), request.note(), false);
+        if (noteConflict) {
+            conflictFields.add("note");
+        }
+        validateSelectionCoverage(selections.keySet(), conflictFields);
+        String resolvedLocation = resolveFieldValue(locationConflict, selections.get("location"),
+                base.location(), current.location(), request.location(), false);
+        String resolvedReading = resolveFieldValue(readingConflict, selections.get("reading"),
+                base.reading(), current.reading(), request.reading(), true);
+        String resolvedNote = resolveFieldValue(noteConflict, selections.get("note"),
+                base.note(), current.note(), request.note(), false);
+        return new MergePlan(conflictFields, ObservationSnapshot.field(current.observationId(),
+                current.version(), resolvedLocation, resolvedReading, resolvedNote, false));
+    }
+
+    /**
+     * SECTION 类型冲突解决计划：版本组整体重算冲突，选择键为 sectionPoint，不可拆分拼接。
+     */
+    private MergePlan planSectionResolution(ObservationSnapshot current, ObservationSnapshot base,
+                                            ResolveConflictRequest request,
+                                            Map<String, FieldSelection> selections) {
+        rejectFieldGroup(request.location(), request.reading(), request.note());
+        requireSectionGroup(request.sectionNo(), request.lateralMm(), request.elevationMm());
+        requireSectionBase(base, current.observationId(), request.baseVersion());
+        boolean conflict = sectionGroupConflicts(base, current,
+                request.sectionNo(), request.lateralMm(), request.elevationMm());
+        List<String> conflictFields = conflict ? List.of(SECTION_GROUP_FIELD) : List.of();
+        validateSelectionCoverage(selections.keySet(), conflictFields);
+        ObservationSnapshot merged;
+        if (conflict) {
+            merged = selections.get(SECTION_GROUP_FIELD) == FieldSelection.CANDIDATE
+                    ? ObservationSnapshot.section(current.observationId(), current.version(),
+                            request.sectionNo(), request.lateralMm(), request.elevationMm(), false)
+                    : current;
+        } else if (sectionGroupEquals(request.sectionNo(), request.lateralMm(), request.elevationMm(), base)) {
+            merged = current;
+        } else {
+            merged = ObservationSnapshot.section(current.observationId(), current.version(),
+                    request.sectionNo(), request.lateralMm(), request.elevationMm(), false);
+        }
+        return new MergePlan(conflictFields, merged);
+    }
+
+    /**
+     * SECTION 版本组整体相等判定：断面号按原文，横向/高程按整数值。
+     */
+    private boolean sectionGroupEquals(String sectionNo, Integer lateralMm, Integer elevationMm,
+                                       ObservationSnapshot snapshot) {
+        return Objects.equals(sectionNo, snapshot.sectionNo())
+                && Objects.equals(lateralMm, snapshot.lateralMm())
+                && Objects.equals(elevationMm, snapshot.elevationMm());
+    }
+
+    /**
+     * SECTION 版本组三方冲突判定：候选未改、当前未改或两边改为相同值均不冲突，否则整组冲突。
+     */
+    private boolean sectionGroupConflicts(ObservationSnapshot base, ObservationSnapshot current,
+                                          String sectionNo, Integer lateralMm, Integer elevationMm) {
+        if (sectionGroupEquals(sectionNo, lateralMm, elevationMm, base)) {
+            return false;
+        }
+        return !sectionGroupEquals(current.sectionNo(), current.lateralMm(), current.elevationMm(), base)
+                && !sectionGroupEquals(sectionNo, lateralMm, elevationMm, current);
+    }
+
+    private void requireFieldGroup(String location, String reading, String note) {
+        if (location == null || reading == null || note == null) {
+            throw ApiException.badRequest("FIELD observation requires location, reading and note");
+        }
+    }
+
+    private void rejectFieldGroup(String location, String reading, String note) {
+        if (location != null || reading != null || note != null) {
+            throw ApiException.badRequest("SECTION observation must not carry location/reading/note");
+        }
+    }
+
+    private void requireSectionGroup(String sectionNo, Integer lateralMm, Integer elevationMm) {
+        if (sectionNo == null || sectionNo.isBlank() || lateralMm == null || elevationMm == null) {
+            throw ApiException.badRequest(
+                    "SECTION observation requires complete group: sectionNo, lateralMm, elevationMm");
+        }
+    }
+
+    private void rejectSectionFields(String sectionNo, Integer lateralMm, Integer elevationMm) {
+        if (sectionNo != null || lateralMm != null || elevationMm != null) {
+            throw ApiException.badRequest("FIELD observation must not carry section fields");
+        }
+    }
+
+    private void requireSectionBase(ObservationSnapshot base, String observationId, int baseVersion) {
+        if (base.deleted() || base.observationType() != ObservationType.SECTION) {
+            throw ApiException.badRequest(
+                    "base version is not a section point version: " + observationId + "@" + baseVersion);
+        }
+    }
+
+    private ObservationSnapshot withVersion(ObservationSnapshot snapshot, int version) {
+        return new ObservationSnapshot(snapshot.observationId(), version, snapshot.observationType(),
+                snapshot.location(), snapshot.reading(), snapshot.note(),
+                snapshot.sectionNo(), snapshot.lateralMm(), snapshot.elevationMm(), snapshot.deleted());
+    }
+
+    private static String str(Integer value) {
+        return value == null ? null : String.valueOf(value);
+    }
+
+    /**
+     * 冲突解决计划：重算出的冲突字段（组）列表与解决后的合并快照（版本号为解决前当前版本）。
+     */
+    private record MergePlan(List<String> conflictFields, ObservationSnapshot merged) {
     }
 
     /**

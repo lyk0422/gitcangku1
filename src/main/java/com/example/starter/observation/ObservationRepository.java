@@ -8,17 +8,25 @@ import java.util.Optional;
 
 /**
  * 观测记录持久化：维护 observation_current 当前状态与 observation_version 完整历史快照。
- * 所有 SQL 使用参数化查询。
+ * 所有 SQL 使用参数化查询；SECTION 类型的断面号/横向/高程三字段作为完整版本组整体读写。
  */
 @Repository
 public class ObservationRepository {
 
+    private static final String SELECT_COLUMNS =
+            "observation_id, version, observation_type, location, reading, note, "
+                    + "section_no, lateral_mm, elevation_mm, deleted";
+
     private static final RowMapper<ObservationSnapshot> SNAPSHOT_MAPPER = (rs, rowNum) -> new ObservationSnapshot(
             rs.getString("observation_id"),
             rs.getInt("version"),
+            ObservationType.valueOf(rs.getString("observation_type")),
             rs.getString("location"),
             rs.getString("reading"),
             rs.getString("note"),
+            rs.getString("section_no"),
+            (Integer) rs.getObject("lateral_mm"),
+            (Integer) rs.getObject("elevation_mm"),
             rs.getBoolean("deleted"));
 
     private final JdbcTemplate jdbcTemplate;
@@ -32,8 +40,7 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findCurrent(String observationId) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
-                                + "FROM observation_current WHERE observation_id = ?",
+                        "SELECT " + SELECT_COLUMNS + " FROM observation_current WHERE observation_id = ?",
                         SNAPSHOT_MAPPER, observationId)
                 .stream().findFirst();
     }
@@ -43,8 +50,7 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findCurrentForUpdate(String observationId) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
-                                + "FROM observation_current WHERE observation_id = ? FOR UPDATE",
+                        "SELECT " + SELECT_COLUMNS + " FROM observation_current WHERE observation_id = ? FOR UPDATE",
                         SNAPSHOT_MAPPER, observationId)
                 .stream().findFirst();
     }
@@ -54,8 +60,7 @@ public class ObservationRepository {
      */
     public Optional<ObservationSnapshot> findVersion(String observationId, int version) {
         return jdbcTemplate.query(
-                        "SELECT observation_id, version, location, reading, note, deleted "
-                                + "FROM observation_version WHERE observation_id = ? AND version = ?",
+                        "SELECT " + SELECT_COLUMNS + " FROM observation_version WHERE observation_id = ? AND version = ?",
                         SNAPSHOT_MAPPER, observationId, version)
                 .stream().findFirst();
     }
@@ -65,9 +70,12 @@ public class ObservationRepository {
      */
     public void insertCurrent(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO observation_current (observation_id, location, reading, note, version, deleted, updated_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-                snapshot.observationId(), snapshot.location(), snapshot.reading(), snapshot.note(),
+                "INSERT INTO observation_current (observation_id, observation_type, location, reading, note, "
+                        + "section_no, lateral_mm, elevation_mm, version, deleted, updated_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                snapshot.observationId(), snapshot.observationType().name(),
+                snapshot.location(), snapshot.reading(), snapshot.note(),
+                snapshot.sectionNo(), snapshot.lateralMm(), snapshot.elevationMm(),
                 snapshot.version(), snapshot.deleted());
     }
 
@@ -76,9 +84,11 @@ public class ObservationRepository {
      */
     public void updateCurrent(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "UPDATE observation_current SET location = ?, reading = ?, note = ?, version = ?, deleted = ?, "
+                "UPDATE observation_current SET location = ?, reading = ?, note = ?, "
+                        + "section_no = ?, lateral_mm = ?, elevation_mm = ?, version = ?, deleted = ?, "
                         + "updated_at = CURRENT_TIMESTAMP WHERE observation_id = ?",
                 snapshot.location(), snapshot.reading(), snapshot.note(),
+                snapshot.sectionNo(), snapshot.lateralMm(), snapshot.elevationMm(),
                 snapshot.version(), snapshot.deleted(), snapshot.observationId());
     }
 
@@ -97,9 +107,11 @@ public class ObservationRepository {
      */
     public void insertVersion(ObservationSnapshot snapshot) {
         jdbcTemplate.update(
-                "INSERT INTO observation_version (observation_id, version, location, reading, note, deleted, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-                snapshot.observationId(), snapshot.version(), snapshot.location(),
-                snapshot.reading(), snapshot.note(), snapshot.deleted());
+                "INSERT INTO observation_version (observation_id, version, observation_type, location, reading, note, "
+                        + "section_no, lateral_mm, elevation_mm, deleted, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                snapshot.observationId(), snapshot.version(), snapshot.observationType().name(),
+                snapshot.location(), snapshot.reading(), snapshot.note(),
+                snapshot.sectionNo(), snapshot.lateralMm(), snapshot.elevationMm(), snapshot.deleted());
     }
 }
