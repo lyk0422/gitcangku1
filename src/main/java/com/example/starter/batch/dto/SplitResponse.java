@@ -1,13 +1,14 @@
 package com.example.starter.batch.dto;
 
 import com.example.starter.batch.BatchStatus;
+import com.example.starter.batch.BatchType;
 
 import java.time.Instant;
 import java.util.List;
 
 /**
  * 拆分响应。父批状态落定 SPLIT；子批初始 QUARANTINED，继承父批产品编码、
- * 生产 UTC 时间与必做检验项，不继承检验或批准记录。splitAt 为 UTC instant。
+ * 生产 UTC 时间、批次类型与必做检验项，不继承检验、曲线或批准记录。splitAt 为 UTC instant。
  */
 public record SplitResponse(
         String parentBatchKey,
@@ -26,7 +27,9 @@ public record SplitResponse(
             Instant producedAt,
             BatchStatus status,
             List<String> requiredTests,
-            Instant createdAt
+            Instant createdAt,
+            BatchType batchType,
+            long version
     ) {
     }
 }

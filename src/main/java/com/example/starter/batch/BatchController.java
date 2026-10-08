@@ -7,6 +7,7 @@ import com.example.starter.batch.dto.CreateBatchRequest;
 import com.example.starter.batch.dto.LineageEntryResponse;
 import com.example.starter.batch.dto.RecallRequest;
 import com.example.starter.batch.dto.SplitRequest;
+import com.example.starter.batch.dto.SubmitPressureCurveRequest;
 import com.example.starter.batch.dto.SubmitTestRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpHeaders;
@@ -50,6 +51,20 @@ public class BatchController {
     public ResponseEntity<String> submitTest(@PathVariable String batchKey,
                                              @Valid @RequestBody SubmitTestRequest request) {
         return stored(service.submitTest(batchKey, request));
+    }
+
+    /**
+     * 提交密封批次压力曲线检验；X-Request-Id 为全局请求标识（同参重放首次响应、异参 409），
+     * X-Actor-Id 为非空操作者。非法曲线 400 且不留检验；合法 FAIL 曲线保留并使批次 REJECTED。
+     */
+    @PostMapping("/{batchKey}/pressure-curve")
+    public ResponseEntity<String> submitPressureCurve(@PathVariable String batchKey,
+                                                      @RequestHeader(name = "X-Request-Id", required = false)
+                                                      String requestId,
+                                                      @RequestHeader(name = "X-Actor-Id", required = false)
+                                                      String actorId,
+                                                      @Valid @RequestBody SubmitPressureCurveRequest request) {
+        return stored(service.submitPressureCurve(batchKey, requestId, actorId, request));
     }
 
     /**

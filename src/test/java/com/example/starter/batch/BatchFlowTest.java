@@ -45,6 +45,10 @@ class BatchFlowTest {
     @BeforeEach
     void cleanTables() {
         jdbc.update("DELETE FROM command_log");
+        jdbc.update("DELETE FROM request_log");
+        jdbc.update("DELETE FROM pressure_curve_segment");
+        jdbc.update("DELETE FROM pressure_curve_node");
+        jdbc.update("DELETE FROM pressure_curve");
         jdbc.update("DELETE FROM approval");
         jdbc.update("DELETE FROM recall");
         jdbc.update("DELETE FROM test_result");
