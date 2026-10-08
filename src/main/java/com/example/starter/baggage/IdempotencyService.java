@@ -38,18 +38,29 @@ public class IdempotencyService {
     }
 
     /**
+     * 在幂等保护下执行写操作（旧入口：无显式操作者，以操作类型作为资源占位）。
+     */
+    public <T> T execute(String requestId, String operation, int successStatus,
+                         Object payload, Class<T> resultType, Supplier<T> action) {
+        return execute(requestId, operation, operation, "legacy", successStatus,
+                payload, resultType, action);
+    }
+
+    /**
      * 在幂等保护下执行写操作。
      *
      * @param requestId     全局唯一请求标识
      * @param operation     操作类型
+     * @param resource      结构化身份中的资源标识（如 groupKey）
+     * @param operator      非空操作者标识
      * @param successStatus 成功响应的 HTTP 状态码（随记录保存，供审计）
-     * @param payload       请求参数（不含 requestId，调用方需已规范化），用于计算摘要
+     * @param payload       请求参数（不含 requestId/operator，调用方需已规范化），用于计算摘要
      * @param resultType    成功结果类型，用于重放时反序列化
      * @param action        业务动作，成功结果与去重记录在同一事务提交
      * @return 已存储的成功结果（重放）或本次执行结果
      */
-    public <T> T execute(String requestId, String operation, int successStatus,
-                         Object payload, Class<T> resultType, Supplier<T> action) {
+    public <T> T execute(String requestId, String operation, String resource, String operator,
+                         int successStatus, Object payload, Class<T> resultType, Supplier<T> action) {
         String hash = sha256(writeJson(payload));
         Object lock = locks.computeIfAbsent(requestId, key -> new Object());
         synchronized (lock) {
@@ -62,13 +73,15 @@ public class IdempotencyService {
                     return transactionTemplate.execute(status -> {
                         T result = action.get();
                         jdbcTemplate.update(
-                                "INSERT INTO request_log (request_id, operation, request_hash, response_status, response_body)"
-                                        + " VALUES (?, ?, ?, ?, ?)",
-                                requestId, operation, hash, successStatus, writeJson(result));
+                                "INSERT INTO request_log (request_id, operation, resource, operator,"
+                                        + " request_hash, response_status, response_body)"
+                                        + " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                requestId, operation, resource, operator,
+                                hash, successStatus, writeJson(result));
                         return result;
                     });
                 } catch (DuplicateKeyException duplicate) {
-                    // 唯一主键兜底：其他节点已写入同键记录，按已存储结果处理
+                    // 唯一主键兜底：其他节点已写入同键记录，按已存储结果处理，不向调用方泄漏唯一键异常
                     StoredRequest stored = find(requestId);
                     if (stored == null) {
                         throw duplicate;

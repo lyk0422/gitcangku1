@@ -14,8 +14,13 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
 import com.example.starter.baggage.BaggageDtos.ArriveResponse;
 import com.example.starter.baggage.BaggageDtos.BagResponse;
+import com.example.starter.baggage.BaggageDtos.ClaimGroupRequest;
+import com.example.starter.baggage.BaggageDtos.ClaimGroupResponse;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveRequest;
 import com.example.starter.baggage.BaggageDtos.DifferenceArriveResponse;
+import com.example.starter.baggage.BaggageDtos.FormGroupRequest;
+import com.example.starter.baggage.BaggageDtos.FormGroupResponse;
+import com.example.starter.baggage.BaggageDtos.GroupResponse;
 import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
@@ -107,5 +112,24 @@ public class BaggageController {
     @GetMapping("/bags/short-unloaded")
     public ShortListResponse listShortUnloaded() {
         return baggageService.listShortUnloaded();
+    }
+
+    /** 建组：任何装载前把 2~5 件同行程、同当前站行李固定成一组，成员之后不改。 */
+    @PostMapping("/groups")
+    public ResponseEntity<FormGroupResponse> formGroup(@Valid @RequestBody FormGroupRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(baggageService.formGroup(request));
+    }
+
+    /** 组查询：逐成员状态与未齐原因，只读不触发认领。 */
+    @GetMapping("/groups/{groupKey}")
+    public GroupResponse getGroup(@PathVariable String groupKey) {
+        return baggageService.getGroup(groupKey);
+    }
+
+    /** 整组显式认领：全部成员都 READY_FOR_CLAIM 才一次转 DELIVERED。 */
+    @PostMapping("/groups/{groupKey}/claim")
+    public ClaimGroupResponse claimGroup(@PathVariable String groupKey,
+                                         @Valid @RequestBody ClaimGroupRequest request) {
+        return baggageService.claimGroup(groupKey, request);
     }
 }
