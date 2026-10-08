@@ -3,12 +3,15 @@ package com.example.starter.baggage;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.Supplier;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -38,19 +41,28 @@ public class IdempotencyService {
     }
 
     /**
+     * 在幂等保护下执行写操作（不记录操作者，兼容旧写入）。
+     */
+    public <T> T execute(String requestId, String operation, int successStatus,
+                         Object payload, Class<T> resultType, Supplier<T> action) {
+        return execute(requestId, operation, null, successStatus, payload, resultType, action);
+    }
+
+    /**
      * 在幂等保护下执行写操作。
      *
      * @param requestId     全局唯一请求标识
      * @param operation     操作类型
+     * @param operator      操作者标识（随记录保存供审计，可为 null）
      * @param successStatus 成功响应的 HTTP 状态码（随记录保存，供审计）
-     * @param payload       请求参数（不含 requestId，调用方需已规范化），用于计算摘要
+     * @param payload       请求参数（不含 requestId，调用方需已规范化），与操作类型一起做结构化摘要
      * @param resultType    成功结果类型，用于重放时反序列化
      * @param action        业务动作，成功结果与去重记录在同一事务提交
      * @return 已存储的成功结果（重放）或本次执行结果
      */
-    public <T> T execute(String requestId, String operation, int successStatus,
+    public <T> T execute(String requestId, String operation, String operator, int successStatus,
                          Object payload, Class<T> resultType, Supplier<T> action) {
-        String hash = sha256(writeJson(payload));
+        String hash = structuredHash(operation, payload);
         Object lock = locks.computeIfAbsent(requestId, key -> new Object());
         synchronized (lock) {
             try {
@@ -62,9 +74,9 @@ public class IdempotencyService {
                     return transactionTemplate.execute(status -> {
                         T result = action.get();
                         jdbcTemplate.update(
-                                "INSERT INTO request_log (request_id, operation, request_hash, response_status, response_body)"
-                                        + " VALUES (?, ?, ?, ?, ?)",
-                                requestId, operation, hash, successStatus, writeJson(result));
+                                "INSERT INTO request_log (request_id, operation, operator, request_hash,"
+                                        + " response_status, response_body) VALUES (?, ?, ?, ?, ?, ?)",
+                                requestId, operation, operator, hash, successStatus, writeJson(result));
                         return result;
                     });
                 } catch (DuplicateKeyException duplicate) {
@@ -105,6 +117,49 @@ public class IdempotencyService {
             return objectMapper.writeValueAsString(value);
         } catch (Exception ex) {
             throw new IllegalArgumentException("请求参数无法序列化", ex);
+        }
+    }
+
+    /**
+     * 结构化摘要：操作类型与全参数（含资源标识、期望版本）一起参与；
+     * 对象字段按名排序，数组保序，十进制按值（去尾零）比较，文本原样比较。
+     */
+    private String structuredHash(String operation, Object payload) {
+        StringBuilder canonical = new StringBuilder();
+        canonical.append("operation=").append(operation).append('\n');
+        appendCanonical(objectMapper.valueToTree(payload), canonical);
+        return sha256(canonical.toString());
+    }
+
+    private void appendCanonical(JsonNode node, StringBuilder out) {
+        if (node == null || node.isNull()) {
+            out.append("null");
+        } else if (node.isObject()) {
+            List<String> names = new ArrayList<>();
+            node.fieldNames().forEachRemaining(names::add);
+            Collections.sort(names);
+            out.append('{');
+            for (String name : names) {
+                out.append(writeJson(name)).append(':');
+                appendCanonical(node.get(name), out);
+                out.append(',');
+            }
+            out.append('}');
+        } else if (node.isArray()) {
+            out.append('[');
+            node.forEach(child -> {
+                appendCanonical(child, out);
+                out.append(',');
+            });
+            out.append(']');
+        } else if (node.isNumber()) {
+            out.append(node.decimalValue().stripTrailingZeros().toPlainString());
+        } else if (node.isTextual()) {
+            out.append(writeJson(node.textValue()));
+        } else if (node.isBoolean()) {
+            out.append(node.booleanValue());
+        } else {
+            out.append(writeJson(node));
         }
     }
 

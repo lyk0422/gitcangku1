@@ -21,6 +21,7 @@ import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.ProofResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -95,6 +96,12 @@ public class BaggageController {
     @GetMapping("/legs/{legId}/manifest")
     public ManifestResponse getManifest(@PathVariable String legId) {
         return baggageService.getManifest(legId);
+    }
+
+    /** 成员证明查询：返回新类型航段封舱清单中指定袋号的叶下标及逐层兄弟摘要。 */
+    @GetMapping("/legs/{legId}/proof/{bagTag}")
+    public ProofResponse getManifestProof(@PathVariable String legId, @PathVariable String bagTag) {
+        return baggageService.getManifestProof(legId, bagTag);
     }
 
     /** 航段差异快照查询：返回只读封舱清单与差异到达实际集合。 */

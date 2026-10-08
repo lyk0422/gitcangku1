@@ -25,6 +25,7 @@ import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
+import com.example.starter.baggage.BaggageDtos.ProofResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
 import com.example.starter.baggage.BaggageDtos.RegisterBagRequest;
@@ -49,6 +50,8 @@ public class BaggageService {
     private static final String LEG_OPEN = "OPEN";
     private static final String LEG_SEALED = "SEALED";
     private static final String LEG_ARRIVED = "ARRIVED";
+    private static final String LEG_TYPE_LEGACY = "LEGACY";
+    private static final String LEG_TYPE_MERKLE = "MERKLE";
     private static final String ARRIVAL_EXACT = "EXACT";
     private static final String ARRIVAL_DIFF = "DIFF";
     private static final String BAG_IN_TRANSIT = "IN_TRANSIT";
@@ -65,7 +68,9 @@ public class BaggageService {
 
     private static final RowMapper<LegRow> LEG_MAPPER = (rs, rowNum) -> new LegRow(
             rs.getString("leg_id"), rs.getString("origin"), rs.getString("destination"),
-            rs.getString("status"), rs.getInt("version"), rs.getString("sealed_manifest"),
+            rs.getString("status"), rs.getString("leg_type"), rs.getInt("version"),
+            rs.getString("sealed_manifest"), rs.getString("manifest_root"),
+            (Integer) rs.getObject("manifest_leaf_count"),
             rs.getString("arrival_type"), rs.getString("arrival_actual"));
 
     private static final RowMapper<BagRow> BAG_MAPPER = (rs, rowNum) -> new BagRow(
@@ -124,10 +129,10 @@ public class BaggageService {
                 payload, LoadResponse.class, () -> doLoad(legId, request));
     }
 
-    /** 封舱：校验版本，保存只读装载清单并转 SEALED；空清单也可封舱。 */
+    /** 封舱：校验版本，保存只读装载清单并转 SEALED；新类型航段拒绝空清单并冻结清单根与叶数。 */
     public SealResponse seal(String legId, SealRequest request) {
-        SealPayload payload = new SealPayload(legId, request.expectedVersion());
-        return idempotencyService.execute(request.requestId(), "SEAL", 200,
+        SealPayload payload = new SealPayload(legId, request.expectedVersion(), request.operator());
+        return idempotencyService.execute(request.requestId(), "SEAL", request.operator(), 200,
                 payload, SealResponse.class, () -> doSeal(legId, request));
     }
 
@@ -145,18 +150,21 @@ public class BaggageService {
      */
     public DifferenceArriveResponse arriveDifference(String legId, DifferenceArriveRequest request) {
         DifferenceArrivePayload payload = new DifferenceArrivePayload(
-                legId, request.expectedVersion(), sortedCopy(request.bagTags()));
-        return idempotencyService.execute(request.requestId(), "ARRIVE_DIFFERENCE", 200,
+                legId, request.expectedVersion(), sortedCopy(request.bagTags()), request.operator());
+        return idempotencyService.execute(request.requestId(), "ARRIVE_DIFFERENCE", request.operator(), 200,
                 payload, DifferenceArriveResponse.class, () -> doArriveDifference(legId, request));
     }
 
     /**
      * 补到：仅 SHORT_UNLOADED 且缺失航段匹配的行李可补到，实际站必须等于该航段到达站（否则 422）。
+     * 缺失航段为新类型时必须携带非空操作者及清单根、叶下标、成员证明，
+     * 严格核对叶数对应路径长度、左右方向及袋号，任一不符 422 且不移动行李；
+     * 证明只代表封舱时成员，不豁免状态与站点核对。补到与后续装载原子核验，凭有效证明不得多次推进。
      * 成功后移动行李、推进待乘索引并标记 RECOVERED（完成行程者 DELIVERED）；
      * 相同补到同参由 requestId 重放原结果，已补到不得再次推进。
      */
     public RecoverResponse recover(RecoverRequest request) {
-        return idempotencyService.execute(request.requestId(), "RECOVER", 200,
+        return idempotencyService.execute(request.requestId(), "RECOVER", request.operator(), 200,
                 request, RecoverResponse.class, () -> doRecover(request));
     }
 
@@ -169,14 +177,39 @@ public class BaggageService {
         return toBagResponse(bag);
     }
 
-    /** 封舱清单查询：未封舱时返回空清单。 */
+    /** 封舱清单查询：未封舱时返回空清单；新类型航段封舱后返回冻结的清单根与叶数。 */
     public ManifestResponse getManifest(String legId) {
         LegRow leg = findLeg(legId);
         if (leg == null) {
             throw ApiException.notFound("航段不存在: " + legId);
         }
         List<String> manifest = leg.sealedManifest() == null ? List.of() : readJsonList(leg.sealedManifest());
-        return new ManifestResponse(leg.legId(), leg.status(), leg.version(), manifest);
+        return new ManifestResponse(leg.legId(), leg.status(), leg.version(), manifest,
+                leg.legType(), leg.manifestRoot(), leg.manifestLeafCount());
+    }
+
+    /**
+     * 成员证明查询：按封舱时冻结的袋号次序与清单根返回叶下标及逐层兄弟摘要；
+     * 只服务已冻结清单，不重新生成新清单，根不随补到或短卸变动。
+     */
+    public ProofResponse getManifestProof(String legId, String bagTag) {
+        LegRow leg = findLeg(legId);
+        if (leg == null) {
+            throw ApiException.notFound("航段不存在: " + legId);
+        }
+        if (!LEG_TYPE_MERKLE.equals(leg.legType())) {
+            throw ApiException.unprocessable("普通旧航段不提供成员证明: " + legId);
+        }
+        if (leg.manifestRoot() == null) {
+            throw ApiException.unprocessable("航段未封舱，无冻结清单: " + legId);
+        }
+        List<String> manifest = readJsonList(leg.sealedManifest());
+        int leafIndex = manifest.indexOf(bagTag);
+        if (leafIndex < 0) {
+            throw ApiException.notFound("行李不在封舱清单: " + bagTag);
+        }
+        return new ProofResponse(leg.legId(), bagTag, leafIndex, manifest.size(),
+                leg.manifestRoot(), MerkleTree.proof(manifest, leafIndex));
     }
 
     /** 航段差异快照查询：返回只读封舱清单、到达类型及差异到达实际集合。 */
@@ -209,10 +242,16 @@ public class BaggageService {
         if (findLeg(request.legId()) != null) {
             throw ApiException.conflict("航段已存在: " + request.legId());
         }
+        String legType = request.legType() == null ? LEG_TYPE_LEGACY : request.legType();
+        if (!LEG_TYPE_LEGACY.equals(legType) && !LEG_TYPE_MERKLE.equals(legType)) {
+            throw ApiException.unprocessable("未知航段类型: " + legType);
+        }
         jdbcTemplate.update(
-                "INSERT INTO leg (leg_id, origin, destination, status, version) VALUES (?, ?, ?, ?, 1)",
-                request.legId(), request.origin(), request.destination(), LEG_OPEN);
-        return new LegResponse(request.legId(), request.origin(), request.destination(), LEG_OPEN, 1);
+                "INSERT INTO leg (leg_id, origin, destination, status, leg_type, version)"
+                        + " VALUES (?, ?, ?, ?, ?, 1)",
+                request.legId(), request.origin(), request.destination(), LEG_OPEN, legType);
+        return new LegResponse(request.legId(), request.origin(), request.destination(),
+                LEG_OPEN, 1, legType);
     }
 
     private BagResponse doRegisterBag(RegisterBagRequest request) {
@@ -290,9 +329,24 @@ public class BaggageService {
         List<String> manifest = jdbcTemplate.queryForList(
                 "SELECT bag_tag FROM load_record WHERE leg_id = ? ORDER BY bag_tag", String.class, legId);
         int newVersion = leg.version() + 1;
+        if (LEG_TYPE_MERKLE.equals(leg.legType())) {
+            requireOperator(request.operator(), "新类型航段封舱");
+            if (manifest.isEmpty()) {
+                throw ApiException.unprocessable("新类型航段空清单拒绝封舱");
+            }
+            // 新类型：按袋号 UTF-8 字节无符号顺序冻结清单，并冻结根摘要与叶数
+            manifest = manifest.stream().sorted(MerkleTree.BAG_TAG_ORDER).toList();
+            String manifestRoot = MerkleTree.hex(MerkleTree.root(manifest));
+            jdbcTemplate.update(
+                    "UPDATE leg SET status = ?, version = ?, sealed_manifest = ?,"
+                            + " manifest_root = ?, manifest_leaf_count = ? WHERE leg_id = ?",
+                    LEG_SEALED, newVersion, writeJson(manifest), manifestRoot, manifest.size(), legId);
+            return new SealResponse(legId, LEG_SEALED, newVersion, manifest,
+                    manifestRoot, manifest.size());
+        }
         jdbcTemplate.update("UPDATE leg SET status = ?, version = ?, sealed_manifest = ? WHERE leg_id = ?",
                 LEG_SEALED, newVersion, writeJson(manifest), legId);
-        return new SealResponse(legId, LEG_SEALED, newVersion, manifest);
+        return new SealResponse(legId, LEG_SEALED, newVersion, manifest, null, null);
     }
 
     private ArriveResponse doArrive(String legId, ArriveRequest request) {
@@ -323,6 +377,9 @@ public class BaggageService {
         checkVersion(leg, request.expectedVersion());
         if (!LEG_SEALED.equals(leg.status())) {
             throw ApiException.unprocessable("航段状态为 " + leg.status() + "，禁止差异到达");
+        }
+        if (LEG_TYPE_MERKLE.equals(leg.legType())) {
+            requireOperator(request.operator(), "新类型航段差异到达");
         }
         List<String> manifest = readJsonList(leg.sealedManifest());
         List<String> actual = request.bagTags();
@@ -384,6 +441,10 @@ public class BaggageService {
                     "实际到站 " + request.actualStation() + " 与缺失航段应到站 "
                             + missingLeg.destination() + " 不一致");
         }
+        if (LEG_TYPE_MERKLE.equals(missingLeg.legType())) {
+            requireOperator(request.operator(), "新类型航段补到");
+            verifyManifestProof(request, missingLeg);
+        }
         int nextIndex = bag.nextLegIndex() + 1;
         int total = itineraryCount(bag.bagTag());
         String newStatus = nextIndex >= total ? BAG_DELIVERED : BAG_RECOVERED;
@@ -443,6 +504,37 @@ public class BaggageService {
         }
     }
 
+    /** 新类型航段写入必须携带非空操作者。 */
+    private static void requireOperator(String operator, String action) {
+        if (operator == null || operator.isBlank()) {
+            throw ApiException.unprocessable(action + "必须携带非空操作者");
+        }
+    }
+
+    /**
+     * 新类型航段补到的成员证明核验：清单根、叶下标、证明齐全，
+     * 路径长度与冻结叶数对应、逐层左右方向与袋号严格核对，任一不符 422 且不移动行李。
+     */
+    private void verifyManifestProof(RecoverRequest request, LegRow missingLeg) {
+        if (request.manifestRoot() == null || request.leafIndex() == null || request.proof() == null) {
+            throw ApiException.unprocessable("新类型航段补到必须携带清单根、叶下标和成员证明");
+        }
+        if (!missingLeg.manifestRoot().equalsIgnoreCase(request.manifestRoot())) {
+            throw ApiException.unprocessable("清单根与封舱冻结根不一致");
+        }
+        boolean valid;
+        try {
+            valid = MerkleTree.verify(request.bagTag(), request.leafIndex(),
+                    missingLeg.manifestLeafCount(), request.proof(),
+                    MerkleTree.unhex(missingLeg.manifestRoot()));
+        } catch (IllegalArgumentException ex) {
+            valid = false;
+        }
+        if (!valid) {
+            throw ApiException.unprocessable("成员证明核验失败: 路径长度、方向或袋号不符");
+        }
+    }
+
     private LegRow findLeg(String legId) {
         List<LegRow> rows = jdbcTemplate.query(legSelect(false), LEG_MAPPER, legId);
         return rows.isEmpty() ? null : rows.get(0);
@@ -457,8 +549,9 @@ public class BaggageService {
     }
 
     private static String legSelect(boolean forUpdate) {
-        return "SELECT leg_id, origin, destination, status, version, sealed_manifest,"
-                + " arrival_type, arrival_actual FROM leg WHERE leg_id = ?"
+        return "SELECT leg_id, origin, destination, status, leg_type, version, sealed_manifest,"
+                + " manifest_root, manifest_leaf_count, arrival_type, arrival_actual"
+                + " FROM leg WHERE leg_id = ?"
                 + (forUpdate ? " FOR UPDATE" : "");
     }
 
@@ -551,7 +644,8 @@ public class BaggageService {
     }
 
     private record LegRow(String legId, String origin, String destination,
-                          String status, int version, String sealedManifest,
+                          String status, String legType, int version, String sealedManifest,
+                          String manifestRoot, Integer manifestLeafCount,
                           String arrivalType, String arrivalActual) {
     }
 
@@ -565,7 +659,7 @@ public class BaggageService {
     }
 
     /** 封舱幂等摘要参数。 */
-    private record SealPayload(String legId, int expectedVersion) {
+    private record SealPayload(String legId, int expectedVersion, String operator) {
     }
 
     /** 到达确认幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
@@ -573,6 +667,7 @@ public class BaggageService {
     }
 
     /** 差异到达幂等摘要参数：bagTags 已排序，顺序差异不视为异参。 */
-    private record DifferenceArrivePayload(String legId, int expectedVersion, List<String> bagTags) {
+    private record DifferenceArrivePayload(String legId, int expectedVersion,
+                                           List<String> bagTags, String operator) {
     }
 }
