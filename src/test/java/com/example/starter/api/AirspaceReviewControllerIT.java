@@ -39,7 +39,10 @@ class AirspaceReviewControllerIT {
         jdbc.update("DELETE FROM request_dedup");
         jdbc.update("DELETE FROM route_point");
         jdbc.update("DELETE FROM route");
+        jdbc.update("DELETE FROM polygon_zone_ring");
+        jdbc.update("DELETE FROM polygon_zone");
         jdbc.update("DELETE FROM no_fly_zone");
+        jdbc.update("DELETE FROM zone_identity");
         jdbc.update("UPDATE airspace_meta SET global_version = 0 WHERE id = 1");
         jdbc.update("UPDATE coord_lock SET touched = 0 WHERE id = 1");
     }
@@ -201,6 +204,90 @@ class AirspaceReviewControllerIT {
                                  "requestId":"idem-fail"}"""))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.replayed").value(false));
+    }
+
+    @Test
+    @DisplayName("带孔洞多边形：孔洞内 CLEAR、触孔边/穿实体 BLOCKED，非法环 400")
+    void polygonZoneOverHttp() throws Exception {
+        // 创建题干合成多边形：外 [0,10]、孔洞 [3,7]
+        mockMvc.perform(post("/api/airspace/zones/polygon")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"zoneId":"p1","requestId":"req-poly-1",
+                                 "outer":[{"x":0,"y":0},{"x":10,"y":0},{"x":10,"y":10},{"x":0,"y":10}],
+                                 "holes":[{"vertices":[
+                                   {"x":3,"y":3},{"x":7,"y":3},{"x":7,"y":7},{"x":3,"y":7}]}]}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.replayed").value(false))
+                .andExpect(jsonPath("$.data.kind").value("POLYGON"))
+                .andExpect(jsonPath("$.data.airspaceVersion").value(1))
+                .andExpect(jsonPath("$.data.holes[0][2].x").value(7));
+
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"pr1","requestId":"req-pr1",
+                                 "points":[{"x":4,"y":4},{"x":6,"y":6}]}"""))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"pr1","routeVersion":1,"airspaceVersion":1,
+                                 "requestId":"req-pr1-rv"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.conclusion").value("CLEAR"));
+
+        mockMvc.perform(post("/api/airspace/routes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"pr2","requestId":"req-pr2",
+                                 "points":[{"x":2,"y":5},{"x":8,"y":5}]}"""))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"pr2","routeVersion":1,"airspaceVersion":1,
+                                 "requestId":"req-pr2-rv"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.conclusion").value("BLOCKED"))
+                .andExpect(jsonPath("$.data.hitZoneIds[0]").value("p1"));
+
+        // 孔洞顶点落在外环边上 → 400 INVALID_POLYGON
+        mockMvc.perform(post("/api/airspace/zones/polygon")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"zoneId":"pbad","requestId":"req-poly-bad",
+                                 "outer":[{"x":0,"y":0},{"x":10,"y":0},{"x":10,"y":10},{"x":0,"y":10}],
+                                 "holes":[{"vertices":[
+                                   {"x":0,"y":1},{"x":5,"y":1},{"x":5,"y":5},{"x":0,"y":5}]}]}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_POLYGON"));
+
+        // 顶点数越界（外环 11 个）→ 400 校验失败
+        String eleven = "{\"x\":0,\"y\":0},{\"x\":1,\"y\":0},{\"x\":2,\"y\":0},"
+                + "{\"x\":3,\"y\":0},{\"x\":4,\"y\":0},{\"x\":5,\"y\":0},{\"x\":6,\"y\":0},"
+                + "{\"x\":7,\"y\":0},{\"x\":8,\"y\":0},{\"x\":9,\"y\":0},{\"x\":10,\"y\":1}";
+        mockMvc.perform(post("/api/airspace/zones/polygon")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"zoneId\":\"pbad2\",\"requestId\":\"req-poly-bad2\","
+                                + "\"outer\":[" + eleven + "],\"holes\":[]}"))
+                .andExpect(status().isBadRequest());
+
+        // 撤销多边形 → 空域版本 2，再审核穿实体航线变为 CLEAR（需先按新版本审核）
+        mockMvc.perform(post("/api/airspace/zones/revoke")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"zoneId":"p1","requestId":"req-poly-revoke"}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.status").value("REVOKED"))
+                .andExpect(jsonPath("$.data.airspaceVersion").value(2));
+        mockMvc.perform(post("/api/airspace/reviews")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"routeId":"pr2","routeVersion":1,"airspaceVersion":2,
+                                 "requestId":"req-pr2-rv2"}"""))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.conclusion").value("CLEAR"));
     }
 
     @Test

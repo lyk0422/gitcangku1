@@ -1,6 +1,7 @@
 package com.example.starter.api;
 
 import com.example.starter.api.dto.MutationResponse;
+import com.example.starter.api.dto.PolygonZoneCreateRequest;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
 import com.example.starter.api.dto.RouteCreateRequest;
@@ -35,6 +36,13 @@ public class AirspaceReviewController {
     @PostMapping("/zones")
     public ResponseEntity<MutationResponse> createZone(@Valid @RequestBody ZoneCreateRequest request) {
         return ResponseEntity.status(HttpStatus.CREATED).body(service.createZone(request));
+    }
+
+    /** 创建带孔洞多边形禁飞区（外环 3~10 顶点，至多 2 个各 3~8 顶点孔洞）。 */
+    @PostMapping("/zones/polygon")
+    public ResponseEntity<MutationResponse> createPolygonZone(
+            @Valid @RequestBody PolygonZoneCreateRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(service.createPolygonZone(request));
     }
 
     /** 撤销禁飞区。 */

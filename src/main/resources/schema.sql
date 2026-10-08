@@ -27,6 +27,32 @@ CREATE TABLE IF NOT EXISTS no_fly_zone (
     revoked_version  BIGINT NULL COMMENT '撤销生效时的全局空域版本；NULL 表示仍有效'
 ) COMMENT = '禁飞区（非退化轴对齐闭矩形，只能创建或撤销）';
 
+-- 所有禁飞区共享的标识注册表：矩形与带孔洞多边形共用同一 zoneId 命名空间。
+-- 两类创建事务都先在本表插入（同事务原子提交），跨类型同号并发时由唯一键裁决。
+CREATE TABLE IF NOT EXISTS zone_identity (
+    zone_id  VARCHAR(64) PRIMARY KEY COMMENT '禁飞区唯一标识（矩形与多边形共用）',
+    kind     VARCHAR(16) NOT NULL COMMENT '区域形状：RECTANGLE 矩形；POLYGON 带孔洞多边形'
+) COMMENT = '禁飞区标识注册表（保证跨类型 zoneId 唯一）';
+
+-- 带孔洞多边形禁飞区：zoneId 唯一；一个外环（3~10 顶点）与至多 2 个孔洞（各 3~8 顶点）
+-- 顶点首尾不重复，创建时冻结，撤销不改变；只能创建或撤销
+CREATE TABLE IF NOT EXISTS polygon_zone (
+    zone_id          VARCHAR(64) PRIMARY KEY COMMENT '多边形禁飞区唯一标识',
+    status           VARCHAR(16) NOT NULL COMMENT '状态：ACTIVE 有效参与审核；REVOKED 已撤销不参与审核',
+    created_version  BIGINT NOT NULL COMMENT '创建生效时的全局空域版本',
+    revoked_version  BIGINT NULL COMMENT '撤销生效时的全局空域版本；NULL 表示仍有效'
+) COMMENT = '带孔洞多边形禁飞区（环顶点在 polygon_zone_ring 冻结，只能创建或撤销）';
+
+-- 多边形环顶点（创建时冻结的不可变快照）：ring_no=0 为外环，1~2 为孔洞；seq 为环内序号
+CREATE TABLE IF NOT EXISTS polygon_zone_ring (
+    zone_id  VARCHAR(64) NOT NULL COMMENT '所属多边形禁飞区标识',
+    ring_no  INT NOT NULL COMMENT '环序号：0 外环；1/2 孔洞（按请求顺序冻结）',
+    seq      INT NOT NULL COMMENT '环内顶点序号，从 0 开始按顺序连接，末点隐式连回首点',
+    x        INT NOT NULL COMMENT '顶点 X 坐标，单位米，范围 [-100000,100000]',
+    y        INT NOT NULL COMMENT '顶点 Y 坐标，单位米，范围 [-100000,100000]',
+    PRIMARY KEY (zone_id, ring_no, seq)
+) COMMENT = '多边形禁飞区冻结环顶点（外环与孔洞，首尾不重复）';
+
 -- 航线当前状态：routeId 唯一，版本从 1 开始，替换成功加一
 -- touch 仅用于审核事务对该行产生真实更新以加行级写锁，与替换操作互斥
 CREATE TABLE IF NOT EXISTS route (
@@ -62,7 +88,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_review_request ON review (request_id);
 -- 写操作幂等去重：同键同参重放原结果，异参冲突；失败不占键
 CREATE TABLE IF NOT EXISTS request_dedup (
     request_id     VARCHAR(64) PRIMARY KEY COMMENT '写操作全局唯一请求标识',
-    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
+    request_kind   VARCHAR(32) NOT NULL COMMENT '请求类型：ZONE_CREATE/ZONE_REVOKE/POLYGON_ZONE_CREATE/ROUTE_CREATE/ROUTE_REPLACE/REVIEW',
     request_hash   VARCHAR(64) NOT NULL COMMENT '规范化参数的 SHA-256 十六进制摘要，用于同键异参冲突判定',
     response_json  CLOB NOT NULL COMMENT '首次成功响应 JSON，重放时原样返回',
     created_at     BIGINT NOT NULL COMMENT '首次成功时间，epoch 毫秒（UTC）'
