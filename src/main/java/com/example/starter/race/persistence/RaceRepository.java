@@ -30,6 +30,9 @@ public class RaceRepository {
             new CheckpointTimingRowMapper();
     private static final SnapshotCheckpointRowMapper SNAPSHOT_CHECKPOINT_ROW_MAPPER =
             new SnapshotCheckpointRowMapper();
+    private static final NeutralLegRowMapper NEUTRAL_LEG_ROW_MAPPER = new NeutralLegRowMapper();
+    private static final SnapshotNeutralLegRowMapper SNAPSHOT_NEUTRAL_LEG_ROW_MAPPER =
+            new SnapshotNeutralLegRowMapper();
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -113,6 +116,30 @@ public class RaceRepository {
                 .findFirst();
     }
 
+    /** 查询赛事的中立区间定义，按 leg_index 升序排列；未启用中立模式时为空列表。 */
+    public List<NeutralLegRow> findNeutralLegs(String raceId) {
+        return jdbcTemplate.query(
+                "SELECT race_id, leg_index, start_position, end_position, created_at "
+                        + "FROM neutral_leg WHERE race_id = ? ORDER BY leg_index",
+                NEUTRAL_LEG_ROW_MAPPER, raceId);
+    }
+
+    /** 一次性写入中立区间定义（计时前固定，启用后不再变更）。 */
+    public void insertNeutralLegs(List<NeutralLegRow> rows) {
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO neutral_leg (race_id, leg_index, start_position, end_position, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                rows,
+                rows.size(),
+                (ps, row) -> {
+                    ps.setString(1, row.raceId());
+                    ps.setInt(2, row.legIndex());
+                    ps.setInt(3, row.startPosition());
+                    ps.setInt(4, row.endPosition());
+                    ps.setLong(5, row.createdAt());
+                });
+    }
+
     /** 统计赛事下的分段记录总数（用于“尚无任何分段记录时才可配置检查点”）。 */
     public int countTimings(String raceId) {
         Integer count = jdbcTemplate.queryForObject(
@@ -157,6 +184,17 @@ public class RaceRepository {
                 row.position(), row.elapsedMillis(), row.createdAt());
     }
 
+    /**
+     * 更正选手某检查点的分段累计耗时（仅更新耗时，不改写 timingId 与提交时间）；
+     * 返回受影响行数（0 表示该分段记录不存在）。
+     */
+    public int updateTimingElapsed(String raceId, String bib, String checkpointCode, long elapsedMillis) {
+        return jdbcTemplate.update(
+                "UPDATE checkpoint_timing SET elapsed_millis = ? "
+                        + "WHERE race_id = ? AND bib = ? AND checkpoint_code = ?",
+                elapsedMillis, raceId, bib, checkpointCode);
+    }
+
     /** 一次性写入赛事检查点配置（配置后不可修改）。 */
     public void insertCheckpoints(List<CheckpointRow> rows) {
         jdbcTemplate.batchUpdate(
@@ -172,7 +210,7 @@ public class RaceRepository {
                 });
     }
 
-    /** 查询封榜快照（含全部条目与分段明细）；未封榜返回 empty。 */
+    /** 查询封榜快照（含全部条目、分段明细与中立扣时明细）；未封榜返回 empty。 */
     public Optional<SnapshotRow> findSnapshot(String raceId) {
         List<SnapshotRow> headers = jdbcTemplate.query(
                 "SELECT race_id, version, sealed_at FROM result_snapshot WHERE race_id = ?",
@@ -188,7 +226,8 @@ public class RaceRepository {
         SnapshotRow header = headers.getFirst();
         List<SnapshotEntryRow> entryRows = jdbcTemplate.query(
                 "SELECT race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count "
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "neutral_deduction_ms, net_time_ms "
                         + "FROM result_snapshot_entry WHERE race_id = ? ORDER BY display_order",
                 SNAPSHOT_ENTRY_ROW_MAPPER, raceId);
         List<SnapshotCheckpointRow> checkpoints = jdbcTemplate.query(
@@ -196,6 +235,12 @@ public class RaceRepository {
                         + "FROM result_snapshot_checkpoint WHERE race_id = ? "
                         + "ORDER BY bib, position",
                 SNAPSHOT_CHECKPOINT_ROW_MAPPER, raceId);
+        List<SnapshotNeutralLegRow> neutralLegs = jdbcTemplate.query(
+                "SELECT race_id, bib, leg_index, start_position, end_position, "
+                        + "start_elapsed_millis, end_elapsed_millis, deduction_ms "
+                        + "FROM result_snapshot_neutral_leg WHERE race_id = ? "
+                        + "ORDER BY bib, leg_index",
+                SNAPSHOT_NEUTRAL_LEG_ROW_MAPPER, raceId);
         // 缺失检查点由明细表中 elapsed_millis 为 NULL 的行派生，保持展示顺序稳定。
         java.util.Map<String, List<String>> missingByBib = new java.util.LinkedHashMap<>();
         for (SnapshotCheckpointRow detail : checkpoints) {
@@ -210,10 +255,11 @@ public class RaceRepository {
                         entry.finishTimeMs(), entry.penaltyMs(), entry.totalTimeMs(),
                         entry.displayOrder(), entry.checkpointCount(),
                         entry.coveredCheckpointCount(),
-                        missingByBib.getOrDefault(entry.bib(), List.of())))
+                        missingByBib.getOrDefault(entry.bib(), List.of()),
+                        entry.neutralDeductionMs(), entry.netTimeMs()))
                 .toList();
         return Optional.of(new SnapshotRow(header.raceId(), header.version(), header.sealedAt(),
-                entries, checkpoints));
+                entries, checkpoints, neutralLegs));
     }
 
     /** 新建赛事，初始版本1、状态OPEN。 */
@@ -284,7 +330,7 @@ public class RaceRepository {
                 newVersion, raceId, expectedVersion);
     }
 
-    /** 原子写入封榜快照头表、全部条目以及每名选手的分段明细。 */
+    /** 原子写入封榜快照头表、全部条目、每名选手的分段明细与中立扣时明细。 */
     public void insertSnapshot(SnapshotRow snapshot) {
         jdbcTemplate.update(
                 "INSERT INTO result_snapshot (race_id, version, sealed_at) VALUES (?, ?, ?)",
@@ -292,8 +338,9 @@ public class RaceRepository {
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_entry "
                         + "(race_id, bib, rank_no, status, finish_time_ms, penalty_ms, total_time_ms, "
-                        + "display_order, checkpoint_count, covered_checkpoint_count) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "display_order, checkpoint_count, covered_checkpoint_count, "
+                        + "neutral_deduction_ms, net_time_ms) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 snapshot.entries(),
                 snapshot.entries().size(),
                 (ps, entry) -> {
@@ -307,6 +354,8 @@ public class RaceRepository {
                     ps.setInt(8, entry.displayOrder());
                     ps.setInt(9, entry.checkpointCount());
                     ps.setInt(10, entry.coveredCheckpointCount());
+                    ps.setObject(11, entry.neutralDeductionMs());
+                    ps.setObject(12, entry.netTimeMs());
                 });
         jdbcTemplate.batchUpdate(
                 "INSERT INTO result_snapshot_checkpoint "
@@ -321,6 +370,23 @@ public class RaceRepository {
                     ps.setInt(4, detail.position());
                     ps.setObject(5, detail.elapsedMillis());
                     ps.setString(6, detail.timingId());
+                });
+        jdbcTemplate.batchUpdate(
+                "INSERT INTO result_snapshot_neutral_leg "
+                        + "(race_id, bib, leg_index, start_position, end_position, "
+                        + "start_elapsed_millis, end_elapsed_millis, deduction_ms) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                snapshot.neutralLegs(),
+                snapshot.neutralLegs().size(),
+                (ps, leg) -> {
+                    ps.setString(1, leg.raceId());
+                    ps.setString(2, leg.bib());
+                    ps.setInt(3, leg.legIndex());
+                    ps.setInt(4, leg.startPosition());
+                    ps.setInt(5, leg.endPosition());
+                    ps.setObject(6, leg.startElapsedMillis());
+                    ps.setObject(7, leg.endElapsedMillis());
+                    ps.setObject(8, leg.deductionMs());
                 });
     }
 
@@ -370,11 +436,13 @@ public class RaceRepository {
 
     /** 测试辅助：清空全部业务数据，按外键依赖顺序删除。 */
     public void deleteAllForTesting() {
+        jdbcTemplate.update("DELETE FROM result_snapshot_neutral_leg");
         jdbcTemplate.update("DELETE FROM result_snapshot_checkpoint");
         jdbcTemplate.update("DELETE FROM result_snapshot_entry");
         jdbcTemplate.update("DELETE FROM result_snapshot");
         jdbcTemplate.update("DELETE FROM idempotency_record");
         jdbcTemplate.update("DELETE FROM checkpoint_timing");
+        jdbcTemplate.update("DELETE FROM neutral_leg");
         jdbcTemplate.update("DELETE FROM checkpoint");
         jdbcTemplate.update("DELETE FROM penalty");
         jdbcTemplate.update("DELETE FROM runner");
@@ -435,7 +503,9 @@ public class RaceRepository {
                     rs.getInt("display_order"),
                     rs.getInt("checkpoint_count"),
                     rs.getInt("covered_checkpoint_count"),
-                    List.of());
+                    List.of(),
+                    (Long) rs.getObject("neutral_deduction_ms"),
+                    (Long) rs.getObject("net_time_ms"));
         }
     }
 
@@ -475,6 +545,34 @@ public class RaceRepository {
                     rs.getInt("position"),
                     (Long) rs.getObject("elapsed_millis"),
                     rs.getString("timing_id"));
+        }
+    }
+
+    private static final class NeutralLegRowMapper implements RowMapper<NeutralLegRow> {
+        @Override
+        public NeutralLegRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new NeutralLegRow(
+                    rs.getString("race_id"),
+                    rs.getInt("leg_index"),
+                    rs.getInt("start_position"),
+                    rs.getInt("end_position"),
+                    rs.getLong("created_at"));
+        }
+    }
+
+    private static final class SnapshotNeutralLegRowMapper
+            implements RowMapper<SnapshotNeutralLegRow> {
+        @Override
+        public SnapshotNeutralLegRow mapRow(ResultSet rs, int rowNum) throws SQLException {
+            return new SnapshotNeutralLegRow(
+                    rs.getString("race_id"),
+                    rs.getString("bib"),
+                    rs.getInt("leg_index"),
+                    rs.getInt("start_position"),
+                    rs.getInt("end_position"),
+                    (Long) rs.getObject("start_elapsed_millis"),
+                    (Long) rs.getObject("end_elapsed_millis"),
+                    (Long) rs.getObject("deduction_ms"));
         }
     }
 

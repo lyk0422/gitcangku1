@@ -2,6 +2,7 @@ package com.example.starter.race.domain;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -20,7 +21,11 @@ import java.util.Set;
  *   <li>赛事配置了检查点时：已有完赛耗时但未覆盖全部检查点的选手状态
  *       MISSING_CHECKPOINT，不排名；全部覆盖后恢复加时与并列排名规则；
  *       未配置检查点的赛事沿用原排名规则；</li>
- *   <li>正常选手按总耗时升序，同耗时同名次，下一名次跳过并列人数（1、1、3）；</li>
+ *   <li>启用中立赛段模式的赛事：净竞技用时=总耗时-全部中立区间
+ *       （终点累计时刻-起点累计时刻）之和，按净竞技用时排名；
+ *       中立端点计时缺失的选手不做估计扣除（其必因漏点不排名）；
+ *       未启用中立模式的普通赛事保留原排名（按总耗时）；</li>
+ *   <li>正常选手按排名用时升序，同耗时同名次，下一名次跳过并列人数（1、1、3）；</li>
  *   <li>并列者及未排名者内部均按参赛号字典序展示。</li>
  * </ul>
  */
@@ -36,6 +41,15 @@ public final class ResultCalculator {
         return compute(runnerView, penalties, List.of(), List.of());
     }
 
+    /** 未启用中立赛段模式的兼容入口：无中立区间。 */
+    public static List<ResultEntry> compute(
+            List<? extends RunnerView> runnerView,
+            List<? extends PenaltyView> penalties,
+            List<? extends CheckpointView> checkpoints,
+            List<? extends TimingView> timings) {
+        return compute(runnerView, penalties, checkpoints, timings, List.of());
+    }
+
     /**
      * 计算即时成绩。
      *
@@ -43,17 +57,20 @@ public final class ResultCalculator {
      * @param penalties   全部处罚（含已撤销）
      * @param checkpoints 赛事检查点配置（按 position 排序后使用）；为空表示赛事未配置检查点
      * @param timings     全部选手的分段通过记录
+     * @param neutralLegs 中立区间定义（计时前固定，启用后不再变更）；为空表示普通赛事
      * @return 按展示顺序排列的成绩条目
      */
     public static List<ResultEntry> compute(
             List<? extends RunnerView> runnerView,
             List<? extends PenaltyView> penalties,
             List<? extends CheckpointView> checkpoints,
-            List<? extends TimingView> timings) {
+            List<? extends TimingView> timings,
+            List<? extends NeutralLegView> neutralLegs) {
         List<CheckpointView> orderedCheckpoints = new ArrayList<>(checkpoints);
         orderedCheckpoints.sort(Comparator.comparingInt(CheckpointView::position)
                 .thenComparing(CheckpointView::checkpointCode));
         int checkpointCount = orderedCheckpoints.size();
+        boolean neutralMode = !neutralLegs.isEmpty();
 
         Map<String, Aggregate> aggregates = new LinkedHashMap<>();
         for (RunnerView runner : runnerView) {
@@ -72,6 +89,7 @@ public final class ResultCalculator {
                 continue;
             }
             aggregate.coveredCodes.add(timing.checkpointCode());
+            aggregate.elapsedByPosition.put(timing.position(), timing.elapsedMillis());
         }
 
         for (PenaltyView penalty : penalties) {
@@ -101,12 +119,20 @@ public final class ResultCalculator {
             } else {
                 aggregate.status = EntryStatus.RANKED;
                 aggregate.totalTimeMs = aggregate.finishTimeMs + aggregate.penaltyMs;
+                if (neutralMode) {
+                    // 全覆盖选手必然覆盖全部中立端点；扣时按当前有效计时计算，不做估计。
+                    Long deduction = NeutralLegs.totalDeduction(
+                            neutralLegs, aggregate.elapsedByPosition);
+                    aggregate.neutralDeductionMs = deduction;
+                    aggregate.netTimeMs = deduction == null
+                            ? null : aggregate.totalTimeMs - deduction;
+                }
                 ranked.add(aggregate);
             }
         }
 
         ranked.sort(Comparator
-                .comparingLong((Aggregate a) -> a.totalTimeMs)
+                .comparingLong((Aggregate a) -> a.rankingTimeMs())
                 .thenComparing(a -> a.bib));
         others.sort(Comparator.comparing(a -> a.bib));
 
@@ -114,7 +140,7 @@ public final class ResultCalculator {
         while (index < ranked.size()) {
             int groupEnd = index + 1;
             while (groupEnd < ranked.size()
-                    && ranked.get(groupEnd).totalTimeMs == ranked.get(index).totalTimeMs) {
+                    && ranked.get(groupEnd).rankingTimeMs() == ranked.get(index).rankingTimeMs()) {
                 groupEnd++;
             }
             int rank = index + 1;
@@ -158,16 +184,24 @@ public final class ResultCalculator {
         private final Long finishTimeMs;
         private final List<CheckpointView> checkpoints;
         private final Set<String> coveredCodes = new HashSet<>();
+        private final Map<Integer, Long> elapsedByPosition = new HashMap<>();
         private long penaltyMs;
         private boolean disqualified;
         private EntryStatus status;
         private int rank;
         private long totalTimeMs;
+        private Long neutralDeductionMs;
+        private Long netTimeMs;
 
         private Aggregate(String bib, Long finishTimeMs, List<CheckpointView> checkpoints) {
             this.bib = bib;
             this.finishTimeMs = finishTimeMs;
             this.checkpoints = checkpoints;
+        }
+
+        /** 排名依据用时：中立赛事为净竞技用时，普通赛事为总耗时。 */
+        private long rankingTimeMs() {
+            return netTimeMs == null ? totalTimeMs : netTimeMs;
         }
 
         private List<String> missingCheckpoints() {
@@ -190,7 +224,9 @@ public final class ResultCalculator {
                     status == EntryStatus.RANKED ? totalTimeMs : null,
                     checkpoints.size(),
                     coveredCodes.size(),
-                    missingCheckpoints());
+                    missingCheckpoints(),
+                    neutralDeductionMs,
+                    status == EntryStatus.RANKED ? netTimeMs : null);
         }
     }
 }

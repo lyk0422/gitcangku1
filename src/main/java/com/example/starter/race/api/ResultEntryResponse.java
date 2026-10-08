@@ -17,6 +17,8 @@ import java.util.List;
  * @param checkpointCount       赛事检查点总数；未配置检查点为 0
  * @param coveredCheckpointCount 该选手已覆盖检查点数量
  * @param missingCheckpoints    缺失检查点代码，按检查点顺序排列；无缺失为空列表
+ * @param neutralDeductionMs    中立区间扣时合计毫秒数；未启用中立模式或端点缺失为 null
+ * @param netTimeMs             净竞技用时毫秒数，中立赛事的排名依据；未启用中立模式或未排名为 null
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ResultEntryResponse(
@@ -28,6 +30,8 @@ public record ResultEntryResponse(
         Long totalTimeMs,
         int checkpointCount,
         int coveredCheckpointCount,
-        List<String> missingCheckpoints
+        List<String> missingCheckpoints,
+        Long neutralDeductionMs,
+        Long netTimeMs
 ) {
 }

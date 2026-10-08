@@ -52,11 +52,23 @@ CREATE TABLE IF NOT EXISTS result_snapshot_entry (
     finish_time_ms BIGINT COMMENT '原始完赛耗时（毫秒）；计时缺失为NULL',
     penalty_ms BIGINT NOT NULL COMMENT '生效（未撤销）加时处罚合计毫秒数，无加时为0',
     total_time_ms BIGINT COMMENT '总耗时=原始完赛耗时+生效加时（毫秒）；未排名时为NULL',
+    neutral_deduction_ms BIGINT COMMENT '中立区间扣时合计=各区间（终点累计时刻-起点累计时刻）之和（毫秒）；未启用中立模式或端点计时缺失为NULL',
+    net_time_ms BIGINT COMMENT '净竞技用时=总耗时-中立扣时合计（毫秒），排名依据；未启用中立模式或未排名为NULL',
     checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '赛事检查点总数；未配置检查点为0',
     covered_checkpoint_count INT NOT NULL DEFAULT 0 COMMENT '封榜时该选手已覆盖检查点数量；缺失检查点由result_snapshot_checkpoint中elapsed_millis为NULL的行固化',
     display_order INT NOT NULL COMMENT '展示顺序，从0开始：先名次顺序，并列者按参赛号字典序，其余按参赛号字典序',
     CONSTRAINT pk_snapshot_entry PRIMARY KEY (race_id, bib),
     CONSTRAINT fk_snapshot_entry_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
+);
+
+CREATE TABLE IF NOT EXISTS neutral_leg (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属赛事ID；未启用中立赛段模式的赛事无任何行',
+    leg_index INT NOT NULL COMMENT '中立区间序号，按起点顺序从1连续递增，最多5个',
+    start_position INT NOT NULL COMMENT '起点检查点顺序；0表示发枪零点（不计检查点耗时）',
+    end_position INT NOT NULL COMMENT '终点检查点顺序，必须严格大于起点且不超过检查点总数',
+    created_at BIGINT NOT NULL COMMENT '配置时间，Unix毫秒时间戳',
+    CONSTRAINT pk_neutral_leg PRIMARY KEY (race_id, leg_index),
+    CONSTRAINT fk_neutral_leg_race FOREIGN KEY (race_id) REFERENCES race (race_id)
 );
 
 CREATE TABLE IF NOT EXISTS checkpoint (
@@ -95,9 +107,22 @@ CREATE TABLE IF NOT EXISTS result_snapshot_checkpoint (
     CONSTRAINT fk_snapshot_checkpoint_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
 );
 
+CREATE TABLE IF NOT EXISTS result_snapshot_neutral_leg (
+    race_id VARCHAR(64) NOT NULL COMMENT '所属快照的赛事ID',
+    bib VARCHAR(64) NOT NULL COMMENT '参赛号',
+    leg_index INT NOT NULL COMMENT '中立区间序号，与neutral_leg一致，从1递增',
+    start_position INT NOT NULL COMMENT '冻结的起点检查点顺序；0表示发枪零点',
+    end_position INT NOT NULL COMMENT '冻结的终点检查点顺序',
+    start_elapsed_millis BIGINT COMMENT '封榜时起点累计耗时（毫秒）；起点为发枪零点时固化为0，端点计时缺失为NULL',
+    end_elapsed_millis BIGINT COMMENT '封榜时终点累计耗时（毫秒）；端点计时缺失为NULL',
+    deduction_ms BIGINT COMMENT '该区间扣时=终点-起点累计耗时（毫秒）；任一端点缺失为NULL，不做估计扣除',
+    CONSTRAINT pk_snapshot_neutral_leg PRIMARY KEY (race_id, bib, leg_index),
+    CONSTRAINT fk_snapshot_neutral_leg_snapshot FOREIGN KEY (race_id) REFERENCES result_snapshot (race_id)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_record (
     request_id VARCHAR(128) NOT NULL COMMENT '全局唯一请求ID（写操作幂等键）',
-    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE',
+    operation VARCHAR(48) NOT NULL COMMENT '操作类型：CREATE_RACE/REGISTER_RUNNER/REVISE_TIME/ADD_PENALTY/REVOKE_PENALTY/CONFIGURE_CHECKPOINTS/SUBMIT_TIMING/SEAL_RACE/CONFIGURE_NEUTRAL_LEGS/CORRECT_TIMING',
     request_digest CHAR(64) NOT NULL COMMENT '请求参数（requestId除外，含expectedVersion）规范化JSON的SHA-256摘要',
     response_status INT NOT NULL COMMENT '原成功请求的HTTP状态码，重放时原样返回',
     response_body TEXT COMMENT '原成功响应体JSON，重放时原样返回',

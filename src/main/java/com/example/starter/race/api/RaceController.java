@@ -87,6 +87,28 @@ public class RaceController {
         return toResponse(raceService.sealRace(raceId, request));
     }
 
+    /** 启用中立赛段模式（计时前一次性固定区间）。 */
+    @PostMapping("/{raceId}/neutral-legs")
+    public ResponseEntity<Object> configureNeutralLegs(
+            @PathVariable String raceId,
+            @Valid @RequestBody ConfigureNeutralLegsRequest request) {
+        return toResponse(raceService.configureNeutralLegs(raceId, request));
+    }
+
+    /** 更正选手某检查点的分段累计耗时。 */
+    @PostMapping("/{raceId}/timing-corrections")
+    public ResponseEntity<Object> correctTiming(
+            @PathVariable String raceId,
+            @Valid @RequestBody CorrectTimingRequest request) {
+        return toResponse(raceService.correctTiming(raceId, request));
+    }
+
+    /** 查询赛事中立区间配置。 */
+    @GetMapping("/{raceId}/neutral-legs")
+    public NeutralLegsConfigResponse getNeutralLegs(@PathVariable String raceId) {
+        return raceService.getNeutralLegs(raceId);
+    }
+
     /** 查询即时成绩（封榜后返回只读快照内容）。 */
     @GetMapping("/{raceId}/results")
     public StandingResponse getResults(@PathVariable String raceId) {

@@ -2,7 +2,10 @@ package com.example.starter.race.service;
 
 import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.ConfigureNeutralLegsRequest;
+import com.example.starter.race.api.CorrectTimingRequest;
 import com.example.starter.race.api.CreateRaceRequest;
+import com.example.starter.race.api.NeutralLegsConfigResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
 import com.example.starter.race.api.RevokePenaltyRequest;
@@ -47,6 +50,21 @@ public interface RaceService {
 
     /** 封榜：校验版本并原子保存只读成绩快照（含每名选手分段明细与缺失检查点）。 */
     ServiceResult sealRace(String raceId, SealRaceRequest request);
+
+    /**
+     * 启用中立赛段模式：计时前一次性固定 1~5 个中立区间（不得交叠、相接合法），
+     * 要求已配置检查点且尚无任何分段记录；启用后区间不再变更，版本加一。
+     */
+    ServiceResult configureNeutralLegs(String raceId, ConfigureNeutralLegsRequest request);
+
+    /**
+     * 更正选手某检查点的分段累计耗时；重算完整扣时集合与名次，
+     * 不改写其他分段、原始完赛耗时与处罚；违反严格递增或完赛耗时约束返回422。
+     */
+    ServiceResult correctTiming(String raceId, CorrectTimingRequest request);
+
+    /** 查询赛事中立区间配置；未启用中立模式返回空列表；只读，不修改版本。 */
+    NeutralLegsConfigResponse getNeutralLegs(String raceId);
 
     /** 查询即时成绩（OPEN 实时计算；SEALED 返回封榜快照）。 */
     StandingResponse getResults(String raceId);

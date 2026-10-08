@@ -4,8 +4,12 @@ import com.example.starter.race.api.AddPenaltyRequest;
 import com.example.starter.race.api.CheckpointResponse;
 import com.example.starter.race.api.CheckpointsConfigResponse;
 import com.example.starter.race.api.ConfigureCheckpointsRequest;
+import com.example.starter.race.api.ConfigureNeutralLegsRequest;
+import com.example.starter.race.api.CorrectTimingRequest;
 import com.example.starter.race.api.CreateRaceRequest;
 import com.example.starter.race.api.MissingCheckpointsResponse;
+import com.example.starter.race.api.NeutralLegResponse;
+import com.example.starter.race.api.NeutralLegsConfigResponse;
 import com.example.starter.race.api.RaceResponse;
 import com.example.starter.race.api.RegisterRunnerRequest;
 import com.example.starter.race.api.ReviseTimeRequest;
@@ -16,6 +20,8 @@ import com.example.starter.race.api.SealRaceRequest;
 import com.example.starter.race.api.StandingResponse;
 import com.example.starter.race.api.SubmitTimingRequest;
 import com.example.starter.race.domain.CheckpointRules;
+import com.example.starter.race.domain.NeutralLegSpec;
+import com.example.starter.race.domain.NeutralLegs;
 import com.example.starter.race.domain.PenaltyType;
 import com.example.starter.race.domain.RaceStatus;
 import com.example.starter.race.domain.ResultCalculator;
@@ -23,11 +29,13 @@ import com.example.starter.race.domain.ResultEntry;
 import com.example.starter.race.persistence.CheckpointRow;
 import com.example.starter.race.persistence.CheckpointTimingRow;
 import com.example.starter.race.persistence.IdempotencyRow;
+import com.example.starter.race.persistence.NeutralLegRow;
 import com.example.starter.race.persistence.PenaltyRow;
 import com.example.starter.race.persistence.RaceRow;
 import com.example.starter.race.persistence.RunnerRow;
 import com.example.starter.race.persistence.SnapshotCheckpointRow;
 import com.example.starter.race.persistence.SnapshotEntryRow;
+import com.example.starter.race.persistence.SnapshotNeutralLegRow;
 import com.example.starter.race.persistence.SnapshotRow;
 import com.example.starter.race.persistence.RaceRepository;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -154,6 +162,8 @@ public class RaceServiceImpl implements RaceService {
                     if (updated == 0) {
                         throw new NotFoundException("选手不存在: " + request.bib());
                     }
+                    // 修订后防御性校验：中立赛事的净竞技用时必须保持正值。
+                    assertPositiveNetTimesIfNeutral(raceId);
                     RunnerRow refreshedRunner =
                             repository.findRunner(raceId, request.bib()).orElseThrow();
                     return ServiceResult.ok(ResponseMapper.toRunnerResponse(refreshedRunner));
@@ -320,6 +330,8 @@ public class RaceServiceImpl implements RaceService {
                         throw new UnprocessableEntityException(
                                 "同一选手同一检查点最多一条分段记录");
                     }
+                    // 写入后防御性校验：中立赛事的净竞技用时必须保持正值。
+                    assertPositiveNetTimesIfNeutral(raceId);
                     CheckpointTimingRow saved =
                             repository.findTiming(request.timingId()).orElseThrow();
                     return ServiceResult.created(ResponseMapper.toTimingResponse(saved));
@@ -359,8 +371,9 @@ public class RaceServiceImpl implements RaceService {
                     List<PenaltyRow> penalties = repository.findPenalties(raceId);
                     List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
                     List<CheckpointTimingRow> timings = repository.findAllTimings(raceId);
-                    List<ResultEntry> entries =
-                            ResultCalculator.compute(runners, penalties, checkpoints, timings);
+                    List<NeutralLegRow> neutralLegs = repository.findNeutralLegs(raceId);
+                    List<ResultEntry> entries = ResultCalculator.compute(
+                            runners, penalties, checkpoints, timings, neutralLegs);
 
                     int newVersion = request.expectedVersion() + 1;
                     int updated = repository.sealIfOpenAtVersion(
@@ -383,13 +396,18 @@ public class RaceServiceImpl implements RaceService {
                                 order,
                                 entry.checkpointCount(),
                                 entry.coveredCheckpointCount(),
-                                entry.missingCheckpoints()));
+                                entry.missingCheckpoints(),
+                                entry.neutralDeductionMs(),
+                                entry.netTimeMs()));
                     }
                     // 在同一封榜事务内固化每名选手 × 每个检查点的明细，缺失行耗时为 null。
                     List<SnapshotCheckpointRow> snapshotCheckpoints =
                             buildSnapshotCheckpoints(raceId, runners, checkpoints, timings);
+                    // 同事务冻结每名选手 × 每个中立区间的端点时刻与段差值，端点缺失为 null。
+                    List<SnapshotNeutralLegRow> snapshotNeutralLegs =
+                            buildSnapshotNeutralLegs(raceId, runners, neutralLegs, timings);
                     repository.insertSnapshot(new SnapshotRow(raceId, newVersion, now,
-                            snapshotEntries, snapshotCheckpoints));
+                            snapshotEntries, snapshotCheckpoints, snapshotNeutralLegs));
                     return ServiceResult.ok(new StandingResponse(
                             raceId, newVersion, RaceStatus.SEALED, now,
                             snapshotEntries.stream().map(ResponseMapper::toEntryResponse).toList()));
@@ -412,7 +430,8 @@ public class RaceServiceImpl implements RaceService {
                 repository.findRunners(raceId),
                 repository.findPenalties(raceId),
                 repository.findCheckpoints(raceId),
-                repository.findAllTimings(raceId));
+                repository.findAllTimings(raceId),
+                repository.findNeutralLegs(raceId));
     }
 
     @Override
@@ -723,5 +742,181 @@ public class RaceServiceImpl implements RaceService {
         String message = cause.getMessage();
         return message != null
                 && message.toUpperCase(java.util.Locale.ROOT).contains(constraintName.toUpperCase(java.util.Locale.ROOT));
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult configureNeutralLegs(String raceId, ConfigureNeutralLegsRequest request) {
+        List<ConfigureNeutralLegsRequest.NeutralLegDefinition> definitions =
+                request.legs().stream()
+                        .sorted(java.util.Comparator
+                                .comparingInt(ConfigureNeutralLegsRequest.NeutralLegDefinition::startPosition)
+                                .thenComparing(ConfigureNeutralLegsRequest.NeutralLegDefinition::endPosition))
+                        .toList();
+        return withIdempotency(request.requestId(), "CONFIGURE_NEUTRAL_LEGS",
+                orderedParams(
+                        "raceId", raceId,
+                        "expectedVersion", request.expectedVersion(),
+                        "operator", request.operator(),
+                        "legs", definitions.stream()
+                                .map(def -> def.startPosition() + ":" + def.endPosition())
+                                .toList()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    List<CheckpointRow> checkpoints = repository.findCheckpoints(raceId);
+                    List<NeutralLegSpec> specs = definitions.stream()
+                            .map(def -> new NeutralLegSpec(def.startPosition(), def.endPosition()))
+                            .toList();
+                    String violation = NeutralLegs.validateLegs(specs, checkpoints.size());
+                    if (violation != null) {
+                        throw new BadRequestException(violation);
+                    }
+                    if (!repository.findNeutralLegs(raceId).isEmpty()) {
+                        throw new ConflictException("中立区间已固定，启用后不再变更: " + raceId);
+                    }
+                    if (repository.countTimings(raceId) > 0) {
+                        throw new ConflictException("赛事已存在分段记录，不能再启用中立赛段模式: " + raceId);
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    long now = clock.millis();
+                    List<NeutralLegRow> rows = new ArrayList<>(definitions.size());
+                    for (int index = 0; index < definitions.size(); index++) {
+                        ConfigureNeutralLegsRequest.NeutralLegDefinition def = definitions.get(index);
+                        rows.add(new NeutralLegRow(
+                                raceId, index + 1, def.startPosition(), def.endPosition(), now));
+                    }
+                    repository.insertNeutralLegs(rows);
+                    return ServiceResult.created(new NeutralLegsConfigResponse(
+                            raceId, request.expectedVersion() + 1, toNeutralLegResponses(rows)));
+                });
+    }
+
+    @Override
+    @Transactional
+    public ServiceResult correctTiming(String raceId, CorrectTimingRequest request) {
+        return withIdempotency(request.requestId(), "CORRECT_TIMING",
+                orderedParams(
+                        "raceId", raceId,
+                        "bib", request.bib(),
+                        "checkpointCode", request.checkpointCode(),
+                        "elapsedMillis", request.elapsedMillis(),
+                        "expectedVersion", request.expectedVersion(),
+                        "operator", request.operator()),
+                () -> {
+                    RaceRow race = requireOpenRace(raceId, request.expectedVersion());
+                    RunnerRow runner = requireRunner(raceId, request.bib());
+                    CheckpointRow checkpoint = repository
+                            .findCheckpoint(raceId, request.checkpointCode())
+                            .orElseThrow(() -> new NotFoundException(
+                                    "检查点不存在: " + request.checkpointCode()));
+                    List<CheckpointTimingRow> runnerTimings =
+                            repository.findTimingsForRunner(raceId, request.bib());
+                    CheckpointTimingRow existing = runnerTimings.stream()
+                            .filter(t -> t.checkpointCode().equals(request.checkpointCode()))
+                            .findFirst()
+                            .orElseThrow(() -> new NotFoundException(
+                                    "分段记录不存在，无法更正: " + request.checkpointCode()));
+                    // 更正仍须满足原累计严格递增与小于完赛耗时约束（排除被更正的自身）。
+                    List<CheckpointTimingRow> others = runnerTimings.stream()
+                            .filter(t -> t.position() != checkpoint.position())
+                            .toList();
+                    String violation = CheckpointRules.validate(
+                            others, checkpoint.position(), request.elapsedMillis(),
+                            runner.finishTimeMs());
+                    if (violation != null) {
+                        throw new UnprocessableEntityException(violation);
+                    }
+                    bumpVersion(race, request.expectedVersion());
+                    int updated = repository.updateTimingElapsed(
+                            raceId, request.bib(), request.checkpointCode(),
+                            request.elapsedMillis());
+                    if (updated == 0) {
+                        throw new NotFoundException(
+                                "分段记录不存在，无法更正: " + request.checkpointCode());
+                    }
+                    // 更正后重算完整扣时集合：净竞技用时必须保持正值，否则整体回滚。
+                    assertPositiveNetTimesIfNeutral(raceId);
+                    CheckpointTimingRow saved =
+                            repository.findTiming(existing.timingId()).orElseThrow();
+                    return ServiceResult.ok(ResponseMapper.toTimingResponse(saved));
+                });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public NeutralLegsConfigResponse getNeutralLegs(String raceId) {
+        RaceRow race = repository.findRace(raceId)
+                .orElseThrow(() -> new NotFoundException("赛事不存在: " + raceId));
+        return new NeutralLegsConfigResponse(
+                raceId, race.version(), toNeutralLegResponses(repository.findNeutralLegs(raceId)));
+    }
+
+    private static List<NeutralLegResponse> toNeutralLegResponses(List<NeutralLegRow> rows) {
+        return rows.stream()
+                .map(row -> new NeutralLegResponse(
+                        row.legIndex(), row.startPosition(), row.endPosition()))
+                .toList();
+    }
+
+    /**
+     * 构造封榜快照的中立扣时明细：每名选手 × 每个中立区间一行，
+     * 冻结区间起止序号、端点当前累计时刻与段差值；端点计时缺失时对应字段为 null，
+     * 不做估计扣除。起点为发枪零点（position 0）时起点时刻固化为 0。
+     */
+    private List<SnapshotNeutralLegRow> buildSnapshotNeutralLegs(
+            String raceId,
+            List<RunnerRow> runners,
+            List<NeutralLegRow> neutralLegs,
+            List<CheckpointTimingRow> timings) {
+        if (neutralLegs.isEmpty()) {
+            return List.of();
+        }
+        Map<String, Map<Integer, Long>> elapsedByBib = new TreeMap<>();
+        for (CheckpointTimingRow timing : timings) {
+            elapsedByBib.computeIfAbsent(timing.bib(), key -> new TreeMap<>())
+                    .put(timing.position(), timing.elapsedMillis());
+        }
+        List<SnapshotNeutralLegRow> rows = new ArrayList<>();
+        for (RunnerRow runner : runners) {
+            Map<Integer, Long> elapsedByPosition =
+                    elapsedByBib.getOrDefault(runner.bib(), Map.of());
+            for (NeutralLegRow leg : neutralLegs) {
+                Long startElapsed = leg.startPosition() == 0
+                        ? 0L : elapsedByPosition.get(leg.startPosition());
+                Long endElapsed = elapsedByPosition.get(leg.endPosition());
+                Long deduction = startElapsed != null && endElapsed != null
+                        ? endElapsed - startElapsed : null;
+                rows.add(new SnapshotNeutralLegRow(
+                        raceId, runner.bib(), leg.legIndex(),
+                        leg.startPosition(), leg.endPosition(),
+                        startElapsed, endElapsed, deduction));
+            }
+        }
+        return rows;
+    }
+
+    /**
+     * 防御性校验：启用中立模式后任何计时变更都必须保持净竞技用时为正值，
+     * 否则抛出422并整体回滚。正常数据（分段严格递增且小于完赛耗时）下净值恒为正。
+     */
+    private void assertPositiveNetTimesIfNeutral(String raceId) {
+        List<NeutralLegRow> legs = repository.findNeutralLegs(raceId);
+        if (legs.isEmpty()) {
+            return;
+        }
+        List<ResultEntry> entries = ResultCalculator.compute(
+                repository.findRunners(raceId),
+                repository.findPenalties(raceId),
+                repository.findCheckpoints(raceId),
+                repository.findAllTimings(raceId),
+                legs);
+        for (ResultEntry entry : entries) {
+            if (entry.netTimeMs() != null) {
+                String violation = NeutralLegs.netTimeViolation(entry.netTimeMs());
+                if (violation != null) {
+                    throw new UnprocessableEntityException(violation);
+                }
+            }
+        }
     }
 }

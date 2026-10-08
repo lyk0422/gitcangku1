@@ -14,6 +14,9 @@ import java.util.List;
  * @param checkpointCount         赛事配置的检查点总数；未配置检查点的赛事为 0
  * @param coveredCheckpointCount  该选手已有分段记录的检查点数量
  * @param missingCheckpoints      该选手尚未通过的检查点代码，按检查点顺序排列；全部覆盖或无检查点时为空列表
+ * @param neutralDeductionMs      中立区间扣时合计（毫秒）；未启用中立模式或端点计时缺失为 null
+ * @param netTimeMs               净竞技用时=总耗时-中立扣时合计（毫秒），中立赛事的排名依据；
+ *                                未启用中立模式或未排名为 null
  */
 public record ResultEntry(
         String bib,
@@ -24,8 +27,25 @@ public record ResultEntry(
         Long totalTimeMs,
         int checkpointCount,
         int coveredCheckpointCount,
-        List<String> missingCheckpoints
+        List<String> missingCheckpoints,
+        Long neutralDeductionMs,
+        Long netTimeMs
 ) {
+
+    /** 未启用中立赛段模式赛事使用的兼容构造器：扣时与净值为 null。 */
+    public ResultEntry(
+            String bib,
+            Integer rank,
+            EntryStatus status,
+            Long finishTimeMs,
+            long penaltyMs,
+            Long totalTimeMs,
+            int checkpointCount,
+            int coveredCheckpointCount,
+            List<String> missingCheckpoints) {
+        this(bib, rank, status, finishTimeMs, penaltyMs, totalTimeMs,
+                checkpointCount, coveredCheckpointCount, missingCheckpoints, null, null);
+    }
 
     /** 未配置检查点赛事使用的兼容构造器：检查点计数均为 0、缺失列表为空。 */
     public ResultEntry(
