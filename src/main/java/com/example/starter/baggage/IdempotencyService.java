@@ -17,8 +17,10 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * 幂等去重服务：所有写操作携带全局唯一 requestId。
- * 同键同参重放原成功结果，同键异参返回 409；失败请求不占键，
+ * 同键同参重放原成功结果，同键异参（含操作类型不同）返回 409；失败请求不占键，
  * 业务变更与去重记录在同一事务中原子提交。
+ * 摘要输入为结构化参数（操作类型 + 规范化后的全部请求参数）的 JSON：
+ * 十进制经类型化反序列化后按值比较，文本原样比较。
  */
 @Service
 public class IdempotencyService {
@@ -50,13 +52,13 @@ public class IdempotencyService {
      */
     public <T> T execute(String requestId, String operation, int successStatus,
                          Object payload, Class<T> resultType, Supplier<T> action) {
-        String hash = sha256(writeJson(payload));
+        String hash = sha256(writeJson(new StructuredParams(operation, payload)));
         Object lock = locks.computeIfAbsent(requestId, key -> new Object());
         synchronized (lock) {
             try {
                 StoredRequest existing = find(requestId);
                 if (existing != null) {
-                    return replay(existing, hash, resultType);
+                    return replay(existing, operation, hash, resultType);
                 }
                 try {
                     return transactionTemplate.execute(status -> {
@@ -73,7 +75,7 @@ public class IdempotencyService {
                     if (stored == null) {
                         throw duplicate;
                     }
-                    return replay(stored, hash, resultType);
+                    return replay(stored, operation, hash, resultType);
                 }
             } finally {
                 locks.remove(requestId, lock);
@@ -81,8 +83,8 @@ public class IdempotencyService {
         }
     }
 
-    private <T> T replay(StoredRequest stored, String hash, Class<T> resultType) {
-        if (!stored.requestHash().equals(hash)) {
+    private <T> T replay(StoredRequest stored, String operation, String hash, Class<T> resultType) {
+        if (!stored.operation().equals(operation) || !stored.requestHash().equals(hash)) {
             throw ApiException.conflict("requestId 已被使用且请求参数不一致");
         }
         try {
@@ -94,8 +96,9 @@ public class IdempotencyService {
 
     private StoredRequest find(String requestId) {
         List<StoredRequest> rows = jdbcTemplate.query(
-                "SELECT request_hash, response_body FROM request_log WHERE request_id = ?",
-                (rs, rowNum) -> new StoredRequest(rs.getString("request_hash"), rs.getString("response_body")),
+                "SELECT operation, request_hash, response_body FROM request_log WHERE request_id = ?",
+                (rs, rowNum) -> new StoredRequest(
+                        rs.getString("operation"), rs.getString("request_hash"), rs.getString("response_body")),
                 requestId);
         return rows.isEmpty() ? null : rows.get(0);
     }
@@ -117,6 +120,10 @@ public class IdempotencyService {
         }
     }
 
-    private record StoredRequest(String requestHash, String responseBody) {
+    private record StoredRequest(String operation, String requestHash, String responseBody) {
+    }
+
+    /** 结构化摘要参数：操作类型 + 规范化后的全部请求参数。 */
+    private record StructuredParams(String operation, Object payload) {
     }
 }

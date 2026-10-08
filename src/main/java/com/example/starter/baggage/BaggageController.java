@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.example.starter.baggage.BaggageDtos.ArriveRequest;
@@ -20,6 +21,7 @@ import com.example.starter.baggage.BaggageDtos.LegDifferenceResponse;
 import com.example.starter.baggage.BaggageDtos.LegResponse;
 import com.example.starter.baggage.BaggageDtos.LoadRequest;
 import com.example.starter.baggage.BaggageDtos.LoadResponse;
+import com.example.starter.baggage.BaggageDtos.ManifestProofResponse;
 import com.example.starter.baggage.BaggageDtos.ManifestResponse;
 import com.example.starter.baggage.BaggageDtos.RecoverRequest;
 import com.example.starter.baggage.BaggageDtos.RecoverResponse;
@@ -95,6 +97,13 @@ public class BaggageController {
     @GetMapping("/legs/{legId}/manifest")
     public ManifestResponse getManifest(@PathVariable String legId) {
         return baggageService.getManifest(legId);
+    }
+
+    /** MERKLE 航段成员证明查询：返回叶下标与逐层兄弟摘要，不重新生成清单。 */
+    @GetMapping("/legs/{legId}/manifest-proof")
+    public ManifestProofResponse getManifestProof(@PathVariable String legId,
+                                                  @RequestParam String bagTag) {
+        return baggageService.getManifestProof(legId, bagTag);
     }
 
     /** 航段差异快照查询：返回只读封舱清单与差异到达实际集合。 */
