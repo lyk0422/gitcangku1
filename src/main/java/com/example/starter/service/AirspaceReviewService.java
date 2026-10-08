@@ -1,6 +1,10 @@
 package com.example.starter.service;
 
 import com.example.starter.api.ApiException;
+import com.example.starter.api.dto.CurvePointDto;
+import com.example.starter.api.dto.CurveRouteCreateRequest;
+import com.example.starter.api.dto.CurveRouteReplaceRequest;
+import com.example.starter.api.dto.CurveSegmentDto;
 import com.example.starter.api.dto.MutationResponse;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
@@ -11,9 +15,11 @@ import com.example.starter.api.dto.RouteResult;
 import com.example.starter.api.dto.ZoneCreateRequest;
 import com.example.starter.api.dto.ZoneResult;
 import com.example.starter.api.dto.ZoneRevokeRequest;
+import com.example.starter.domain.CurveSegment;
 import com.example.starter.domain.Geometry;
 import com.example.starter.domain.Point;
 import com.example.starter.domain.ReviewConclusion;
+import com.example.starter.domain.RouteKind;
 import com.example.starter.domain.ZoneStatus;
 import com.example.starter.repo.AirspaceRepository;
 import com.example.starter.repo.DedupPo;
@@ -26,6 +32,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.DecimalNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.dao.DuplicateKeyException;
@@ -34,6 +41,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -63,6 +71,8 @@ public class AirspaceReviewService {
     static final String KIND_ZONE_REVOKE = "ZONE_REVOKE";
     static final String KIND_ROUTE_CREATE = "ROUTE_CREATE";
     static final String KIND_ROUTE_REPLACE = "ROUTE_REPLACE";
+    static final String KIND_CURVE_ROUTE_CREATE = "CURVE_ROUTE_CREATE";
+    static final String KIND_CURVE_ROUTE_REPLACE = "CURVE_ROUTE_REPLACE";
     static final String KIND_REVIEW = "REVIEW";
 
     private final AirspaceRepository airspaceRepo;
@@ -172,6 +182,54 @@ public class AirspaceReviewService {
         });
     }
 
+    // ============================ 二次曲线航线 ============================
+
+    /** 创建二次曲线航线（初始版本 1）；段数 1~5，前后端点必须相等。 */
+    public MutationResponse createCurveRoute(CurveRouteCreateRequest request) {
+        return withIdempotency(request.requestId(), KIND_CURVE_ROUTE_CREATE,
+                canonicalHash(request), () -> {
+                    List<CurveSegment> segments = toCurveSegments(request.segments());
+                    validateCurveSegments(segments);
+                    if (routeRepo.findRoute(request.routeId()) != null) {
+                        throw new ApiException(HttpStatus.CONFLICT, "ROUTE_ALREADY_EXISTS",
+                                "航线已存在: " + request.routeId());
+                    }
+                    routeRepo.insertCurveRoute(request.routeId(), segments);
+                    return new MutationResponse(request.requestId(), false,
+                            new RouteResult(request.routeId(), 1));
+                });
+    }
+
+    /** 替换二次曲线段，expectedVersion 不匹配返回 409；成功版本加一。 */
+    public MutationResponse replaceCurveRoute(CurveRouteReplaceRequest request) {
+        return withIdempotency(request.requestId(), KIND_CURVE_ROUTE_REPLACE,
+                canonicalHash(request), () -> {
+                    List<CurveSegment> segments = toCurveSegments(request.segments());
+                    validateCurveSegments(segments);
+                    RoutePo route = routeRepo.findRoute(request.routeId());
+                    if (route == null) {
+                        throw new ApiException(HttpStatus.NOT_FOUND, "ROUTE_NOT_FOUND",
+                                "航线不存在: " + request.routeId());
+                    }
+                    if (route.version() != request.expectedVersion()) {
+                        throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                                "航线版本不匹配：expected=" + request.expectedVersion()
+                                        + ", current=" + route.version());
+                    }
+                    // 条件更新兜底并发替换：更新 0 行说明版本已被其他事务推进
+                    int updated = routeRepo.compareAndIncrementVersion(
+                            request.routeId(), request.expectedVersion());
+                    if (updated == 0) {
+                        throw new ApiException(HttpStatus.CONFLICT, "VERSION_CONFLICT",
+                                "航线版本已变化，请使用最新 expectedVersion 重试");
+                    }
+                    routeRepo.deleteSegments(request.routeId());
+                    routeRepo.insertSegments(request.routeId(), segments);
+                    return new MutationResponse(request.requestId(), false,
+                            new RouteResult(request.routeId(), request.expectedVersion() + 1));
+                });
+    }
+
     // ============================ 审核 ============================
 
     /** 提交审核：任一指定版本不是当前版本返回 409；结果不可变。 */
@@ -199,8 +257,12 @@ public class AirspaceReviewService {
             List<ZonePo> activeZones = airspaceRepo.findActiveZones();
             Set<String> hits = new TreeSet<>();
             for (ZonePo zone : activeZones) {
-                if (Geometry.polylineHitsRectangle(route.points(),
-                        zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax())) {
+                boolean hit = route.kind() == RouteKind.QUADRATIC
+                        ? Geometry.curveHitsRectangle(route.segments(),
+                                zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax())
+                        : Geometry.polylineHitsRectangle(route.points(),
+                                zone.xMin(), zone.yMin(), zone.xMax(), zone.yMax());
+                if (hit) {
                     hits.add(zone.zoneId());
                 }
             }
@@ -208,8 +270,11 @@ public class AirspaceReviewService {
                     ? ReviewConclusion.CLEAR.name()
                     : ReviewConclusion.BLOCKED.name();
             String reviewId = "rv_" + UUID.randomUUID();
+            // 冻结当前版本的完整几何（曲线含全部控制点 P0/P1/P2），审核后不再随航线变化
             ReviewPo po = new ReviewPo(reviewId, request.routeId(), route.version(), globalVersion,
-                    conclusion, new ArrayList<>(hits), List.copyOf(route.points()),
+                    conclusion, new ArrayList<>(hits), route.kind(),
+                    route.kind() == RouteKind.QUADRATIC ? List.of() : List.copyOf(route.points()),
+                    route.kind() == RouteKind.QUADRATIC ? List.copyOf(route.segments()) : List.of(),
                     request.requestId(), nowMillis());
             reviewRepo.insertReview(po);
             return new MutationResponse(request.requestId(), false, toDto(po, conclusion, true));
@@ -329,6 +394,38 @@ public class AirspaceReviewService {
         return points;
     }
 
+    private static List<CurveSegment> toCurveSegments(List<CurveSegmentDto> dtos) {
+        List<CurveSegment> segments = new ArrayList<>(dtos.size());
+        for (CurveSegmentDto dto : dtos) {
+            segments.add(new CurveSegment(
+                    new Point(dto.p0().x(), dto.p0().y()),
+                    new Point(dto.p1().x(), dto.p1().y()),
+                    new Point(dto.p2().x(), dto.p2().y())));
+        }
+        return segments;
+    }
+
+    /**
+     * 校验二次曲线航线：1~5 段，且相邻段前段固定终点 P2 必须等于后段固定起点 P0。
+     * 控制点 P1 不要求落在端线上（允许弯曲），共线时退化为直线，仍按曲线登记与审核。
+     */
+    private static void validateCurveSegments(List<CurveSegment> segments) {
+        if (segments.isEmpty() || segments.size() > 5) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "INVALID_CURVE_SEGMENTS",
+                    "二次曲线航线必须包含 1~5 段");
+        }
+        for (int i = 1; i < segments.size(); i++) {
+            Point prevEnd = segments.get(i - 1).p2();
+            Point nextStart = segments.get(i).p0();
+            if (prevEnd.x() != nextStart.x() || prevEnd.y() != nextStart.y()) {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "CURVE_NOT_CONTINUOUS",
+                        "第 " + i + " 段终点 (" + prevEnd.x() + "," + prevEnd.y()
+                                + ") 与第 " + (i + 1) + " 段起点 ("
+                                + nextStart.x() + "," + nextStart.y() + ") 不一致");
+            }
+        }
+    }
+
     private static void validatePointsDistinct(List<Point> points) {
         Point first = points.get(0);
         for (Point p : points) {
@@ -345,8 +442,18 @@ public class AirspaceReviewService {
         for (Point p : po.pointsSnapshot()) {
             snapshot.add(new RoutePointDto(p.x(), p.y()));
         }
+        List<CurveSegmentDto> curveSnapshot = new ArrayList<>(po.segmentsSnapshot().size());
+        for (CurveSegment seg : po.segmentsSnapshot()) {
+            curveSnapshot.add(new CurveSegmentDto(
+                    toCurvePoint(seg.p0()), toCurvePoint(seg.p1()), toCurvePoint(seg.p2())));
+        }
         return new ReviewResultDto(po.reviewId(), po.routeId(), po.routeVersion(),
-                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()), snapshot, current);
+                po.airspaceVersion(), conclusion, List.copyOf(po.hitZoneIds()),
+                po.kind().name(), List.copyOf(snapshot), List.copyOf(curveSnapshot), current);
+    }
+
+    private static CurvePointDto toCurvePoint(Point p) {
+        return new CurvePointDto(p.x(), p.y());
     }
 
     private long nowMillis() {
@@ -364,9 +471,10 @@ public class AirspaceReviewService {
     /**
      * 计算请求参数的规范化哈希（SHA-256）。
      * 对象字段按键名字典序递归排序，列表保持顺序，使相同语义参数产生相同哈希、
-     * 字段书写顺序不同不影响比对结果。
+     * 字段书写顺序不同不影响比对结果。数值按十进制真值归一（1 与 1.0 视为同参），
+     * 文本节点原样保留（不做大小写或空白折叠）。包内可见以便单元测试直接验证。
      */
-    private String canonicalHash(Object request) {
+    String canonicalHash(Object request) {
         try {
             JsonNode sorted = canonicalize(objectMapper.valueToTree(request));
             String canonical = objectMapper.writeValueAsString(sorted);
@@ -392,6 +500,11 @@ public class AirspaceReviewService {
             ArrayNode array = JsonNodeFactory.instance.arrayNode();
             node.forEach(child -> array.add(canonicalize(child)));
             return array;
+        }
+        if (node.isNumber()) {
+            // 十进制真值归一：去掉尾随零后 1、1.0、1.00 序列化为同一形式
+            BigDecimal normalized = node.decimalValue().stripTrailingZeros();
+            return DecimalNode.valueOf(normalized);
         }
         return node;
     }

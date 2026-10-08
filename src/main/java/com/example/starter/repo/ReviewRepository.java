@@ -1,6 +1,8 @@
 package com.example.starter.repo;
 
+import com.example.starter.domain.CurveSegment;
 import com.example.starter.domain.Point;
+import com.example.starter.domain.RouteKind;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
@@ -11,7 +13,8 @@ import java.util.List;
 
 /**
  * 审核结果与幂等去重数据访问。
- * 点快照以 "x,y;x,y" 文本保存，命中 zoneId 以逗号拼接，均为不可变内容。
+ * LINE 点快照以 "x,y;x,y" 文本保存；QUADRATIC 曲线段快照以
+ * "p0x,p0y,p1x,p1y,p2x,p2y;..." 保存（完整冻结控制点）；命中 zoneId 以逗号拼接。
  */
 @Repository
 public class ReviewRepository {
@@ -22,6 +25,10 @@ public class ReviewRepository {
         this.jdbc = jdbc;
     }
 
+    private static final String REVIEW_COLUMNS =
+            "review_id, route_id, route_version, airspace_version, conclusion, "
+                    + "hit_zone_ids, kind, points_snapshot, segments_snapshot, request_id, created_at";
+
     private static final RowMapper<ReviewPo> REVIEW_MAPPER = (rs, n) -> new ReviewPo(
             rs.getString("review_id"),
             rs.getString("route_id"),
@@ -29,25 +36,23 @@ public class ReviewRepository {
             rs.getLong("airspace_version"),
             rs.getString("conclusion"),
             decodeZoneIds(rs.getString("hit_zone_ids")),
+            RouteKind.valueOf(rs.getString("kind")),
             decodePoints(rs.getString("points_snapshot")),
+            decodeSegments(rs.getString("segments_snapshot")),
             rs.getString("request_id"),
             rs.getLong("created_at"));
 
     /** 按 reviewId 查询不可变审核记录，不存在返回 null。 */
     public ReviewPo findReview(String reviewId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE review_id = ?",
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE review_id = ?",
                 REVIEW_MAPPER, reviewId).stream().findFirst().orElse(null);
     }
 
     /** 查询某航线最新的一条审核记录（按创建时间、reviewId 倒序），没有返回 null。 */
     public ReviewPo findLatestReview(String routeId) {
         return jdbc.query(
-                "SELECT review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at "
-                        + "FROM review WHERE route_id = ? "
+                "SELECT " + REVIEW_COLUMNS + " FROM review WHERE route_id = ? "
                         + "ORDER BY created_at DESC, review_id DESC LIMIT 1",
                 REVIEW_MAPPER, routeId).stream().findFirst().orElse(null);
     }
@@ -56,10 +61,11 @@ public class ReviewRepository {
     public void insertReview(ReviewPo po) {
         jdbc.update("INSERT INTO review "
                         + "(review_id, route_id, route_version, airspace_version, conclusion, "
-                        + "hit_zone_ids, points_snapshot, request_id, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        + "hit_zone_ids, kind, points_snapshot, segments_snapshot, request_id, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 po.reviewId(), po.routeId(), po.routeVersion(), po.airspaceVersion(),
-                po.conclusion(), encodeZoneIds(po.hitZoneIds()), encodePoints(po.pointsSnapshot()),
+                po.conclusion(), encodeZoneIds(po.hitZoneIds()), po.kind().name(),
+                encodePoints(po.pointsSnapshot()), encodeSegments(po.segmentsSnapshot()),
                 po.requestId(), po.createdAt());
     }
 
@@ -104,6 +110,39 @@ public class ReviewRepository {
             }
         }
         return points;
+    }
+
+    /** 曲线段列表编码："p0x,p0y,p1x,p1y,p2x,p2y;..."；空列表编码为空串。 */
+    public static String encodeSegments(List<CurveSegment> segments) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < segments.size(); i++) {
+            if (i > 0) {
+                sb.append(';');
+            }
+            CurveSegment seg = segments.get(i);
+            sb.append(seg.p0().x()).append(',')
+                    .append(seg.p0().y()).append(',')
+                    .append(seg.p1().x()).append(',')
+                    .append(seg.p1().y()).append(',')
+                    .append(seg.p2().x()).append(',')
+                    .append(seg.p2().y());
+        }
+        return sb.toString();
+    }
+
+    /** 曲线段列表解码。 */
+    public static List<CurveSegment> decodeSegments(String text) {
+        List<CurveSegment> segments = new ArrayList<>();
+        if (text != null && !text.isEmpty()) {
+            for (String six : text.split(";")) {
+                String[] v = six.split(",");
+                segments.add(new CurveSegment(
+                        new Point(Integer.parseInt(v[0]), Integer.parseInt(v[1])),
+                        new Point(Integer.parseInt(v[2]), Integer.parseInt(v[3])),
+                        new Point(Integer.parseInt(v[4]), Integer.parseInt(v[5]))));
+            }
+        }
+        return segments;
     }
 
     /** zoneId 列表编码（字典序去重由调用方保证），逗号拼接。 */

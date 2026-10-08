@@ -63,6 +63,7 @@ class AirspaceReviewServiceH2Test {
     private void cleanup() {
         jdbc.update("DELETE FROM review");
         jdbc.update("DELETE FROM request_dedup");
+        jdbc.update("DELETE FROM route_curve_segment");
         jdbc.update("DELETE FROM route_point");
         jdbc.update("DELETE FROM route");
         jdbc.update("DELETE FROM no_fly_zone");

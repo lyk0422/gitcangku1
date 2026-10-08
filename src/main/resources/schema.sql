@@ -29,20 +29,36 @@ CREATE TABLE IF NOT EXISTS no_fly_zone (
 
 -- 航线当前状态：routeId 唯一，版本从 1 开始，替换成功加一
 -- touch 仅用于审核事务对该行产生真实更新以加行级写锁，与替换操作互斥
+-- kind 区分几何类型：LINE 折线 / QUADRATIC 二次贝塞尔曲线
 CREATE TABLE IF NOT EXISTS route (
     route_id  VARCHAR(64) PRIMARY KEY COMMENT '航线唯一标识',
     version   INT NOT NULL COMMENT '当前航线版本，初始 1，每次成功替换加一',
+    kind      VARCHAR(16) NOT NULL COMMENT '几何类型：LINE 折线；QUADRATIC 二次贝塞尔曲线（1~5 段）',
     touch     BIGINT NOT NULL COMMENT '仅用于审核事务加行级写锁的计数器，无业务含义'
 ) COMMENT = '航线当前版本状态';
 
--- 航线点（当前版本，2~50 个，按 seq 顺序连接）
+-- 航线点（LINE 类型当前版本，2~50 个，按 seq 顺序连接）
 CREATE TABLE IF NOT EXISTS route_point (
     route_id  VARCHAR(64) NOT NULL COMMENT '所属航线标识',
     seq       INT NOT NULL COMMENT '点序号，从 0 开始按顺序连接',
     x         INT NOT NULL COMMENT '航点 X 坐标，单位米，范围 [-100000,100000]',
     y         INT NOT NULL COMMENT '航点 Y 坐标，单位米，范围 [-100000,100000]',
     PRIMARY KEY (route_id, seq)
-) COMMENT = '航线当前版本有序航点';
+) COMMENT = '折线航线当前版本有序航点';
+
+-- 二次曲线段（QUADRATIC 类型当前版本，1~5 段，按 seq 顺序，前段终点须等于后段起点）
+-- 审核必须冻结完整控制点：P0/P1/P2 全部落库，禁止调用方在审核时临时修改
+CREATE TABLE IF NOT EXISTS route_curve_segment (
+    route_id  VARCHAR(64) NOT NULL COMMENT '所属航线标识',
+    seq       INT NOT NULL COMMENT '曲线段序号，从 0 开始',
+    p0x       INT NOT NULL COMMENT '本段固定起点 P0 的 X 坐标，单位米',
+    p0y       INT NOT NULL COMMENT '本段固定起点 P0 的 Y 坐标，单位米',
+    p1x       INT NOT NULL COMMENT '本段控制点 P1 的 X 坐标，单位米；可与端点共线退化为直线',
+    p1y       INT NOT NULL COMMENT '本段控制点 P1 的 Y 坐标，单位米；可与端点共线退化为直线',
+    p2x       INT NOT NULL COMMENT '本段固定终点 P2 的 X 坐标，单位米；须等于下一段 P0',
+    p2y       INT NOT NULL COMMENT '本段固定终点 P2 的 Y 坐标，单位米；须等于下一段 P0',
+    PRIMARY KEY (route_id, seq)
+) COMMENT = '二次贝塞尔曲线航线当前版本分段（含冻结控制点）';
 
 -- 审核不可变结果
 CREATE TABLE IF NOT EXISTS review (
@@ -52,7 +68,9 @@ CREATE TABLE IF NOT EXISTS review (
     airspace_version  BIGINT NOT NULL COMMENT '审核明确指定的空域版本',
     conclusion        VARCHAR(16) NOT NULL COMMENT '保存时的原结论：CLEAR 通过或 BLOCKED 命中，永不改变',
     hit_zone_ids      CLOB NOT NULL COMMENT '命中的全部 zoneId，字典序去重后逗号拼接；未命中为空串',
-    points_snapshot   VARCHAR(4000) NOT NULL COMMENT '审核时航点不可变快照，格式 x,y;x,y',
+    kind              VARCHAR(16) NOT NULL COMMENT '审核时航线几何类型：LINE / QUADRATIC',
+    points_snapshot   VARCHAR(4000) NOT NULL COMMENT 'LINE 类型审核时航点不可变快照，格式 x,y;x,y；QUADRATIC 为空串',
+    segments_snapshot VARCHAR(4000) NOT NULL COMMENT 'QUADRATIC 类型审核时冻结的完整曲线段快照，格式 p0x,p0y,p1x,p1y,p2x,p2y;...；LINE 为空串',
     request_id        VARCHAR(64) NOT NULL COMMENT '提交审核的写操作请求标识',
     created_at        BIGINT NOT NULL COMMENT '创建时间，epoch 毫秒（UTC）'
 ) COMMENT = '审核不可变结果';

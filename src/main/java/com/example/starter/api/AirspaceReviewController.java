@@ -1,5 +1,7 @@
 package com.example.starter.api;
 
+import com.example.starter.api.dto.CurveRouteCreateRequest;
+import com.example.starter.api.dto.CurveRouteReplaceRequest;
 import com.example.starter.api.dto.MutationResponse;
 import com.example.starter.api.dto.ReviewRequest;
 import com.example.starter.api.dto.ReviewResultDto;
@@ -53,6 +55,20 @@ public class AirspaceReviewController {
     @PostMapping("/routes/replace")
     public ResponseEntity<MutationResponse> replaceRoute(@Valid @RequestBody RouteReplaceRequest request) {
         return ResponseEntity.ok(service.replaceRoute(request));
+    }
+
+    /** 创建二次曲线航线（1~5 段，含冻结控制点）。 */
+    @PostMapping("/curve-routes")
+    public ResponseEntity<MutationResponse> createCurveRoute(
+            @Valid @RequestBody CurveRouteCreateRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(service.createCurveRoute(request));
+    }
+
+    /** 替换二次曲线航线。 */
+    @PostMapping("/curve-routes/replace")
+    public ResponseEntity<MutationResponse> replaceCurveRoute(
+            @Valid @RequestBody CurveRouteReplaceRequest request) {
+        return ResponseEntity.ok(service.replaceCurveRoute(request));
     }
 
     /** 提交审核。 */
